@@ -2,10 +2,34 @@ const mongoose = require('mongoose');
 
 const connectDatabase = async () => {
   try {
-    const conn = await mongoose.connect(process.env.MONGO_URI);
+    const conn = await mongoose.connect(process.env.MONGO_URI, {
+      // Auto-create indexes defined in schemas
+      autoIndex: true,
+      // Auto-create collections when models are used
+      autoCreate: true,
+    });
+    
     console.log(`MongoDB Connected: ${conn.connection.host}`);
+    console.log(`Database: ${conn.connection.name}`);
+    
+    // Sync all models - ensures collections and indexes exist
+    console.log('🔄 Syncing database models...');
+    
+    // Get all registered models
+    const models = mongoose.modelNames();
+    console.log(`   Found ${models.length} models: ${models.join(', ')}`);
+    
+    // Sync indexes for all models
+    for (const modelName of models) {
+      const model = mongoose.model(modelName);
+      await model.syncIndexes();
+      console.log(`   ✅ Synced indexes for ${modelName}`);
+    }
+    
+    console.log('✅ Database sync complete');
+    
   } catch (error) {
-    console.error(`Error: ${error.message}`);
+    console.error(`❌ Database connection error: ${error.message}`);
     process.exit(1);
   }
 };

@@ -1,0 +1,79 @@
+const express = require('express');
+const router = express.Router();
+const { authenticateAny } = require('../middlewares/auth');
+const {
+  // Authentication
+  initiateLogin,
+  handleCallback,
+  checkAuthStatus,
+  getDetailedAuthStatus,
+  triggerAutoLogin,
+  logout,
+  
+  // Instruments
+  fetchInstruments,
+  getInstrumentsInfo,
+  searchInstruments,
+  
+  // Market Quotes
+  fetchQuotes,
+  getLatestQuotes,
+  getLTPByToken,
+  
+  // Profile
+  getProfile
+} = require('../controllers/kiteController');
+
+// ==================== AUTHENTICATION ROUTES (PUBLIC) ====================
+
+// Initiate login (redirects to Kite)
+router.get('/login', initiateLogin);
+
+// Handle callback from Kite
+router.get('/callback', handleCallback);
+
+// Check auth status (simple)
+router.get('/auth-status', checkAuthStatus);
+
+// Get detailed auth status
+router.get('/auth/status', getDetailedAuthStatus);
+
+// Trigger automated login
+router.post('/auth/auto-login', triggerAutoLogin);
+
+// ==================== PROTECTED ROUTES (REQUIRE AUTHENTICATION) ====================
+
+// Apply authentication middleware to all routes below
+router.use(authenticateAny);
+
+// Logout
+router.delete('/logout', logout);
+
+// ==================== INSTRUMENT ROUTES ====================
+
+// Fetch and store instruments
+router.post('/instruments/fetch', fetchInstruments);
+
+// Get instruments info
+router.get('/instruments/info', getInstrumentsInfo);
+
+// Search instruments
+router.get('/instruments/search', searchInstruments);
+
+// ==================== MARKET QUOTE ROUTES ====================
+
+// Fetch quotes from Kite API
+router.post('/quotes/fetch', fetchQuotes);
+
+// Get latest quotes from database
+router.get('/quotes/latest', getLatestQuotes);
+
+// Get LTP by instrument token
+router.get('/quotes/ltp/:instrumentToken', getLTPByToken);
+
+// ==================== PROFILE ROUTES ====================
+
+// Get user profile
+router.get('/profile', getProfile);
+
+module.exports = router;

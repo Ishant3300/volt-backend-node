@@ -10,7 +10,7 @@ const kiteInstrumentSchema = new mongoose.Schema({
     type: String,
     required: true
   },
-  trading_symbol: {
+  tradingsymbol: {
     type: String,
     required: true
   },
@@ -71,7 +71,7 @@ kiteInstrumentSchema.set('toJSON', {
 // Indexes
 kiteInstrumentSchema.index({ instrument_token: 1 }, { unique: true });
 kiteInstrumentSchema.index({ exchange_token: 1 });
-kiteInstrumentSchema.index({ trading_symbol: 1 });
+kiteInstrumentSchema.index({ tradingsymbol: 1 });
 kiteInstrumentSchema.index({ name: 1 });
 kiteInstrumentSchema.index({ exchange: 1 });
 kiteInstrumentSchema.index({ segment: 1 });
