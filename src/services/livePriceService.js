@@ -102,6 +102,24 @@ class LivePriceService {
       const accessToken = await kiteService.getStoredAccessToken();
       if (!accessToken) {
         console.log('⚠️  No Kite access token available for WebSocket');
+        
+        // Try auto-login once
+        if (!this.autoLoginAttempted) {
+          this.autoLoginAttempted = true;
+          console.log('🤖 Attempting auto-login...');
+          
+          const kiteAuthService = require('./kiteAuthService');
+          const loginResult = await kiteAuthService.performAutomatedLogin();
+          
+          if (loginResult.success) {
+            console.log('✅ Auto-login successful, connecting to WebSocket...');
+            // Retry connection immediately
+            return this._connectToKite();
+          } else {
+            console.log('❌ Auto-login failed:', loginResult.error);
+          }
+        }
+        
         console.log('   Will retry in 30 seconds...');
         this.reconnectTimer = setTimeout(() => this._connectToKite(), 30000);
         return;
@@ -117,6 +135,7 @@ class LivePriceService {
       this.kiteTicker.on('open', () => {
         console.log('✅ Connected to Kite WebSocket');
         this.isKiteConnected = true;
+        this.autoLoginAttempted = false; // Reset for next disconnect
         this._broadcastToClients({
           type: 'kite_status',
           connected: true,

@@ -60,7 +60,7 @@ server.listen(PORT, async () => {
       console.log('🤖 Attempting auto-login...\n');
       
       const loginResult = await kiteAuthService.performAutomatedLogin();
-      
+      console.log({loginResult})
       if (loginResult.success) {
         console.log('✅ Kite auto-login successful!');
       } else {

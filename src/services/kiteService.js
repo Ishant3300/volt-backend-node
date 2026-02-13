@@ -524,6 +524,39 @@ class KiteService {
   }
 
   /**
+   * Get market depth for an instrument
+   */
+  async getMarketDepth(exchange, tradingsymbol) {
+    try {
+      const accessToken = await this.getStoredAccessToken();
+      if (!accessToken) {
+        throw new Error('Not authenticated');
+      }
+
+      const instrumentKey = `${exchange}:${tradingsymbol}`;
+      const response = await axios.get(
+        `${this.baseUrl}/quote/ohlc`,
+        {
+          params: { i: instrumentKey },
+          headers: {
+            'X-Kite-Version': '3',
+            'Authorization': `token ${this.apiKey}:${accessToken}`
+          }
+        }
+      );
+
+      if (response.data && response.data.status === 'success') {
+        return response.data.data;
+      }
+
+      return null;
+    } catch (error) {
+      console.error('Error fetching market depth:', error.message);
+      throw error;
+    }
+  }
+
+  /**
    * Check authentication status
    */
   async isAuthenticated() {

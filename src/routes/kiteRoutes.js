@@ -20,6 +20,10 @@ const {
   getLatestQuotes,
   getLTPByToken,
   
+  // Option Chain & Market Depth
+  getOptionChain,
+  getMarketDepth,
+  
   // Profile
   getProfile
 } = require('../controllers/kiteController');
@@ -70,6 +74,12 @@ router.get('/quotes/latest', getLatestQuotes);
 
 // Get LTP by instrument token
 router.get('/quotes/ltp/:instrumentToken', getLTPByToken);
+
+// Get option chain for an instrument
+router.get('/option-chain/:tradingSymbol', getOptionChain);
+
+// Get market depth for an instrument
+router.get('/market-depth/:instrumentToken', getMarketDepth);
 
 // ==================== PROFILE ROUTES ====================
 

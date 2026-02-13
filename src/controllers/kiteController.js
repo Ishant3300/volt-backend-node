@@ -353,6 +353,179 @@ const getProfile = async (req, res) => {
   }
 };
 
+// ==================== OPTION CHAIN ====================
+
+/**
+ * Get option chain for a trading symbol
+ */
+const getOptionChain = async (req, res) => {
+  try {
+    const { tradingSymbol } = req.params;
+    const { expiry } = req.query; // Optional expiry filter
+    
+    console.log(`📊 Fetching option chain for ${tradingSymbol}`);
+    
+    const KiteInstrument = require('../models/KiteInstrument');
+    
+    // Build query
+    const query = {
+      tradingsymbol: new RegExp(`^${tradingSymbol}`, 'i'),
+      instrument_type: { $in: ['CE', 'PE'] },
+      segment: 'NFO-OPT'
+    };
+    
+    if (expiry) {
+      query.expiry = new Date(expiry);
+    }
+    
+    // Get all options for this symbol
+    const options = await KiteInstrument.find(query)
+      .sort({ strike: 1, instrument_type: 1 })
+      .lean();
+    
+    console.log(`   Found ${options.length} options`);
+    
+    // Try to fetch live quotes for these options (if Kite is authenticated)
+    let liveQuotes = {};
+    try {
+      const accessToken = await kiteService.getStoredAccessToken();
+      if (accessToken && options.length > 0) {
+        // Kite quote API expects exchange:tradingsymbol format, NOT instrument_token
+        const batchSize = 100;
+        const instrumentKeys = options.map(o => `${o.exchange}:${o.tradingsymbol}`);
+        
+        for (let i = 0; i < instrumentKeys.length; i += batchSize) {
+          const batch = instrumentKeys.slice(i, i + batchSize);
+          try {
+            const quotes = await kiteService.getMarketQuotes(batch, 'ltp');
+            liveQuotes = { ...liveQuotes, ...quotes };
+          } catch (quoteError) {
+            console.log(`   ⚠️  Failed to fetch quotes for batch ${i}: ${quoteError.message}`);
+          }
+        }
+        console.log(`   ✅ Fetched live quotes for ${Object.keys(liveQuotes).length} options`);
+      }
+    } catch (quoteError) {
+      console.log(`   ⚠️  Could not fetch live quotes: ${quoteError.message}`);
+    }
+    
+    // Group by strike price and merge with live quotes
+    const optionChain = {};
+    
+    options.forEach(option => {
+      const strike = option.strike;
+      if (!optionChain[strike]) {
+        optionChain[strike] = { strike, CE: null, PE: null };
+      }
+      
+      // Merge live quote data if available — key matches exchange:tradingsymbol
+      const quoteKey = `${option.exchange}:${option.tradingsymbol}`;
+      if (liveQuotes[quoteKey]) {
+        option.last_price = liveQuotes[quoteKey].last_price || option.last_price;
+        option.volume = liveQuotes[quoteKey].volume;
+        option.buy_quantity = liveQuotes[quoteKey].buy_quantity;
+        option.sell_quantity = liveQuotes[quoteKey].sell_quantity;
+      }
+      
+      if (option.instrument_type === 'CE') {
+        optionChain[strike].CE = option;
+      } else if (option.instrument_type === 'PE') {
+        optionChain[strike].PE = option;
+      }
+    });
+    
+    // Convert to array and sort by strike
+    const chainArray = Object.values(optionChain).sort((a, b) => a.strike - b.strike);
+    
+    res.json({
+      success: true,
+      message: `Found ${chainArray.length} strike prices`,
+      data: {
+        tradingSymbol,
+        expiry: expiry || 'all',
+        chain: chainArray,
+        hasLiveData: Object.keys(liveQuotes).length > 0
+      }
+    });
+    
+  } catch (error) {
+    console.error('❌ Error fetching option chain:', error);
+    res.status(500).json({
+      success: false,
+      message: error.message,
+      data: null
+    });
+  }
+};
+
+/**
+ * Get market depth for an instrument
+ */
+const getMarketDepth = async (req, res) => {
+  try {
+    const { instrumentToken } = req.params;
+    
+    console.log(`📊 Fetching market depth for token ${instrumentToken}`);
+    
+    // First, get instrument details from database
+    const KiteInstrument = require('../models/KiteInstrument');
+    const instrument = await KiteInstrument.findOne({ instrument_token: instrumentToken });
+    
+    if (!instrument) {
+      return res.status(404).json({
+        success: false,
+        message: 'Instrument not found',
+        data: null
+      });
+    }
+    
+    // Get market depth from Kite API
+    try {
+      const depth = await kiteService.getMarketDepth(instrument.exchange, instrument.tradingsymbol);
+      
+      if (depth && Object.keys(depth).length > 0) {
+        return res.json({
+          success: true,
+          message: 'Market depth fetched successfully',
+          data: depth
+        });
+      }
+    } catch (apiError) {
+      console.log(`   ⚠️  Kite API error: ${apiError.message}`);
+    }
+    
+    // Fallback: return instrument data from database
+    console.log(`   ℹ️  Using database data (market may be closed)`);
+    res.json({
+      success: true,
+      message: 'Market depth from database (market may be closed)',
+      data: {
+        [`${instrument.exchange}:${instrument.tradingsymbol}`]: {
+          instrument_token: instrumentToken,
+          last_price: instrument.last_price,
+          ohlc: {
+            open: instrument.last_price,
+            high: instrument.last_price,
+            low: instrument.last_price,
+            close: instrument.last_price
+          },
+          volume: 0,
+          tradingsymbol: instrument.tradingsymbol,
+          exchange: instrument.exchange
+        }
+      }
+    });
+    
+  } catch (error) {
+    console.error('❌ Error fetching market depth:', error);
+    res.status(500).json({
+      success: false,
+      message: error.message,
+      data: null
+    });
+  }
+};
+
 module.exports = {
   // Authentication
   initiateLogin,
@@ -371,6 +544,10 @@ module.exports = {
   fetchQuotes,
   getLatestQuotes,
   getLTPByToken,
+  
+  // Option Chain & Market Depth
+  getOptionChain,
+  getMarketDepth,
   
   // Profile
   getProfile
