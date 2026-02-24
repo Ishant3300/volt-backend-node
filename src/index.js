@@ -22,6 +22,14 @@ const authRoutes = require('./routes/authRoutes');
 const adminRoutes = require('./routes/adminRoutes');
 const kiteRoutes = require('./routes/kiteRoutes');
 const watchlistRoutes = require('./routes/watchlistRoutes');
+const masterRoutes = require('./routes/masterRoutes');
+const messageRoutes = require('./routes/messageRoutes');
+const masterFlowRoutes = require('./routes/masterFlowRoutes');
+const serverRoutes = require('./routes/serverRoutes');
+
+// Import new models to ensure they're registered
+require('./models/Trade');
+require('./models/CreditTransaction');
 
 // Routes
 app.get('/', (req, res) => {
@@ -36,6 +44,10 @@ app.use('/api/auth', authRoutes);
 app.use('/api/admin', adminRoutes);
 app.use('/api/kite', kiteRoutes);
 app.use('/api/watchlist', watchlistRoutes);
+app.use('/api/masters', masterRoutes);
+app.use('/api/master', masterFlowRoutes); // Master Flow routes
+app.use('/api/master/messages', messageRoutes);
+app.use('/api/servers', serverRoutes); // Server routes
 
 // Start server
 const PORT = process.env.PORT || 5000;

@@ -2,6 +2,10 @@ const bcrypt = require('bcryptjs');
 const User = require('../models/User');
 const Master = require('../models/Master');
 const Server = require('../models/Server');
+const GroupedQuantity = require('../models/GroupedQuantity');
+const ScriptQuantity = require('../models/ScriptQuantity');
+const TradeMargin = require('../models/TradeMargin');
+const BrokerageSettings = require('../models/BrokerageSettings');
 
 // Create User
 const createUser = async (req, res) => {
@@ -282,4 +286,734 @@ module.exports = {
   getUserById,
   updateUser,
   deleteUser
+};
+
+// ============================================
+// Grouped Quantity CRUD Operations
+// ============================================
+
+// Create Grouped Quantity
+const createGroupedQuantity = async (req, res) => {
+  try {
+    const { exchange_name, lot_name, instrument_id, instrument_symbol, max_qty, break_qty, lot_size } = req.body;
+
+    console.log('📥 Creating grouped quantity:', {
+      exchange_name,
+      lot_name,
+      instrument_id,
+      instrument_symbol,
+      max_qty,
+      break_qty,
+      lot_size
+    });
+
+    if (!exchange_name || !lot_name || !instrument_id || !instrument_symbol || max_qty === undefined || break_qty === undefined || lot_size === undefined) {
+      console.log('❌ Validation failed - missing required fields');
+      return res.status(400).json({
+        success: false,
+        message: 'exchange_name, lot_name, instrument_id, instrument_symbol, max_qty, break_qty, and lot_size are required',
+        data: null
+      });
+    }
+
+    const groupedQty = await GroupedQuantity.create({
+      exchange_name,
+      lot_name,
+      instrument_id,
+      instrument_symbol,
+      max_qty,
+      break_qty,
+      lot_size
+    });
+
+    console.log('✅ Grouped quantity created:', groupedQty._id);
+
+    res.status(201).json({
+      success: true,
+      message: 'Grouped quantity created successfully',
+      data: groupedQty.toJSON()
+    });
+  } catch (error) {
+    console.error('❌ Error creating grouped quantity:', error);
+    res.status(500).json({
+      success: false,
+      message: error.message,
+      data: null
+    });
+  }
+};
+
+// Get All Grouped Quantities
+const getAllGroupedQuantities = async (req, res) => {
+  try {
+    const { page = 1, limit = 20 } = req.query;
+
+    const filter = { deleted_at: null };
+
+    const groupedQuantities = await GroupedQuantity.find(filter)
+      .limit(limit * 1)
+      .skip((page - 1) * limit)
+      .sort({ created_at: -1 });
+
+    const count = await GroupedQuantity.countDocuments(filter);
+
+    res.status(200).json({
+      success: true,
+      message: 'Grouped quantities retrieved successfully',
+      data: {
+        grouped_quantities: groupedQuantities.map(gq => gq.toJSON()),
+        total: count,
+        page: parseInt(page),
+        pages: Math.ceil(count / limit)
+      }
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: error.message,
+      data: null
+    });
+  }
+};
+
+// Get Grouped Quantity by ID
+const getGroupedQuantityById = async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const groupedQty = await GroupedQuantity.findById(id);
+
+    if (!groupedQty || groupedQty.deleted_at) {
+      return res.status(404).json({
+        success: false,
+        message: 'Grouped quantity not found',
+        data: null
+      });
+    }
+
+    res.status(200).json({
+      success: true,
+      message: 'Grouped quantity retrieved successfully',
+      data: groupedQty.toJSON()
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: error.message,
+      data: null
+    });
+  }
+};
+
+// Update Grouped Quantity
+const updateGroupedQuantity = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { exchange_name, lot_name, instrument_id, instrument_symbol, max_qty, break_qty, lot_size } = req.body;
+
+    const groupedQty = await GroupedQuantity.findById(id);
+
+    if (!groupedQty || groupedQty.deleted_at) {
+      return res.status(404).json({
+        success: false,
+        message: 'Grouped quantity not found',
+        data: null
+      });
+    }
+
+    if (exchange_name) groupedQty.exchange_name = exchange_name;
+    if (lot_name) groupedQty.lot_name = lot_name;
+    if (instrument_id) groupedQty.instrument_id = instrument_id;
+    if (instrument_symbol) groupedQty.instrument_symbol = instrument_symbol;
+    if (max_qty !== undefined) groupedQty.max_qty = max_qty;
+    if (break_qty !== undefined) groupedQty.break_qty = break_qty;
+    if (lot_size !== undefined) groupedQty.lot_size = lot_size;
+
+    await groupedQty.save();
+
+    res.status(200).json({
+      success: true,
+      message: 'Grouped quantity updated successfully',
+      data: groupedQty.toJSON()
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: error.message,
+      data: null
+    });
+  }
+};
+
+// Delete Grouped Quantity (Soft Delete)
+const deleteGroupedQuantity = async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const groupedQty = await GroupedQuantity.findById(id);
+
+    if (!groupedQty || groupedQty.deleted_at) {
+      return res.status(404).json({
+        success: false,
+        message: 'Grouped quantity not found',
+        data: null
+      });
+    }
+
+    groupedQty.deleted_at = new Date();
+    await groupedQty.save();
+
+    res.status(200).json({
+      success: true,
+      message: 'Grouped quantity deleted successfully',
+      data: null
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: error.message,
+      data: null
+    });
+  }
+};
+
+// ============================================
+// Script Quantity CRUD Operations
+// ============================================
+
+// Create Script Quantity
+const createScriptQuantity = async (req, res) => {
+  try {
+    const { exchange_name, script_name, lot_size, max_qty, brk_qty } = req.body;
+
+    if (!exchange_name || !script_name || lot_size === undefined || max_qty === undefined || brk_qty === undefined) {
+      return res.status(400).json({
+        success: false,
+        message: 'exchange_name, script_name, lot_size, max_qty, and brk_qty are required',
+        data: null
+      });
+    }
+
+    const scriptQty = await ScriptQuantity.create({
+      exchange_name,
+      script_name,
+      lot_size,
+      max_qty,
+      brk_qty
+    });
+
+    res.status(201).json({
+      success: true,
+      message: 'Script quantity created successfully',
+      data: scriptQty.toJSON()
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: error.message,
+      data: null
+    });
+  }
+};
+
+// Get All Script Quantities
+const getAllScriptQuantities = async (req, res) => {
+  try {
+    const { page = 1, limit = 20 } = req.query;
+
+    const filter = { deleted_at: null };
+
+    const scriptQuantities = await ScriptQuantity.find(filter)
+      .limit(limit * 1)
+      .skip((page - 1) * limit)
+      .sort({ created_at: -1 });
+
+    const count = await ScriptQuantity.countDocuments(filter);
+
+    res.status(200).json({
+      success: true,
+      message: 'Script quantities retrieved successfully',
+      data: {
+        script_quantities: scriptQuantities.map(sq => sq.toJSON()),
+        total: count,
+        page: parseInt(page),
+        pages: Math.ceil(count / limit)
+      }
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: error.message,
+      data: null
+    });
+  }
+};
+
+// Get Script Quantity by ID
+const getScriptQuantityById = async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const scriptQty = await ScriptQuantity.findById(id);
+
+    if (!scriptQty || scriptQty.deleted_at) {
+      return res.status(404).json({
+        success: false,
+        message: 'Script quantity not found',
+        data: null
+      });
+    }
+
+    res.status(200).json({
+      success: true,
+      message: 'Script quantity retrieved successfully',
+      data: scriptQty.toJSON()
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: error.message,
+      data: null
+    });
+  }
+};
+
+// Update Script Quantity
+const updateScriptQuantity = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { exchange_name, script_name, lot_size, max_qty, brk_qty } = req.body;
+
+    const scriptQty = await ScriptQuantity.findById(id);
+
+    if (!scriptQty || scriptQty.deleted_at) {
+      return res.status(404).json({
+        success: false,
+        message: 'Script quantity not found',
+        data: null
+      });
+    }
+
+    if (exchange_name) scriptQty.exchange_name = exchange_name;
+    if (script_name) scriptQty.script_name = script_name;
+    if (lot_size !== undefined) scriptQty.lot_size = lot_size;
+    if (max_qty !== undefined) scriptQty.max_qty = max_qty;
+    if (brk_qty !== undefined) scriptQty.brk_qty = brk_qty;
+
+    await scriptQty.save();
+
+    res.status(200).json({
+      success: true,
+      message: 'Script quantity updated successfully',
+      data: scriptQty.toJSON()
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: error.message,
+      data: null
+    });
+  }
+};
+
+// Delete Script Quantity (Soft Delete)
+const deleteScriptQuantity = async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const scriptQty = await ScriptQuantity.findById(id);
+
+    if (!scriptQty || scriptQty.deleted_at) {
+      return res.status(404).json({
+        success: false,
+        message: 'Script quantity not found',
+        data: null
+      });
+    }
+
+    scriptQty.deleted_at = new Date();
+    await scriptQty.save();
+
+    res.status(200).json({
+      success: true,
+      message: 'Script quantity deleted successfully',
+      data: null
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: error.message,
+      data: null
+    });
+  }
+};
+
+// ============================================
+// Trade Margin CRUD Operations
+// ============================================
+
+// Create Trade Margin
+const createTradeMargin = async (req, res) => {
+  try {
+    const { exchange_name, script_name, amount_type, trade_margin } = req.body;
+
+    if (!exchange_name || !script_name || !amount_type || trade_margin === undefined) {
+      return res.status(400).json({
+        success: false,
+        message: 'exchange_name, script_name, amount_type, and trade_margin are required',
+        data: null
+      });
+    }
+
+    const tradeMarginDoc = await TradeMargin.create({
+      exchange_name,
+      script_name,
+      amount_type,
+      trade_margin
+    });
+
+    res.status(201).json({
+      success: true,
+      message: 'Trade margin created successfully',
+      data: tradeMarginDoc.toJSON()
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: error.message,
+      data: null
+    });
+  }
+};
+
+// Get All Trade Margins
+const getAllTradeMargins = async (req, res) => {
+  try {
+    const { page = 1, limit = 20 } = req.query;
+
+    const filter = { deleted_at: null };
+
+    const tradeMargins = await TradeMargin.find(filter)
+      .limit(limit * 1)
+      .skip((page - 1) * limit)
+      .sort({ created_at: -1 });
+
+    const count = await TradeMargin.countDocuments(filter);
+
+    res.status(200).json({
+      success: true,
+      message: 'Trade margins retrieved successfully',
+      data: {
+        trade_margins: tradeMargins.map(tm => tm.toJSON()),
+        total: count,
+        page: parseInt(page),
+        pages: Math.ceil(count / limit)
+      }
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: error.message,
+      data: null
+    });
+  }
+};
+
+// Get Trade Margin by ID
+const getTradeMarginById = async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const tradeMargin = await TradeMargin.findById(id);
+
+    if (!tradeMargin || tradeMargin.deleted_at) {
+      return res.status(404).json({
+        success: false,
+        message: 'Trade margin not found',
+        data: null
+      });
+    }
+
+    res.status(200).json({
+      success: true,
+      message: 'Trade margin retrieved successfully',
+      data: tradeMargin.toJSON()
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: error.message,
+      data: null
+    });
+  }
+};
+
+// Update Trade Margin
+const updateTradeMargin = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { exchange_name, script_name, amount_type, trade_margin } = req.body;
+
+    const tradeMargin = await TradeMargin.findById(id);
+
+    if (!tradeMargin || tradeMargin.deleted_at) {
+      return res.status(404).json({
+        success: false,
+        message: 'Trade margin not found',
+        data: null
+      });
+    }
+
+    if (exchange_name) tradeMargin.exchange_name = exchange_name;
+    if (script_name) tradeMargin.script_name = script_name;
+    if (amount_type) tradeMargin.amount_type = amount_type;
+    if (trade_margin !== undefined) tradeMargin.trade_margin = trade_margin;
+
+    await tradeMargin.save();
+
+    res.status(200).json({
+      success: true,
+      message: 'Trade margin updated successfully',
+      data: tradeMargin.toJSON()
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: error.message,
+      data: null
+    });
+  }
+};
+
+// Delete Trade Margin (Soft Delete)
+const deleteTradeMargin = async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const tradeMargin = await TradeMargin.findById(id);
+
+    if (!tradeMargin || tradeMargin.deleted_at) {
+      return res.status(404).json({
+        success: false,
+        message: 'Trade margin not found',
+        data: null
+      });
+    }
+
+    tradeMargin.deleted_at = new Date();
+    await tradeMargin.save();
+
+    res.status(200).json({
+      success: true,
+      message: 'Trade margin deleted successfully',
+      data: null
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: error.message,
+      data: null
+    });
+  }
+};
+
+// ==================== BROKERAGE SETTINGS ====================
+
+// Create Brokerage Settings
+const createBrokerageSettings = async (req, res) => {
+  try {
+    const { type, exchange_name, script_name, brk_value } = req.body;
+
+    if (!type || !exchange_name || !script_name || brk_value === undefined) {
+      return res.status(400).json({
+        success: false,
+        message: 'type, exchange_name, script_name, and brk_value are required',
+        data: null
+      });
+    }
+
+    const newBrokerageSettings = new BrokerageSettings({
+      type,
+      exchange_name,
+      script_name,
+      brk_value
+    });
+
+    await newBrokerageSettings.save();
+
+    res.status(201).json({
+      success: true,
+      message: 'Brokerage settings created successfully',
+      data: newBrokerageSettings.toJSON()
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: error.message,
+      data: null
+    });
+  }
+};
+
+// Get All Brokerage Settings
+const getAllBrokerageSettings = async (req, res) => {
+  try {
+    const { page = 1, limit = 20 } = req.query;
+
+    const filter = { deleted_at: null };
+
+    const brokerageSettings = await BrokerageSettings.find(filter)
+      .limit(limit * 1)
+      .skip((page - 1) * limit)
+      .sort({ created_at: -1 });
+
+    const count = await BrokerageSettings.countDocuments(filter);
+
+    res.status(200).json({
+      success: true,
+      message: 'Brokerage settings retrieved successfully',
+      data: {
+        brokerage_settings: brokerageSettings.map(bs => bs.toJSON()),
+        total: count,
+        page: parseInt(page),
+        pages: Math.ceil(count / limit)
+      }
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: error.message,
+      data: null
+    });
+  }
+};
+
+// Get Brokerage Settings by ID
+const getBrokerageSettingsById = async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const brokerageSettings = await BrokerageSettings.findById(id);
+
+    if (!brokerageSettings || brokerageSettings.deleted_at) {
+      return res.status(404).json({
+        success: false,
+        message: 'Brokerage settings not found',
+        data: null
+      });
+    }
+
+    res.status(200).json({
+      success: true,
+      message: 'Brokerage settings retrieved successfully',
+      data: brokerageSettings.toJSON()
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: error.message,
+      data: null
+    });
+  }
+};
+
+// Update Brokerage Settings
+const updateBrokerageSettings = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { type, exchange_name, script_name, brk_value } = req.body;
+
+    const brokerageSettings = await BrokerageSettings.findById(id);
+
+    if (!brokerageSettings || brokerageSettings.deleted_at) {
+      return res.status(404).json({
+        success: false,
+        message: 'Brokerage settings not found',
+        data: null
+      });
+    }
+
+    if (type) brokerageSettings.type = type;
+    if (exchange_name) brokerageSettings.exchange_name = exchange_name;
+    if (script_name) brokerageSettings.script_name = script_name;
+    if (brk_value !== undefined) brokerageSettings.brk_value = brk_value;
+
+    await brokerageSettings.save();
+
+    res.status(200).json({
+      success: true,
+      message: 'Brokerage settings updated successfully',
+      data: brokerageSettings.toJSON()
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: error.message,
+      data: null
+    });
+  }
+};
+
+// Delete Brokerage Settings (Soft Delete)
+const deleteBrokerageSettings = async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const brokerageSettings = await BrokerageSettings.findById(id);
+
+    if (!brokerageSettings || brokerageSettings.deleted_at) {
+      return res.status(404).json({
+        success: false,
+        message: 'Brokerage settings not found',
+        data: null
+      });
+    }
+
+    brokerageSettings.deleted_at = new Date();
+    await brokerageSettings.save();
+
+    res.status(200).json({
+      success: true,
+      message: 'Brokerage settings deleted successfully',
+      data: null
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: error.message,
+      data: null
+    });
+  }
+};
+
+module.exports = {
+  createUser,
+  getAllUsers,
+  getUserById,
+  updateUser,
+  deleteUser,
+  // Grouped Quantity
+  createGroupedQuantity,
+  getAllGroupedQuantities,
+  getGroupedQuantityById,
+  updateGroupedQuantity,
+  deleteGroupedQuantity,
+  // Script Quantity
+  createScriptQuantity,
+  getAllScriptQuantities,
+  getScriptQuantityById,
+  updateScriptQuantity,
+  deleteScriptQuantity,
+  // Trade Margin
+  createTradeMargin,
+  getAllTradeMargins,
+  getTradeMarginById,
+  updateTradeMargin,
+  deleteTradeMargin,
+  // Brokerage Settings
+  createBrokerageSettings,
+  getAllBrokerageSettings,
+  getBrokerageSettingsById,
+  updateBrokerageSettings,
+  deleteBrokerageSettings
 };

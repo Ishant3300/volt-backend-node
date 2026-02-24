@@ -14,20 +14,16 @@ const watchlistSchema = new mongoose.Schema({
     type: Number,
     required: true
   },
-  user_id: {
+  owner_id: {
     type: mongoose.Schema.Types.ObjectId,
-    ref: 'User',
-    required: true
+    required: true,
+    // Can reference either User or Admin
+    refPath: 'owner_type'
   },
-  master_id: {
-    type: mongoose.Schema.Types.ObjectId,
-    ref: 'Master',
-    required: true
-  },
-  admin_id: {
-    type: mongoose.Schema.Types.ObjectId,
-    ref: 'Admin',
-    required: true
+  owner_type: {
+    type: String,
+    required: true,
+    enum: ['User', 'Admin']
   },
   deleted_at: {
     type: Date,
@@ -52,10 +48,8 @@ watchlistSchema.set('toJSON', {
 });
 
 // Indexes
-watchlistSchema.index({ user_id: 1 });
-watchlistSchema.index({ master_id: 1 });
-watchlistSchema.index({ admin_id: 1 });
+watchlistSchema.index({ owner_id: 1, owner_type: 1 });
 watchlistSchema.index({ kite_instrument_id: 1 });
-watchlistSchema.index({ user_id: 1, order: 1 });
+watchlistSchema.index({ owner_id: 1, order: 1 });
 
 module.exports = mongoose.model('Watchlist', watchlistSchema);

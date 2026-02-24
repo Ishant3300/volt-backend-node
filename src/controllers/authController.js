@@ -2,6 +2,7 @@ const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
 const User = require('../models/User');
 const Admin = require('../models/Admin');
+const Master = require('../models/Master');
 
 // Generate JWT Token
 const generateToken = (id, role) => {
@@ -52,8 +53,10 @@ const userLogin = async (req, res) => {
     // Generate new token (no expiration)
     const token = generateToken(user._id, 'user');
 
-    // Update active_token to invalidate previous sessions
+    // Update active_token, last_login, and IP address
     user.active_token = token;
+    user.last_login = new Date();
+    user.ip_address = req.ip || req.connection.remoteAddress || req.socket.remoteAddress || (req.connection.socket ? req.connection.socket.remoteAddress : null);
     await user.save();
 
     res.status(200).json({
@@ -192,9 +195,109 @@ const adminLogout = async (req, res) => {
   }
 };
 
+// Master Login
+const masterLogin = async (req, res) => {
+  try {
+    const { username, password } = req.body;
+
+    if (!username || !password) {
+      return res.status(400).json({
+        success: false,
+        message: 'Username and password are required',
+        data: null
+      });
+    }
+
+    const master = await Master.findOne({ username });
+
+    if (!master || master.deleted_at) {
+      return res.status(401).json({
+        success: false,
+        message: 'Invalid credentials',
+        data: null
+      });
+    }
+
+    if (master.status !== 'active') {
+      return res.status(403).json({
+        success: false,
+        message: 'Account is not active',
+        data: null
+      });
+    }
+
+    const isPasswordValid = await bcrypt.compare(password, master.password);
+
+    if (!isPasswordValid) {
+      return res.status(401).json({
+        success: false,
+        message: 'Invalid credentials',
+        data: null
+      });
+    }
+
+    // Generate new token (no expiration)
+    const token = generateToken(master._id, 'master');
+
+    // Update active_token, last_login, and IP address
+    master.active_token = token;
+    master.last_login = new Date();
+    master.ip_address = req.ip || req.connection.remoteAddress || req.socket.remoteAddress || (req.connection.socket ? req.connection.socket.remoteAddress : null);
+    await master.save();
+
+    res.status(200).json({
+      success: true,
+      message: 'Login successful',
+      data: {
+        token,
+        master: master.toJSON()
+      }
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: error.message,
+      data: null
+    });
+  }
+};
+
+// Master Logout
+const masterLogout = async (req, res) => {
+  try {
+    const master = await Master.findById(req.master.id);
+
+    if (!master) {
+      return res.status(404).json({
+        success: false,
+        message: 'Master not found',
+        data: null
+      });
+    }
+
+    // Clear active token
+    master.active_token = null;
+    await master.save();
+
+    res.status(200).json({
+      success: true,
+      message: 'Logout successful',
+      data: null
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: error.message,
+      data: null
+    });
+  }
+};
+
 module.exports = {
   userLogin,
   adminLogin,
+  masterLogin,
   userLogout,
-  adminLogout
+  adminLogout,
+  masterLogout
 };

@@ -1,0 +1,122 @@
+const mongoose = require('mongoose');
+
+const tradeSchema = new mongoose.Schema({
+  user_id: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'User',
+    required: true
+  },
+  master_id: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'Master',
+    required: true
+  },
+  admin_id: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'Admin',
+    required: true
+  },
+  instrument_token: {
+    type: String,
+    required: true
+  },
+  tradingsymbol: {
+    type: String,
+    required: true
+  },
+  exchange: {
+    type: String,
+    required: true,
+    enum: ['NSE', 'BSE', 'NFO', 'BFO', 'MCX', 'CDS']
+  },
+  transaction_type: {
+    type: String,
+    required: true,
+    enum: ['BUY', 'SELL']
+  },
+  quantity: {
+    type: Number,
+    required: true
+  },
+  price: {
+    type: Number,
+    required: true
+  },
+  order_type: {
+    type: String,
+    required: true,
+    enum: ['MARKET', 'LIMIT', 'SL', 'SL-M']
+  },
+  status: {
+    type: String,
+    required: true,
+    enum: ['pending', 'completed', 'cancelled', 'rejected'],
+    default: 'pending'
+  },
+  order_id: {
+    type: String,
+    default: null
+  },
+  executed_at: {
+    type: Date,
+    default: null
+  },
+  executed_price: {
+    type: Number,
+    default: null
+  },
+  executed_quantity: {
+    type: Number,
+    default: null
+  },
+  pnl: {
+    type: Number,
+    default: 0
+  },
+  brokerage: {
+    type: Number,
+    default: 0
+  },
+  taxes: {
+    type: Number,
+    default: 0
+  },
+  net_amount: {
+    type: Number,
+    default: 0
+  },
+  remarks: {
+    type: String,
+    default: ''
+  },
+  deleted_at: {
+    type: Date,
+    default: null
+  }
+}, {
+  timestamps: true
+});
+
+// Transform _id to id and timestamps to snake_case
+tradeSchema.set('toJSON', {
+  transform: (doc, ret) => {
+    ret.id = ret._id;
+    delete ret._id;
+    delete ret.__v;
+    ret.created_at = ret.createdAt;
+    ret.updated_at = ret.updatedAt;
+    delete ret.createdAt;
+    delete ret.updatedAt;
+    return ret;
+  }
+});
+
+// Indexes
+tradeSchema.index({ user_id: 1, created_at: -1 });
+tradeSchema.index({ master_id: 1, created_at: -1 });
+tradeSchema.index({ admin_id: 1, created_at: -1 });
+tradeSchema.index({ status: 1 });
+tradeSchema.index({ instrument_token: 1 });
+tradeSchema.index({ executed_at: -1 });
+
+module.exports = mongoose.model('Trade', tradeSchema);

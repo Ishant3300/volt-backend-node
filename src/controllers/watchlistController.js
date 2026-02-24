@@ -8,21 +8,36 @@ const Master = require('../models/Master');
 const getWatchlist = async (req, res) => {
   try {
     const userId = req.user?.id || req.admin?.id;
-    const isAdmin = req.admin !== null;
+    const ownerType = req.admin ? 'Admin' : 'User';
+
+    console.log('📋 Getting watchlist for:', {
+      userId,
+      ownerType
+    });
 
     const filter = {
+      owner_id: userId,
+      owner_type: ownerType,
       deleted_at: null,
     };
 
-    if (isAdmin) {
-      filter.admin_id = userId;
-    } else {
-      filter.user_id = userId;
-    }
+    console.log('   Query filter:', filter);
 
     const watchlist = await Watchlist.find(filter)
       .populate('kite_instrument_id')
       .sort({ order: 1 });
+
+    console.log(`   Found ${watchlist.length} documents before filtering`);
+    
+    // Log each item to see if kite_instrument_id is populated
+    watchlist.forEach((item, index) => {
+      console.log(`   Item ${index + 1}:`, {
+        id: item._id,
+        instrument_token: item.instrument_token,
+        kite_instrument_id: item.kite_instrument_id ? 'POPULATED' : 'NULL',
+        kite_instrument_exists: !!item.kite_instrument_id
+      });
+    });
 
     const items = watchlist
       .filter(item => item.kite_instrument_id)
@@ -33,6 +48,8 @@ const getWatchlist = async (req, res) => {
         instrument: item.kite_instrument_id,
         created_at: item.createdAt,
       }));
+
+    console.log(`   Returning ${items.length} items after filtering`);
 
     res.status(200).json({
       success: true,
@@ -55,7 +72,7 @@ const getWatchlist = async (req, res) => {
 const addToWatchlist = async (req, res) => {
   try {
     const userId = req.user?.id || req.admin?.id;
-    const isAdmin = req.admin !== null;
+    const ownerType = req.admin ? 'Admin' : 'User';
     const { kite_instrument_id, instrument_token } = req.body;
 
     if (!kite_instrument_id || !instrument_token) {
@@ -68,15 +85,11 @@ const addToWatchlist = async (req, res) => {
 
     // Check if already in watchlist
     const filter = {
+      owner_id: userId,
+      owner_type: ownerType,
       kite_instrument_id,
       deleted_at: null,
     };
-
-    if (isAdmin) {
-      filter.admin_id = userId;
-    } else {
-      filter.user_id = userId;
-    }
 
     const existing = await Watchlist.findOne(filter);
 
@@ -88,56 +101,18 @@ const addToWatchlist = async (req, res) => {
       });
     }
 
-    let watchlistData = {
+    // Get next order number
+    const countFilter = { owner_id: userId, owner_type: ownerType, deleted_at: null };
+    const lastItem = await Watchlist.findOne(countFilter).sort({ order: -1 });
+    const nextOrder = lastItem ? lastItem.order + 1 : 1;
+
+    const watchlistData = {
       kite_instrument_id,
       instrument_token,
+      order: nextOrder,
+      owner_id: userId,
+      owner_type: ownerType,
     };
-
-    if (isAdmin) {
-      // Admin watchlist - use admin's ID for all fields
-      const countFilter = { admin_id: userId, deleted_at: null };
-      const lastItem = await Watchlist.findOne(countFilter).sort({ order: -1 });
-      const nextOrder = lastItem ? lastItem.order + 1 : 1;
-
-      watchlistData = {
-        ...watchlistData,
-        order: nextOrder,
-        admin_id: userId,
-        master_id: userId, // For admin, use same ID
-        user_id: userId,   // For admin, use same ID
-      };
-    } else {
-      // User watchlist - get master_id and admin_id from user
-      const user = await User.findById(userId);
-      if (!user) {
-        return res.status(404).json({
-          success: false,
-          message: 'User not found',
-          data: null,
-        });
-      }
-
-      const master = await Master.findById(user.master_id);
-      if (!master) {
-        return res.status(404).json({
-          success: false,
-          message: 'Master not found',
-          data: null,
-        });
-      }
-
-      const countFilter = { user_id: userId, deleted_at: null };
-      const lastItem = await Watchlist.findOne(countFilter).sort({ order: -1 });
-      const nextOrder = lastItem ? lastItem.order + 1 : 1;
-
-      watchlistData = {
-        ...watchlistData,
-        order: nextOrder,
-        user_id: userId,
-        master_id: user.master_id,
-        admin_id: master.admin_id,
-      };
-    }
 
     const watchlistItem = await Watchlist.create(watchlistData);
 
@@ -170,19 +145,15 @@ const addToWatchlist = async (req, res) => {
 const removeFromWatchlist = async (req, res) => {
   try {
     const userId = req.user?.id || req.admin?.id;
-    const isAdmin = req.admin !== null;
+    const ownerType = req.admin ? 'Admin' : 'User';
     const { id } = req.params;
 
     const filter = {
       _id: id,
+      owner_id: userId,
+      owner_type: ownerType,
       deleted_at: null,
     };
-
-    if (isAdmin) {
-      filter.admin_id = userId;
-    } else {
-      filter.user_id = userId;
-    }
 
     const item = await Watchlist.findOneAndUpdate(
       filter,
