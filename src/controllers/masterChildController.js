@@ -4,9 +4,12 @@ const Server = require('../models/Server');
 const Message = require('../models/Message');
 const Trade = require('../models/Trade');
 const CreditTransaction = require('../models/CreditTransaction');
+const mongoose = require('mongoose');
+const Transaction = require('../models/Transaction');
 
 // Create Child Master
 const createChildMaster = async (req, res) => {
+  const session = await mongoose.startSession();
   try {
     const {
       name,
@@ -47,189 +50,158 @@ const createChildMaster = async (req, res) => {
       });
     }
 
-    // Determine if request is from Admin or Master
     const isAdmin = !!req.admin;
     const isMaster = !!req.master;
-
-    let parentMaster = null;
     let adminId = null;
 
-    if (isAdmin) {
-      // Admin creating a master - no parent master, no credit deduction
-      adminId = req.admin.id;
-      console.log('👑 Admin creating master, adminId:', adminId);
-    } else if (isMaster) {
-      // Master creating a child master
-      parentMaster = await Master.findById(req.master.id);
+    let resultData;
+    let responseMessage;
 
-      if (!parentMaster) {
-        return res.status(404).json({
-          success: false,
-          message: 'Parent master not found',
-          data: null
-        });
+    await session.withTransaction(async () => {
+      let parentMaster = null;
+
+      if (isAdmin) {
+        adminId = req.admin.id;
+        console.log('👑 Admin creating master, adminId:', adminId);
+      } else if (isMaster) {
+        parentMaster = await Master.findById(req.master.id).session(session);
+
+        if (!parentMaster) throw new Error('Parent master not found');
+        if (!parentMaster.add_master) throw new Error('No permission to create child masters');
+        if (parentMaster.balance < credits) {
+          throw new Error(`Insufficient balance. Available: ${parentMaster.balance}, Required: ${credits}`);
+        }
+
+        adminId = parentMaster.admin_id;
+        console.log('👨‍💼 Master creating child master, parentId:', req.master.id, 'adminId:', adminId);
+      } else {
+        throw new Error('Unauthorized');
       }
 
-      // Check if parent master has add_master permission
-      if (!parentMaster.add_master) {
-        return res.status(403).json({
-          success: false,
-          message: 'You do not have permission to create child masters. You can only create users.',
-          data: null
-        });
-      }
+      const existingMaster = await Master.findOne({ username }).session(session);
+      if (existingMaster) throw new Error('Username already exists');
 
-      // Check if parent master has sufficient credits
-      if (parentMaster.credits < credits) {
-        return res.status(400).json({
-          success: false,
-          message: `Insufficient credits. Available: ${parentMaster.credits}, Required: ${credits}`,
-          data: null
-        });
-      }
+      const server = await Server.findById(server_id).session(session);
+      if (!server) throw new Error('Server not found');
 
-      adminId = parentMaster.admin_id;
-      console.log('👨‍💼 Master creating child master, parentId:', req.master.id, 'adminId:', adminId);
-    } else {
-      return res.status(401).json({
-        success: false,
-        message: 'Unauthorized',
-        data: null
-      });
-    }
+      if (pnl_sharing < 0 || pnl_sharing > 100) throw new Error('P&L sharing must be between 0 and 100');
+      if (brokerage_sharing < 0 || brokerage_sharing > 100) throw new Error('Brokerage sharing must be between 0 and 100');
 
-    // Check if username already exists
-    const existingMaster = await Master.findOne({ username });
-    if (existingMaster) {
-      return res.status(400).json({
-        success: false,
-        message: 'Username already exists',
-        data: null
-      });
-    }
-
-    // Verify server exists
-    const server = await Server.findById(server_id);
-    if (!server) {
-      return res.status(404).json({
-        success: false,
-        message: 'Server not found',
-        data: null
-      });
-    }
-
-    // Validate percentages
-    if (pnl_sharing < 0 || pnl_sharing > 100) {
-      return res.status(400).json({
-        success: false,
-        message: 'P&L sharing must be between 0 and 100',
-        data: null
-      });
-    }
-
-    if (brokerage_sharing < 0 || brokerage_sharing > 100) {
-      return res.status(400).json({
-        success: false,
-        message: 'Brokerage sharing must be between 0 and 100',
-        data: null
-      });
-    }
-
-    // Validate sharing percentages against parent (only for master creating child master)
-    if (isMaster && parentMaster) {
-      // Check if parent has enough P&L sharing to give
-      if (parentMaster.pnl_sharing < pnl_sharing) {
-        return res.status(400).json({
-          success: false,
-          message: `Insufficient P&L sharing. Parent has: ${parentMaster.pnl_sharing}%, Requested: ${pnl_sharing}%`,
-          data: null
-        });
-      }
-
-      // Check if parent has enough brokerage sharing to give
-      if (parentMaster.brokerage_sharing < brokerage_sharing) {
-        return res.status(400).json({
-          success: false,
-          message: `Insufficient brokerage sharing. Parent has: ${parentMaster.brokerage_sharing}%, Requested: ${brokerage_sharing}%`,
-          data: null
-        });
-      }
-    }
-
-    // Validate permissions inheritance (only for master creating child master)
-    if (permissions && isMaster && parentMaster) {
-      for (const [key, value] of Object.entries(permissions)) {
-        if (value === true && parentMaster.permissions[key] !== true) {
-          return res.status(403).json({
-            success: false,
-            message: `Cannot grant permission '${key}' - parent master doesn't have this permission`,
-            data: null
-          });
+      if (isMaster && parentMaster) {
+        if (parentMaster.pnl_sharing < pnl_sharing) {
+          throw new Error(`Insufficient P&L sharing. Parent has: ${parentMaster.pnl_sharing}%, Requested: ${pnl_sharing}%`);
+        }
+        if (parentMaster.brokerage_sharing < brokerage_sharing) {
+          throw new Error(`Insufficient brokerage sharing. Parent has: ${parentMaster.brokerage_sharing}%, Requested: ${brokerage_sharing}%`);
         }
       }
-    }
 
-    // Hash password
-    const hashedPassword = await bcrypt.hash(password, 10);
+      if (permissions && isMaster && parentMaster) {
+        for (const [key, value] of Object.entries(permissions)) {
+          if (value === true && parentMaster.permissions[key] !== true) {
+            throw new Error(`Cannot grant permission '${key}' - parent master doesn't have this permission`);
+          }
+        }
+      }
 
-    // Normalize exchange names to uppercase
-    const normalizedExchangesAllowed = exchanges_allowed.map(ex => ex.toUpperCase());
-    const normalizedTradeLimit = trade_limit.map(ex => ex.toUpperCase());
+      const hashedPassword = await bcrypt.hash(password, 10);
+      const normalizedExchangesAllowed = exchanges_allowed.map(ex => ex.toUpperCase());
+      const normalizedTradeLimit = trade_limit.map(ex => ex.toUpperCase());
 
-    const childMaster = await Master.create({
-      name,
-      username,
-      password: hashedPassword,
-      credits,
-      note,
-      pnl_sharing,
-      brokerage_sharing,
-      exchanges_allowed: normalizedExchangesAllowed,
-      trade_limit: normalizedTradeLimit,
-      add_master: add_master || false,
-      change_pass_on_first_login: change_pass_on_first_login || false,
-      server_id,
-      master_id: parentMaster ? parentMaster._id : null, // Set parent master if exists
-      admin_id: adminId, // Use determined admin_id
-      max_credit: max_credit || 0,
-      status: status || 'active',
-      active_status: active_status !== undefined ? active_status : true,
-      last_due_bill: last_due_bill || null,
-      exchanges: exchanges || [],
-      permissions: permissions || {}
+      const childMaster = new Master({
+        name,
+        username,
+        password: hashedPassword,
+        credits,
+        balance: credits,
+        note,
+        pnl_sharing,
+        brokerage_sharing,
+        exchanges_allowed: normalizedExchangesAllowed,
+        trade_limit: normalizedTradeLimit,
+        add_master: add_master || false,
+        change_pass_on_first_login: change_pass_on_first_login || false,
+        server_id,
+        master_id: parentMaster ? parentMaster._id : null,
+        admin_id: adminId,
+        max_credit: max_credit || 0,
+        status: status || 'active',
+        active_status: active_status !== undefined ? active_status : true,
+        last_due_bill: last_due_bill || null,
+        exchanges: exchanges || [],
+        permissions: permissions || {}
+      });
+      await childMaster.save({ session });
+
+      let prevMasterBalance = 0;
+
+      if (parentMaster) {
+        prevMasterBalance = parentMaster.balance;
+        parentMaster.balance -= credits;
+        parentMaster.pnl_sharing -= pnl_sharing;
+        parentMaster.brokerage_sharing -= brokerage_sharing;
+        await parentMaster.save({ session });
+
+        console.log('✅ Parent master updated:');
+        console.log(`   Balance: ${prevMasterBalance} -> ${parentMaster.balance}`);
+        console.log(`   P&L Sharing: ${parentMaster.pnl_sharing + pnl_sharing}% -> ${parentMaster.pnl_sharing}%`);
+
+        const masterTx = new Transaction({
+          transactionId: `TXN_${Date.now()}_${Math.random().toString(36).substr(2, 6)}_M`,
+          userId: parentMaster._id,
+          userModel: 'Master',
+          type: 'DEBIT',
+          status: 'SUCCESS',
+          amount: credits,
+          referenceId: childMaster._id,
+          referenceModel: 'Master',
+          balanceBefore: prevMasterBalance,
+          balanceAfter: parentMaster.balance,
+          metadata: { note: note || 'Deducted balance for new child master creation' }
+        });
+        await masterTx.save({ session });
+      }
+
+      const childTx = new Transaction({
+        transactionId: `TXN_${Date.now()}_${Math.random().toString(36).substr(2, 6)}_C`,
+        userId: childMaster._id,
+        userModel: 'Master',
+        type: 'CREDIT',
+        status: 'SUCCESS',
+        amount: credits,
+        referenceId: parentMaster ? parentMaster._id : adminId,
+        referenceModel: parentMaster ? 'Master' : 'Admin',
+        balanceBefore: 0,
+        balanceAfter: credits,
+        metadata: { note: note || 'Initial account creation funding' }
+      });
+      await childTx.save({ session });
+
+      resultData = { child_master: childMaster.toJSON() };
+      if (parentMaster) {
+        resultData.parent_master_remaining_balance = parentMaster.balance;
+        resultData.parent_master_remaining_pnl_sharing = parentMaster.pnl_sharing;
+        resultData.parent_master_remaining_brokerage_sharing = parentMaster.brokerage_sharing;
+      }
+      responseMessage = isAdmin ? 'Master created successfully' : 'Child master created successfully';
     });
 
-    // Deduct credits and sharing percentages from parent master (only if master creating child master)
-    if (parentMaster) {
-      parentMaster.credits -= credits;
-      parentMaster.pnl_sharing -= pnl_sharing;
-      parentMaster.brokerage_sharing -= brokerage_sharing;
-      await parentMaster.save();
-      
-      console.log('✅ Parent master updated:');
-      console.log(`   Credits: ${parentMaster.credits + credits} -> ${parentMaster.credits}`);
-      console.log(`   P&L Sharing: ${parentMaster.pnl_sharing + pnl_sharing}% -> ${parentMaster.pnl_sharing}%`);
-      console.log(`   Brokerage Sharing: ${parentMaster.brokerage_sharing + brokerage_sharing}% -> ${parentMaster.brokerage_sharing}%`);
-    }
-
-    const responseData = {
-      child_master: childMaster.toJSON()
-    };
-
-    // Add parent master remaining values if applicable
-    if (parentMaster) {
-      responseData.parent_master_remaining_credits = parentMaster.credits;
-      responseData.parent_master_remaining_pnl_sharing = parentMaster.pnl_sharing;
-      responseData.parent_master_remaining_brokerage_sharing = parentMaster.brokerage_sharing;
-    }
+    session.endSession();
 
     res.status(201).json({
       success: true,
-      message: isAdmin ? 'Master created successfully' : 'Child master created successfully',
-      data: responseData
+      message: responseMessage,
+      data: resultData
     });
   } catch (error) {
-    res.status(500).json({
+    session.endSession();
+
+    let statusCode = 500;
+    if (error.message.includes('not found')) statusCode = 404;
+    else if (error.message === 'Unauthorized' || error.message.includes('No permission')) statusCode = 403;
+    else if (error.message.includes('Insufficient') || error.message.includes('exists') || error.message.includes('between 0 and 100') || error.message.includes('grant permission')) statusCode = 400;
+
+    res.status(statusCode).json({
       success: false,
       message: error.message,
       data: null

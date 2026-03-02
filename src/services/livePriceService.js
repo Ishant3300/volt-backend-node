@@ -5,6 +5,7 @@
 
 const WebSocket = require('ws');
 const kiteService = require('./kiteService');
+const priceQueueService = require('./priceQueueService');
 
 class LivePriceService {
   constructor() {
@@ -12,6 +13,7 @@ class LivePriceService {
     this.kiteTicker = null;    // Kite WebSocket connection
     this.subscribedTokens = new Set();
     this.clients = new Set();
+    this.latestPrices = new Map();
     this.reconnectTimer = null;
     this.isKiteConnected = false;
   }
@@ -66,6 +68,13 @@ class LivePriceService {
    */
   _handleClientMessage(ws, data) {
     switch (data.type) {
+      case 'auth':
+        if (data.userId) {
+          ws.userId = data.userId;
+          console.log(`✅ Client authenticated for WS metrics as user: ${data.userId}`);
+        }
+        break;
+
       case 'subscribe':
         if (data.tokens && Array.isArray(data.tokens)) {
           console.log(`📊 Subscribe request for tokens: ${data.tokens.join(', ')}`);
@@ -102,15 +111,15 @@ class LivePriceService {
       const accessToken = await kiteService.getStoredAccessToken();
       if (!accessToken) {
         console.log('⚠️  No Kite access token available for WebSocket');
-        
+
         // Try auto-login once
         if (!this.autoLoginAttempted) {
           this.autoLoginAttempted = true;
           console.log('🤖 Attempting auto-login...');
-          
+
           const kiteAuthService = require('./kiteAuthService');
           const loginResult = await kiteAuthService.performAutomatedLogin();
-          
+
           if (loginResult.success) {
             console.log('✅ Auto-login successful, connecting to WebSocket...');
             // Retry connection immediately
@@ -119,7 +128,7 @@ class LivePriceService {
             console.log('❌ Auto-login failed:', loginResult.error);
           }
         }
-        
+
         console.log('   Will retry in 30 seconds...');
         this.reconnectTimer = setTimeout(() => this._connectToKite(), 30000);
         return;
@@ -238,9 +247,20 @@ class LivePriceService {
       }
 
       if (ticks.length > 0) {
+        // Update latest prices map
+        ticks.forEach(t => {
+          if (t && t.instrument_token && t.last_price) {
+            this.latestPrices.set(t.instrument_token.toString(), t.last_price);
+            this.latestPrices.set(parseInt(t.instrument_token), t.last_price);
+
+            // Publish price update to BullMQ for order matching
+            priceQueueService.publishPriceUpdate(t.instrument_token.toString(), t.last_price);
+          }
+        });
+
         console.log(`📈 Received ${ticks.length} tick(s):`);
         ticks.forEach(t => {
-          console.log(`   Token: ${t.instrument_token} | LTP: ${t.last_price} | Change: ${t.change?.toFixed(2)} | High: ${t.high} | Low: ${t.low}`);
+          console.log(`   Token: ${t.instrument_token} | LTP: ${t.last_price}`);
         });
 
         this._broadcastToClients({
@@ -281,7 +301,7 @@ class LivePriceService {
 
         const change = lastPrice - closePrice;
         let changePercent = 0;
-        
+
         // Only calculate percentage if closePrice is valid and reasonable
         if (closePrice > 0.01) {
           changePercent = (change / closePrice) * 100;
@@ -339,12 +359,38 @@ class LivePriceService {
   }
 
   /**
+   * Send data to a specific user's WebSocket connection(s).
+   * Requires the client to have sent an 'auth' message with userId.
+   *
+   * @param {string} userId - The user's MongoDB _id
+   * @param {object} data   - The payload to send
+   */
+  broadcastToUser(userId, data) {
+    if (!this.wss) return;
+
+    const message = JSON.stringify(data);
+    let sentCount = 0;
+
+    this.wss.clients.forEach((client) => {
+      if (client.readyState === WebSocket.OPEN && client.userId === userId) {
+        client.send(message);
+        sentCount++;
+      }
+    });
+
+    if (sentCount > 0) {
+      console.log(`📤 [WS] Sent '${data.type}' to user ${userId} (${sentCount} connection(s))`);
+    }
+  }
+
+  /**
    * Remove tokens that no clients need anymore
    */
   _cleanupUnusedTokens() {
     if (this.wss && this.wss.clients.size === 0) {
-      console.log('🧹 No clients connected, clearing subscriptions');
+      console.log('🧹 No clients connected, clearing subscriptions and latest prices');
       this.subscribedTokens.clear();
+      this.latestPrices.clear();
     }
   }
 

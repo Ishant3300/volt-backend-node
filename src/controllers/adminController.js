@@ -6,9 +6,12 @@ const GroupedQuantity = require('../models/GroupedQuantity');
 const ScriptQuantity = require('../models/ScriptQuantity');
 const TradeMargin = require('../models/TradeMargin');
 const BrokerageSettings = require('../models/BrokerageSettings');
+const mongoose = require('mongoose');
+const Transaction = require('../models/Transaction');
 
 // Create User
 const createUser = async (req, res) => {
+  const session = await mongoose.startSession();
   try {
     const {
       username,
@@ -30,58 +33,74 @@ const createUser = async (req, res) => {
       });
     }
 
-    // Check if username already exists
-    const existingUser = await User.findOne({ username });
-    if (existingUser) {
-      return res.status(400).json({
-        success: false,
-        message: 'Username already exists',
-        data: null
+    let resultData;
+
+    await session.withTransaction(async () => {
+      // Check if username already exists
+      const existingUser = await User.findOne({ username }).session(session);
+      if (existingUser) throw new Error('Username already exists');
+
+      // Verify server exists
+      const server = await Server.findById(server_id).session(session);
+      if (!server) throw new Error('Server not found');
+
+      // Verify master exists
+      const master = await Master.findById(master_id).session(session);
+      if (!master) throw new Error('Master not found');
+
+      // Hash password
+      const hashedPassword = await bcrypt.hash(password, 10);
+
+      const initialCredit = credit || 0;
+
+      const user = new User({
+        username,
+        password: hashedPassword,
+        server_id,
+        master_id,
+        credits: initialCredit,
+        current_credit: current_credit || 0,
+        balance: balance !== undefined ? balance : initialCredit,
+        exchanges_support: exchanges_support || [],
+        status: status || 'active'
       });
-    }
+      await user.save({ session });
 
-    // Verify server exists
-    const server = await Server.findById(server_id);
-    if (!server) {
-      return res.status(404).json({
-        success: false,
-        message: 'Server not found',
-        data: null
-      });
-    }
+      if (initialCredit > 0) {
+        const tx = new Transaction({
+          transactionId: `TXN_${Date.now()}_${Math.random().toString(36).substr(2, 6)}_U`,
+          userId: user._id,
+          userModel: 'User',
+          type: 'CREDIT',
+          status: 'SUCCESS',
+          amount: initialCredit,
+          referenceId: req.admin ? req.admin.id : null,
+          referenceModel: 'Admin',
+          balanceBefore: 0,
+          balanceAfter: user.balance,
+          metadata: { note: 'Admin created user with initial credit' }
+        });
+        await tx.save({ session });
+      }
 
-    // Verify master exists
-    const master = await Master.findById(master_id);
-    if (!master) {
-      return res.status(404).json({
-        success: false,
-        message: 'Master not found',
-        data: null
-      });
-    }
-
-    // Hash password
-    const hashedPassword = await bcrypt.hash(password, 10);
-
-    const user = await User.create({
-      username,
-      password: hashedPassword,
-      server_id,
-      master_id,
-      credit: credit || 0,
-      current_credit: current_credit || 0,
-      balance: balance || 0,
-      exchanges_support: exchanges_support || [],
-      status: status || 'active'
+      resultData = user.toJSON();
     });
+
+    session.endSession();
 
     res.status(201).json({
       success: true,
       message: 'User created successfully',
-      data: user.toJSON()
+      data: resultData
     });
   } catch (error) {
-    res.status(500).json({
+    session.endSession();
+
+    let statusCode = 500;
+    if (error.message.includes('not found')) statusCode = 404;
+    else if (error.message === 'Username already exists') statusCode = 400;
+
+    res.status(statusCode).json({
       success: false,
       message: error.message,
       data: null
@@ -226,7 +245,7 @@ const updateUser = async (req, res) => {
       user.master_id = master_id;
     }
 
-    if (credit !== undefined) user.credit = credit;
+    if (credit !== undefined) user.credits = credit;
     if (current_credit !== undefined) user.current_credit = current_credit;
     if (balance !== undefined) user.balance = balance;
     if (exchanges_support) user.exchanges_support = exchanges_support;

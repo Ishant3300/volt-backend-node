@@ -5,6 +5,10 @@ const cors = require('cors');
 const connectDatabase = require('./database/database');
 const kiteAuthService = require('./services/kiteAuthService');
 const livePriceService = require('./services/livePriceService');
+const cronService = require('./services/cronService');
+const redisService = require('./services/redisService');
+const orderBookService = require('./services/orderBookService');
+const priceQueueService = require('./services/priceQueueService');
 
 const app = express();
 const server = http.createServer(app);
@@ -20,16 +24,19 @@ connectDatabase();
 // Import routes
 const authRoutes = require('./routes/authRoutes');
 const adminRoutes = require('./routes/adminRoutes');
+const userRoutes = require('./routes/userRoutes');
 const kiteRoutes = require('./routes/kiteRoutes');
 const watchlistRoutes = require('./routes/watchlistRoutes');
 const masterRoutes = require('./routes/masterRoutes');
 const messageRoutes = require('./routes/messageRoutes');
 const masterFlowRoutes = require('./routes/masterFlowRoutes');
 const serverRoutes = require('./routes/serverRoutes');
+const tradeRoutes = require('./routes/tradeRoutes');
 
 // Import new models to ensure they're registered
 require('./models/Trade');
 require('./models/CreditTransaction');
+require('./models/Transaction');
 
 // Routes
 app.get('/', (req, res) => {
@@ -42,37 +49,62 @@ app.get('/', (req, res) => {
 
 app.use('/api/auth', authRoutes);
 app.use('/api/admin', adminRoutes);
+app.use('/api/users', userRoutes);
 app.use('/api/kite', kiteRoutes);
 app.use('/api/watchlist', watchlistRoutes);
 app.use('/api/masters', masterRoutes);
 app.use('/api/master', masterFlowRoutes); // Master Flow routes
 app.use('/api/master/messages', messageRoutes);
 app.use('/api/servers', serverRoutes); // Server routes
+app.use('/api/trade', tradeRoutes); // Trade & Metrics routes
 
 // Start server
 const PORT = process.env.PORT || 5000;
 server.listen(PORT, async () => {
   console.log(`Server is running on port ${PORT}`);
-  
+
+  // Initialize Redis connection
+  try {
+    redisService.init();
+    // Give Redis a moment to connect before proceeding
+    await new Promise(resolve => setTimeout(resolve, 1000));
+
+    if (redisService.isAvailable()) {
+      // Bootstrap: sync pending orders from MongoDB into Redis order book
+      await orderBookService.syncFromDatabase();
+
+      // Initialize BullMQ price queue (producer + worker)
+      priceQueueService.init();
+      console.log('🚀 Redis Order Book + BullMQ Price Queue active');
+    } else {
+      console.log('⚠️  Redis not available – using DB-polling fallback for limit orders');
+    }
+  } catch (err) {
+    console.error('⚠️  Redis init error:', err.message, '– falling back to DB polling');
+  }
+
   // Initialize WebSocket live price service
   livePriceService.init(server);
   console.log('📡 Live price WebSocket ready at ws://localhost:' + PORT + '/ws/live-prices');
-  
+
+  // Initialize background jobs
+  cronService.init();
+
   // Perform Kite auto-login on server start
   console.log('\n🔐 Checking Kite authentication...');
-  
+
   try {
     // Check if already authenticated
     const status = await kiteAuthService.checkTokenStatus();
-    
+
     if (status.valid) {
       console.log(`✅ Kite already authenticated (valid for ${status.hoursLeft} hours)`);
     } else {
       console.log(`⚠️  Kite not authenticated: ${status.reason}`);
       console.log('🤖 Attempting auto-login...\n');
-      
+
       const loginResult = await kiteAuthService.performAutomatedLogin();
-      console.log({loginResult})
+      console.log({ loginResult })
       if (loginResult.success) {
         console.log('✅ Kite auto-login successful!');
       } else {
@@ -84,6 +116,6 @@ server.listen(PORT, async () => {
     console.error('❌ Error during Kite authentication:', error.message);
     console.log('💡 You can manually login at: http://localhost:' + PORT + '/api/kite/login');
   }
-  
+
   console.log('\n🚀 Server ready!\n');
 });

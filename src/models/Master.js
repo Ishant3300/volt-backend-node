@@ -21,6 +21,11 @@ const masterSchema = new mongoose.Schema({
     required: true,
     default: 0
   },
+  balance: {
+    type: Number,
+    required: true,
+    default: 0
+  },
   note: {
     type: String,
     required: true,

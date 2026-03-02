@@ -21,6 +21,11 @@ const userSchema = new mongoose.Schema({
     required: true,
     default: 0
   },
+  balance: {
+    type: Number,
+    required: true,
+    default: 0
+  },
   note: {
     type: String,
     required: true,
@@ -160,6 +165,7 @@ userSchema.set('toJSON', {
     delete ret.__v;
     ret.created_at = ret.createdAt;
     ret.updated_at = ret.updatedAt;
+    ret.credit = ret.credits; // Aliasing for older API endpoints expecting credit
     delete ret.createdAt;
     delete ret.updatedAt;
     return ret;

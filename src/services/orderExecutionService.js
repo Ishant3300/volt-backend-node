@@ -1,0 +1,206 @@
+const Trade = require('../models/Trade');
+const Transaction = require('../models/Transaction');
+const User = require('../models/User');
+const kiteService = require('./kiteService');
+const orderBookService = require('./orderBookService');
+const redisService = require('./redisService');
+
+/**
+ * Fetches live prices from Kite for a list of instrument tokens.
+ * Returns a Map<number, number> of instrumentToken -> lastPrice.
+ */
+const _getLivePrices = async (instrumentTokens) => {
+    if (!instrumentTokens || instrumentTokens.length === 0) return new Map();
+    try {
+        const quotes = await kiteService.getLatestQuotes(instrumentTokens, 100);
+        const ltpMap = new Map();
+        quotes.forEach(q => {
+            ltpMap.set(q.instrument_token, q.last_price);
+        });
+        return ltpMap;
+    } catch (err) {
+        console.error('[OrderExecution] Error fetching live quotes:', err.message);
+        return new Map();
+    }
+};
+
+/**
+ * DB-based fallback: Checks all pending limit orders and executes them
+ * if the live price satisfies the limit condition.
+ *
+ * This runs ONLY when Redis is unavailable. When Redis is up, the
+ * BullMQ price queue worker handles execution instead.
+ *
+ * BUY LIMIT:  executes when live_price <= limit_price
+ * SELL LIMIT: executes when live_price >= limit_price
+ */
+const processPendingOrders = async () => {
+    // Skip if Redis + BullMQ are handling execution
+    if (redisService.isAvailable()) return;
+
+    try {
+        const pendingTrades = await Trade.find({ status: 'pending', order_type: 'LIMIT' });
+
+        if (pendingTrades.length === 0) return;
+
+        // Collect distinct instrument tokens
+        const tokenSet = new Set(pendingTrades.map(t => parseInt(t.instrument_token)));
+        const tokenArray = [...tokenSet];
+
+        const ltpMap = await _getLivePrices(tokenArray);
+
+        if (ltpMap.size === 0) {
+            // Could not fetch any prices, skip this cycle
+            return;
+        }
+
+        let executedCount = 0;
+
+        for (const trade of pendingTrades) {
+            const livePrice = ltpMap.get(parseInt(trade.instrument_token));
+            if (!livePrice) continue; // No price available for this instrument
+
+            let shouldExecute = false;
+
+            if (trade.transaction_type === 'BUY' && livePrice <= trade.price) {
+                shouldExecute = true;
+            } else if (trade.transaction_type === 'SELL' && livePrice >= trade.price) {
+                shouldExecute = true;
+            }
+
+            if (shouldExecute) {
+                // Idempotency: re-check status before executing
+                const freshTrade = await Trade.findById(trade._id);
+                if (!freshTrade || freshTrade.status !== 'pending') continue;
+
+                // Calculate realised P&L if this trade closes a position
+                let realisedPnl = 0;
+                const existingAgg = await Trade.aggregate([
+                    {
+                        $match: {
+                            user_id: freshTrade.user_id,
+                            instrument_token: freshTrade.instrument_token,
+                            status: 'completed',
+                            deleted_at: null
+                        }
+                    },
+                    {
+                        $group: {
+                            _id: null,
+                            total_buy_qty: {
+                                $sum: { $cond: [{ $eq: ['$transaction_type', 'BUY'] }, '$executed_quantity', 0] }
+                            },
+                            total_sell_qty: {
+                                $sum: { $cond: [{ $eq: ['$transaction_type', 'SELL'] }, '$executed_quantity', 0] }
+                            },
+                            total_buy_value: {
+                                $sum: {
+                                    $cond: [
+                                        { $eq: ['$transaction_type', 'BUY'] },
+                                        { $multiply: ['$executed_quantity', '$executed_price'] },
+                                        0
+                                    ]
+                                }
+                            },
+                            total_sell_value: {
+                                $sum: {
+                                    $cond: [
+                                        { $eq: ['$transaction_type', 'SELL'] },
+                                        { $multiply: ['$executed_quantity', '$executed_price'] },
+                                        0
+                                    ]
+                                }
+                            }
+                        }
+                    }
+                ]);
+
+                if (existingAgg.length > 0) {
+                    const agg = existingAgg[0];
+                    const prevNetQty = agg.total_buy_qty - agg.total_sell_qty;
+                    const avgBuyPrice = agg.total_buy_qty > 0 ? agg.total_buy_value / agg.total_buy_qty : 0;
+                    const avgSellPrice = agg.total_sell_qty > 0 ? agg.total_sell_value / agg.total_sell_qty : 0;
+
+                    if (freshTrade.transaction_type === 'SELL' && prevNetQty > 0) {
+                        const closingQty = Math.min(freshTrade.quantity, prevNetQty);
+                        realisedPnl = (freshTrade.price - avgBuyPrice) * closingQty;
+                    } else if (freshTrade.transaction_type === 'BUY' && prevNetQty < 0) {
+                        const closingQty = Math.min(freshTrade.quantity, Math.abs(prevNetQty));
+                        realisedPnl = (avgSellPrice - freshTrade.price) * closingQty;
+                    }
+                }
+
+                // Execute the trade
+                freshTrade.status = 'completed';
+                freshTrade.executed_at = new Date();
+                freshTrade.executed_price = freshTrade.price;
+                freshTrade.executed_quantity = freshTrade.quantity;
+                freshTrade.pnl = realisedPnl;
+                freshTrade.net_amount = realisedPnl;
+                await freshTrade.save();
+
+                // Update user balance with realised P&L
+                if (realisedPnl !== 0) {
+                    await User.findByIdAndUpdate(freshTrade.user_id, { $inc: { balance: realisedPnl } });
+                }
+
+                // Log a transaction for this execution
+                try {
+                    const user = await User.findById(freshTrade.user_id);
+                    const tradeValue = freshTrade.price * freshTrade.quantity;
+
+                    const tx = new Transaction({
+                        transactionId: `TXN_${Date.now()}_${Math.random().toString(36).substr(2, 6)}_LE`,
+                        userId: freshTrade.user_id,
+                        userModel: 'User',
+                        type: freshTrade.transaction_type,
+                        status: 'SUCCESS',
+                        amount: tradeValue,
+                        referenceId: freshTrade._id,
+                        referenceModel: 'Trade',
+                        balanceBefore: user ? (user.balance - realisedPnl) : 0,
+                        balanceAfter: user ? user.balance : 0,
+                        metadata: {
+                            tradingsymbol: freshTrade.tradingsymbol,
+                            quantity: freshTrade.quantity,
+                            executedPrice: freshTrade.price,
+                            order_type: freshTrade.order_type,
+                            realisedPnl,
+                            positionClosed: realisedPnl !== 0,
+                            executedBy: 'db_fallback_engine'
+                        }
+                    });
+
+                    await tx.save();
+                } catch (txErr) {
+                    console.error(`[OrderExecution] Error logging transaction for trade ${freshTrade._id}:`, txErr.message);
+                }
+
+                executedCount++;
+                console.log(`✅ [OrderExecution/Fallback] Executed ${freshTrade.transaction_type} LIMIT for ${freshTrade.tradingsymbol} @ ${freshTrade.price} (live: ${livePrice})`);
+
+                // Notify the user's Flutter client via WebSocket
+                const livePriceService = require('./livePriceService');
+                livePriceService.broadcastToUser(freshTrade.user_id.toString(), {
+                    type: 'trade_executed',
+                    trade_id: freshTrade._id.toString(),
+                    instrument_token: freshTrade.instrument_token,
+                    tradingsymbol: freshTrade.tradingsymbol,
+                    transaction_type: freshTrade.transaction_type,
+                    quantity: freshTrade.quantity,
+                    executed_price: freshTrade.price,
+                    pnl: realisedPnl,
+                    status: 'completed',
+                });
+            }
+        }
+
+        if (executedCount > 0) {
+            console.log(`📊 [OrderExecution/Fallback] Executed ${executedCount} pending limit order(s) this cycle.`);
+        }
+    } catch (error) {
+        console.error('[OrderExecution] Error processing pending orders:', error.message);
+    }
+};
+
+module.exports = { processPendingOrders };

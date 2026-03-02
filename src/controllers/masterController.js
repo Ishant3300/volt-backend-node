@@ -5,9 +5,12 @@ const Message = require('../models/Message');
 const Trade = require('../models/Trade');
 const CreditTransaction = require('../models/CreditTransaction');
 const User = require('../models/User');
+const mongoose = require('mongoose');
+const Transaction = require('../models/Transaction');
 
 // Create Master
 const createMaster = async (req, res) => {
+  const session = await mongoose.startSession();
   try {
     const {
       name,
@@ -38,27 +41,6 @@ const createMaster = async (req, res) => {
       });
     }
 
-    // Check if username already exists
-    const existingMaster = await Master.findOne({ username });
-    if (existingMaster) {
-      return res.status(400).json({
-        success: false,
-        message: 'Username already exists',
-        data: null
-      });
-    }
-
-    // Verify server exists
-    const server = await Server.findById(server_id);
-    if (!server) {
-      return res.status(404).json({
-        success: false,
-        message: 'Server not found',
-        data: null
-      });
-    }
-
-    // Validate percentages
     if (pnl_sharing < 0 || pnl_sharing > 100) {
       return res.status(400).json({
         success: false,
@@ -75,38 +57,82 @@ const createMaster = async (req, res) => {
       });
     }
 
-    // Hash password
-    const hashedPassword = await bcrypt.hash(password, 10);
+    let resultData;
 
-    const master = await Master.create({
-      name,
-      username,
-      password: hashedPassword,
-      credits,
-      note,
-      pnl_sharing,
-      brokerage_sharing,
-      exchanges_allowed,
-      trade_limit,
-      add_master: add_master !== undefined ? add_master : false,
-      change_pass_on_first_login: change_pass_on_first_login !== undefined ? change_pass_on_first_login : false,
-      server_id,
-      admin_id: req.admin.id,
-      max_credit: max_credit || 0,
-      status: status || 'active',
-      active_status: active_status !== undefined ? active_status : true,
-      last_due_bill: last_due_bill || null,
-      exchanges: exchanges || [],
-      permissions: permissions || {}
+    await session.withTransaction(async () => {
+      // Check if username already exists
+      const existingMaster = await Master.findOne({ username }).session(session);
+      if (existingMaster) {
+        throw new Error('Username already exists');
+      }
+
+      // Verify server exists
+      const server = await Server.findById(server_id).session(session);
+      if (!server) {
+        throw new Error('Server not found');
+      }
+
+      // Hash password
+      const hashedPassword = await bcrypt.hash(password, 10);
+
+      // Create master
+      const master = new Master({
+        name,
+        username,
+        password: hashedPassword,
+        credits,
+        balance: credits,
+        note,
+        pnl_sharing,
+        brokerage_sharing,
+        exchanges_allowed,
+        trade_limit,
+        add_master: add_master !== undefined ? add_master : false,
+        change_pass_on_first_login: change_pass_on_first_login !== undefined ? change_pass_on_first_login : false,
+        server_id,
+        admin_id: req.admin.id,
+        max_credit: max_credit || 0,
+        status: status || 'active',
+        active_status: active_status !== undefined ? active_status : true,
+        last_due_bill: last_due_bill || null,
+        exchanges: exchanges || [],
+        permissions: permissions || {}
+      });
+      await master.save({ session });
+
+      // Create transaction record for initial credits
+      const transaction = new Transaction({
+        transactionId: `TXN_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`,
+        userId: master._id,
+        userModel: 'Master',
+        type: 'CREDIT',
+        status: 'SUCCESS',
+        amount: credits,
+        referenceId: req.admin.id,
+        referenceModel: 'Admin',
+        balanceBefore: 0,
+        balanceAfter: credits,
+        metadata: { note: note || 'Initial master creation' }
+      });
+      await transaction.save({ session });
+
+      resultData = master.toJSON();
     });
+
+    session.endSession();
 
     res.status(201).json({
       success: true,
       message: 'Master created successfully',
-      data: master.toJSON()
+      data: resultData
     });
   } catch (error) {
-    res.status(500).json({
+    session.endSession();
+
+    // Check if error is a known validation error we threw
+    const isClientError = error.message === 'Username already exists' || error.message === 'Server not found';
+
+    res.status(isClientError ? 400 : 500).json({
       success: false,
       message: error.message,
       data: null
@@ -261,7 +287,7 @@ const updateMaster = async (req, res) => {
     if (name) master.name = name;
     if (note !== undefined) master.note = note;
     if (credits !== undefined) master.credits = credits;
-    
+
     if (pnl_sharing !== undefined) {
       if (pnl_sharing < 0 || pnl_sharing > 100) {
         return res.status(400).json({
@@ -272,7 +298,7 @@ const updateMaster = async (req, res) => {
       }
       master.pnl_sharing = pnl_sharing;
     }
-    
+
     if (brokerage_sharing !== undefined) {
       if (brokerage_sharing < 0 || brokerage_sharing > 100) {
         return res.status(400).json({
@@ -283,7 +309,7 @@ const updateMaster = async (req, res) => {
       }
       master.brokerage_sharing = brokerage_sharing;
     }
-    
+
     if (exchanges_allowed !== undefined) master.exchanges_allowed = exchanges_allowed;
     if (trade_limit !== undefined) master.trade_limit = trade_limit;
     if (add_master !== undefined) master.add_master = add_master;
@@ -309,7 +335,7 @@ const updateMaster = async (req, res) => {
     if (credit !== undefined) master.credit = credit;
     if (status) master.status = status;
     if (active_status !== undefined) master.active_status = active_status;
-    
+
     if (pnl_share_percentage !== undefined) {
       if (pnl_share_percentage < 0 || pnl_share_percentage > 100) {
         return res.status(400).json({
@@ -320,7 +346,7 @@ const updateMaster = async (req, res) => {
       }
       master.pnl_share_percentage = pnl_share_percentage;
     }
-    
+
     if (last_due_bill !== undefined) master.last_due_bill = last_due_bill;
 
     await master.save();
@@ -367,7 +393,7 @@ const updateMasterStatus = async (req, res) => {
     if (last_due_bill !== undefined) master.last_due_bill = last_due_bill;
     if (active_status !== undefined) master.active_status = active_status;
     if (credit !== undefined) master.credit = credit;
-    
+
     if (pnl_share_percentage !== undefined) {
       if (pnl_share_percentage < 0 || pnl_share_percentage > 100) {
         return res.status(400).json({
@@ -488,6 +514,7 @@ const deleteMaster = async (req, res) => {
 
 // Credit Master Account
 const creditMaster = async (req, res) => {
+  const session = await mongoose.startSession();
   try {
     const { id } = req.params;
     const { amount, note } = req.body;
@@ -500,50 +527,83 @@ const creditMaster = async (req, res) => {
       });
     }
 
-    const master = await Master.findOne({
-      _id: id,
-      admin_id: req.admin.id,
-      deleted_at: null
-    });
+    let resultData;
 
-    if (!master) {
-      return res.status(404).json({
-        success: false,
-        message: 'Master not found',
-        data: null
+    await session.withTransaction(async () => {
+      const master = await Master.findOne({
+        _id: id,
+        admin_id: req.admin.id,
+        deleted_at: null
+      }).session(session);
+
+      if (!master) {
+        throw new Error('Master not found');
+      }
+
+      const previousCredits = master.credits;
+      const previousBalance = master.balance;
+
+      master.credits += amount;
+      master.balance += amount; // Also update balance as per new logic
+
+      await master.save({ session });
+
+      // Create universal transaction record
+      const transaction = new Transaction({
+        transactionId: `TXN_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`,
+        userId: master._id,
+        userModel: 'Master',
+        type: 'CREDIT',
+        status: 'SUCCESS',
+        amount,
+        referenceId: req.admin.id,
+        referenceModel: 'Admin',
+        balanceBefore: previousBalance,
+        balanceAfter: master.balance,
+        metadata: {
+          note: note || '',
+          previousCredits,
+          newCredits: master.credits
+        }
       });
-    }
+      await transaction.save({ session });
 
-    const previousCredits = master.credits;
-    master.credits += amount;
-    await master.save();
+      // Create legacy credit transaction record for backwards compatibility
+      await CreditTransaction.create([{
+        master_id: master._id,
+        admin_id: req.admin.id,
+        transaction_type: 'CREDIT',
+        amount,
+        previous_balance: previousCredits,
+        new_balance: master.credits,
+        note: note || ''
+      }], { session });
 
-    // Create transaction record
-    const transaction = await CreditTransaction.create({
-      master_id: master._id,
-      admin_id: req.admin.id,
-      transaction_type: 'CREDIT',
-      amount,
-      previous_balance: previousCredits,
-      new_balance: master.credits,
-      note: note || ''
-    });
-
-    res.status(200).json({
-      success: true,
-      message: 'Credit added successfully',
-      data: {
+      resultData = {
         id: master._id,
         username: master.username,
         previous_credits: previousCredits,
         amount_credited: amount,
         current_credits: master.credits,
+        current_balance: master.balance,
         transaction_id: transaction._id,
         updated_at: master.updatedAt
-      }
+      };
+    });
+
+    session.endSession();
+
+    res.status(200).json({
+      success: true,
+      message: 'Credit added successfully',
+      data: resultData
     });
   } catch (error) {
-    res.status(500).json({
+    session.endSession();
+
+    const isClientError = error.message === 'Master not found';
+
+    res.status(isClientError ? 404 : 500).json({
       success: false,
       message: error.message,
       data: null
@@ -551,8 +611,10 @@ const creditMaster = async (req, res) => {
   }
 };
 
+
 // Debit Master Account
 const debitMaster = async (req, res) => {
+  const session = await mongoose.startSession();
   try {
     const { id } = req.params;
     const { amount, note } = req.body;
@@ -565,58 +627,90 @@ const debitMaster = async (req, res) => {
       });
     }
 
-    const master = await Master.findOne({
-      _id: id,
-      admin_id: req.admin.id,
-      deleted_at: null
-    });
+    let resultData;
 
-    if (!master) {
-      return res.status(404).json({
-        success: false,
-        message: 'Master not found',
-        data: null
+    await session.withTransaction(async () => {
+      const master = await Master.findOne({
+        _id: id,
+        admin_id: req.admin.id,
+        deleted_at: null
+      }).session(session);
+
+      if (!master) {
+        throw new Error('Master not found');
+      }
+
+      if (master.credits < amount) {
+        throw new Error('Insufficient credits');
+      }
+
+      const previousCredits = master.credits;
+      const previousBalance = master.balance;
+
+      master.credits -= amount;
+      // Balance is deliberately excluded here per user logic. Balance resets at weekend.
+
+      await master.save({ session });
+
+      // Create universal transaction record
+      const transaction = new Transaction({
+        transactionId: `TXN_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`,
+        userId: master._id,
+        userModel: 'Master',
+        type: 'DEBIT',
+        status: 'SUCCESS',
+        amount,
+        referenceId: req.admin.id,
+        referenceModel: 'Admin',
+        balanceBefore: previousBalance,
+        balanceAfter: master.balance,
+        metadata: {
+          note: note || '',
+          previousCredits,
+          newCredits: master.credits
+        }
       });
-    }
+      await transaction.save({ session });
 
-    if (master.credits < amount) {
-      return res.status(400).json({
-        success: false,
-        message: 'Insufficient credits',
-        data: null
-      });
-    }
+      // Create legacy credit transaction record
+      await CreditTransaction.create([{
+        master_id: master._id,
+        admin_id: req.admin.id,
+        transaction_type: 'DEBIT',
+        amount,
+        previous_balance: previousCredits,
+        new_balance: master.credits,
+        note: note || ''
+      }], { session });
 
-    const previousCredits = master.credits;
-    master.credits -= amount;
-    await master.save();
-
-    // Create transaction record
-    const transaction = await CreditTransaction.create({
-      master_id: master._id,
-      admin_id: req.admin.id,
-      transaction_type: 'DEBIT',
-      amount,
-      previous_balance: previousCredits,
-      new_balance: master.credits,
-      note: note || ''
-    });
-
-    res.status(200).json({
-      success: true,
-      message: 'Amount debited successfully',
-      data: {
+      resultData = {
         id: master._id,
         username: master.username,
         previous_credits: previousCredits,
         amount_debited: amount,
         current_credits: master.credits,
+        current_balance: master.balance,
         transaction_id: transaction._id,
         updated_at: master.updatedAt
-      }
+      };
+    });
+
+    session.endSession();
+
+    res.status(200).json({
+      success: true,
+      message: 'Amount debited successfully',
+      data: resultData
     });
   } catch (error) {
-    res.status(500).json({
+    session.endSession();
+
+    // Determine status code based on error message
+    let statusCode = 500;
+    if (error.message === 'Master not found') statusCode = 404;
+    else if (error.message === 'Insufficient credits or balance') statusCode = 400;
+
+    res.status(statusCode).json({
       success: false,
       message: error.message,
       data: null
