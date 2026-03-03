@@ -309,7 +309,7 @@ class LivePriceService {
           changePercent = Math.max(-100, Math.min(1000, changePercent));
         }
 
-        return {
+        const tick = {
           instrument_token: instrumentToken.toString(),
           last_price: lastPrice,
           high: highPrice,
@@ -319,6 +319,43 @@ class LivePriceService {
           change: change,
           change_percent: changePercent,
         };
+
+        // Full mode (184 bytes) includes market depth with bid/ask
+        if (packet.length >= 184) {
+          // Market depth starts at offset 60
+          // Each depth entry is 12 bytes: 4 (quantity) + 4 (price) + 4 (orders)
+          // Best bid is at offset 60 (first buy entry)
+          // Best ask is at offset 120 (first sell entry, after 5 buy entries)
+          
+          try {
+            // Best bid (buy) - quantity at 60, price at 64
+            const bestBidPrice = packet.readInt32BE(64) / 100;
+            // Best ask (sell) - quantity at 120, price at 124
+            const bestAskPrice = packet.readInt32BE(124) / 100;
+
+            if (bestBidPrice > 0) {
+              tick.bid_price = bestBidPrice;
+              console.log(`   📊 Bid: ${bestBidPrice}`);
+            }
+            if (bestAskPrice > 0) {
+              tick.ask_price = bestAskPrice;
+              console.log(`   📊 Ask: ${bestAskPrice}`);
+            }
+            
+            // Log if both are present
+            if (bestBidPrice > 0 && bestAskPrice > 0) {
+              const spread = bestAskPrice - bestBidPrice;
+              const spreadPercent = (spread / bestBidPrice) * 100;
+              console.log(`   💰 SPREAD: ${spread.toFixed(2)} (${spreadPercent.toFixed(3)}%)`);
+            }
+          } catch (err) {
+            console.log(`   ⚠️  Error parsing market depth: ${err.message}`);
+          }
+        } else {
+          console.log(`   ⚠️  Packet size ${packet.length} bytes - no market depth (need 184 bytes for full mode)`);
+        }
+
+        return tick;
       }
 
       // Minimal parse
@@ -370,6 +407,13 @@ class LivePriceService {
 
     const message = JSON.stringify(data);
     let sentCount = 0;
+
+    // Count authenticated clients for debugging
+    const authenticatedClients = [];
+    this.wss.clients.forEach((client) => {
+      if (client.userId) authenticatedClients.push(client.userId);
+    });
+    console.log(`🔔 [WS] broadcastToUser → target userId: "${userId}" | event: ${data.type} | authenticated clients: [${authenticatedClients.join(', ')}]`);
 
     this.wss.clients.forEach((client) => {
       if (client.readyState === WebSocket.OPEN && client.userId === userId) {

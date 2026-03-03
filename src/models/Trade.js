@@ -27,7 +27,7 @@ const tradeSchema = new mongoose.Schema({
   exchange: {
     type: String,
     required: true,
-    enum: ['NSE', 'BSE', 'NFO', 'BFO', 'MCX', 'CDS']
+    enum: ['NSE', 'BSE', 'NFO', 'BFO', 'MCX', 'CDS','NSEIX']
   },
   transaction_type: {
     type: String,

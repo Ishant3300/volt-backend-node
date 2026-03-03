@@ -557,6 +557,70 @@ class KiteService {
   }
 
   /**
+   * Get historical candle data for an instrument
+   * @param {string} instrumentToken - Instrument token
+   * @param {string} interval - Candle interval (minute, day, 3minute, 5minute, 10minute, 15minute, 30minute, 60minute)
+   * @param {string} fromDate - Start date (YYYY-MM-DD)
+   * @param {string} toDate - End date (YYYY-MM-DD)
+   */
+  async getHistoricalData(instrumentToken, interval, fromDate, toDate) {
+    try {
+      const accessToken = await this.getStoredAccessToken();
+      if (!accessToken) {
+        throw new Error('Not authenticated with Kite');
+      }
+
+      // Kite API expects the format: /instruments/historical/{instrument_token}/{interval}
+      // Query params: from, to, continuous (optional), oi (optional)
+      const url = `${this.baseUrl}/instruments/historical/${instrumentToken}/${interval}`;
+      
+      console.log(`📊 Fetching historical data from Kite API`);
+      console.log(`   URL: ${url}`);
+      console.log(`   From: ${fromDate}, To: ${toDate}`);
+      console.log(`   Access Token: ${accessToken.substring(0, 20)}...`);
+
+      const response = await axios.get(url, {
+        params: {
+          from: fromDate,
+          to: toDate
+        },
+        headers: {
+          'X-Kite-Version': '3',
+          'Authorization': `token ${this.apiKey}:${accessToken}`
+        }
+      });
+
+      if (response.data && response.data.status === 'success') {
+        const candles = response.data.data.candles;
+        
+        // Transform Kite candle format to our format
+        // Kite format: [date, open, high, low, close, volume, oi]
+        const transformedCandles = candles.map(candle => ({
+          date: candle[0], // ISO date string
+          open: candle[1],
+          high: candle[2],
+          low: candle[3],
+          close: candle[4],
+          volume: candle[5],
+          oi: candle[6] || 0
+        }));
+
+        console.log(`✅ Fetched ${transformedCandles.length} candles from Kite`);
+        return transformedCandles;
+      }
+
+      return [];
+    } catch (error) {
+      console.error('❌ Error fetching historical data:', error.message);
+      if (error.response) {
+        console.error('   Response status:', error.response.status);
+        console.error('   Response data:', JSON.stringify(error.response.data, null, 2));
+      }
+      throw error;
+    }
+  }
+
+  /**
    * Check authentication status
    */
   async isAuthenticated() {

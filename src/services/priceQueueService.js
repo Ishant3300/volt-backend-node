@@ -33,27 +33,27 @@ let worker = null;
  * @param {number} livePrice
  */
 const publishPriceUpdate = async (instrumentToken, livePrice) => {
-  if (!queue) return;
+  if (!queue) {
+    console.log(`⚠️  [PriceQueue] Cannot publish - queue not initialized`);
+    return;
+  }
 
   try {
+    const jobId = `price_${instrumentToken}_${Date.now()}`; // Unique ID to prevent replacement
     await queue.add('PRICE_UPDATE', {
       instrument_token: instrumentToken,
       live_price: livePrice,
       timestamp: Date.now(),
     }, {
-      // De-duplicate: only keep the latest price per instrument
-      // If a previous job for the same token hasn't been picked up yet, replace it
-      jobId: `price_${instrumentToken}`,
-      removeOnComplete: 100,   // Keep last 100 completed jobs for debugging
+      jobId: jobId,
+      removeOnComplete: 100,
       removeOnFail: 200,
       attempts: 3,
       backoff: { type: 'exponential', delay: 1000 },
     });
+    console.log(`📤 [PriceQueue] Published: Token ${instrumentToken} @ ${livePrice} (Job: ${jobId})`);
   } catch (err) {
-    // Don't spam logs – price updates are very frequent
-    if (err.message && !err.message.includes('Duplicated')) {
-      console.error(`❌ [PriceQueue] publishPriceUpdate error: ${err.message}`);
-    }
+    console.error(`❌ [PriceQueue] publishPriceUpdate error: ${err.message}`);
   }
 };
 
@@ -66,6 +66,8 @@ const publishPriceUpdate = async (instrumentToken, livePrice) => {
 const _processJob = async (job) => {
   const { instrument_token, live_price } = job.data;
 
+  console.log(`🔄 [PriceQueue] Processing price update: Token ${instrument_token} @ ${live_price}`);
+
   // 1. Find matching BUY orders (limitPrice >= livePrice)
   const matchingBuys = await orderBookService.getMatchingBuyOrders(instrument_token, live_price);
 
@@ -77,7 +79,10 @@ const _processJob = async (job) => {
     ...matchingSells.map(id => ({ id, side: 'SELL' })),
   ];
 
-  if (allMatches.length === 0) return;
+  if (allMatches.length === 0) {
+    console.log(`   ℹ️  No matching orders for token ${instrument_token} at price ${live_price}`);
+    return;
+  }
 
   console.log(`⚡ [PriceQueue] Token ${instrument_token} @ ${live_price} → ${allMatches.length} order(s) to execute`);
 

@@ -13,10 +13,22 @@
  */
 
 const crypto = require('crypto');
+const os = require('os');
+const path = require('path');
 const base32 = require('hi-base32');
-const puppeteer = require('puppeteer');
 const kiteService = require('./kiteService');
 const { AccessToken } = require('../models/KiteConfig');
+
+// ==================== HELPERS ====================
+
+/**
+ * Human-like random delay between min and max ms
+ */
+function randomDelay(min = 300, max = 900) {
+  return new Promise(resolve =>
+    setTimeout(resolve, Math.floor(Math.random() * (max - min + 1)) + min)
+  );
+}
 
 class KiteAuthService {
   constructor() {
@@ -24,12 +36,12 @@ class KiteAuthService {
     this.isRunning = false;
     this.lastRunTime = null;
     this.lastRunStatus = null;
-    
+
     // Credentials from environment
     this.apiKey = process.env.KITE_API_KEY;
-    this.userId = process.env.ZERODHA_USER_ID 
-    this.password = process.env.ZERODHA_PASSWORD 
-    this.totpSecret = process.env.ZERODHA_TOTP_SECRET
+    this.userId = process.env.ZERODHA_USER_ID;
+    this.password = process.env.ZERODHA_PASSWORD;
+    this.totpSecret = process.env.ZERODHA_TOTP_SECRET;
 
     // ==================== AUTH SERVICE ====================
     this.isAuthenticating = false;
@@ -46,20 +58,20 @@ class KiteAuthService {
       const key = base32.decode.asBytes(secret);
       const epoch = Math.floor(Date.now() / 1000);
       const time = Math.floor(epoch / 30);
-      
+
       const buffer = Buffer.alloc(8);
       buffer.writeBigInt64BE(BigInt(time));
-      
+
       const hmac = crypto.createHmac('sha1', Buffer.from(key));
       hmac.update(buffer);
       const hash = hmac.digest();
-      
+
       const offset = hash[hash.length - 1] & 0xf;
       const binary = ((hash[offset] & 0x7f) << 24) |
-                     ((hash[offset + 1] & 0xff) << 16) |
-                     ((hash[offset + 2] & 0xff) << 8) |
-                     (hash[offset + 3] & 0xff);
-      
+        ((hash[offset + 1] & 0xff) << 16) |
+        ((hash[offset + 2] & 0xff) << 8) |
+        (hash[offset + 3] & 0xff);
+
       const otp = binary % 1000000;
       return otp.toString().padStart(6, '0');
     } catch (error) {
@@ -76,20 +88,20 @@ class KiteAuthService {
   async checkTokenStatus() {
     try {
       const accessToken = await kiteService.getStoredAccessToken();
-      
+
       if (!accessToken) {
         return { valid: false, reason: 'No token found' };
       }
 
       const tokenDoc = await AccessToken.findOne().sort({ created_at: -1 });
-      
+
       if (!tokenDoc) {
         return { valid: false, reason: 'No token document found' };
       }
 
       const now = new Date();
       const expiresAt = new Date(tokenDoc.expires_at);
-      
+
       if (now >= expiresAt) {
         return { valid: false, reason: 'Token expired', expiresAt };
       }
@@ -97,9 +109,9 @@ class KiteAuthService {
       // Check if token expires in less than 2 hours
       const twoHours = 2 * 60 * 60 * 1000;
       if (expiresAt - now < twoHours) {
-        return { 
-          valid: false, 
-          reason: 'Token expires soon', 
+        return {
+          valid: false,
+          reason: 'Token expires soon',
           expiresAt,
           minutesLeft: Math.floor((expiresAt - now) / 60000)
         };
@@ -108,15 +120,15 @@ class KiteAuthService {
       // Validate token against actual Kite API
       const isValidOnAPI = await kiteService.validateAccessToken(accessToken);
       if (!isValidOnAPI) {
-        return { 
-          valid: false, 
-          reason: 'Token invalid according to Kite API', 
-          expiresAt 
+        return {
+          valid: false,
+          reason: 'Token invalid according to Kite API',
+          expiresAt
         };
       }
 
-      return { 
-        valid: true, 
+      return {
+        valid: true,
         expiresAt,
         hoursLeft: Math.floor((expiresAt - now) / (60 * 60 * 1000))
       };
@@ -132,7 +144,7 @@ class KiteAuthService {
   async checkAuthenticationStatus() {
     try {
       const tokenDoc = await AccessToken.findOne().sort({ created_at: -1 });
-      
+
       if (!tokenDoc) {
         return {
           status: 'no_token',
@@ -189,11 +201,9 @@ class KiteAuthService {
    */
   async ensureAuthenticated() {
     try {
-      // Check if we already have a valid token
       const existingToken = await kiteService.getStoredAccessToken();
-      
+
       if (existingToken) {
-        // Validate token against actual Kite API
         const isValid = await kiteService.validateAccessToken(existingToken);
         if (isValid) {
           console.log('✅ Using existing valid access token');
@@ -203,12 +213,11 @@ class KiteAuthService {
         }
       }
 
-      // No valid token - need manual login
       console.log('❌ No valid access token found');
       console.log('🔑 Manual login required at: http://localhost:3000/api/kite/login');
-      
-      return { 
-        success: false, 
+
+      return {
+        success: false,
         requiresLogin: true,
         loginUrl: `${process.env.BASE_URL || 'http://localhost:3000'}/api/kite/login`,
         message: 'Manual login required - access token expired or not found'
@@ -223,7 +232,9 @@ class KiteAuthService {
   // ==================== AUTOMATED LOGIN ====================
 
   /**
-   * Perform automated login using Puppeteer
+   * Perform automated login via direct HTTP API calls (no browser/Puppeteer).
+   * Zerodha's /api/login and /api/twofa endpoints don't enforce the browser
+   * captcha token — that check only runs on the rendered web form.
    */
   async performAutomatedLogin() {
     if (this.isRunning) {
@@ -232,173 +243,206 @@ class KiteAuthService {
     }
 
     this.isRunning = true;
-    let browser = null;
 
     try {
-      console.log('🚀 Starting automated Kite login...');
-      
-      const loginUrl = `https://kite.zerodha.com/connect/login?api_key=${this.apiKey}&v=3`;
-      
-      // Launch browser
-      browser = await puppeteer.launch({
-        headless: 'new',
-        args: [
-          '--no-sandbox',
-          '--disable-setuid-sandbox',
-          '--disable-dev-shm-usage',
-          '--disable-gpu'
-        ]
+      console.log('🚀 Starting automated Kite login (direct API)...');
+
+      const axios = require('axios');
+
+      // Shared headers that mimic a real browser session
+      const headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+        'Accept': 'application/json, text/plain, */*',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'Origin': 'https://kite.zerodha.com',
+        'Referer': `https://kite.zerodha.com/connect/login?api_key=${this.apiKey}&v=3`,
+        'X-Kite-Version': '3',
+      };
+
+      // ── Step 1: Login with user ID + password ──
+      console.log('📝 Posting credentials to Zerodha login API...');
+
+      const loginParams = new URLSearchParams({
+        user_id: this.userId,
+        password: this.password,
       });
 
-      const page = await browser.newPage();
-      await page.goto(loginUrl, { waitUntil: 'networkidle2' });
+      const loginRes = await axios.post(
+        'https://kite.zerodha.com/api/login',
+        loginParams.toString(),
+        { headers }
+      );
 
-      // Step 1: Enter User ID
-      console.log('📝 Entering user ID...');
-      await page.waitForSelector('#userid', { timeout: 10000 });
-      await page.type('#userid', this.userId);
-      await page.click('button[type="submit"]');
+      const loginData = loginRes.data;
+      console.log('📥 Login response status:', loginData.status);
 
-      // Step 2: Enter Password
-      console.log('🔑 Entering password...');
-      await page.waitForSelector('#password', { timeout: 10000 });
-      await page.type('#password', this.password);
-      await page.click('button[type="submit"]');
+      if (loginData.status !== 'success') {
+        throw new Error('Login step 1 failed: ' + JSON.stringify(loginData));
+      }
 
-      // Step 3: Enter TOTP
-      console.log('🔐 Generating and entering TOTP...');
-      await new Promise(resolve => setTimeout(resolve, 2000));
-      
-      await page.waitForSelector('#userid', { timeout: 10000 });
+      const requestId = loginData.data?.request_id;
+      const twoFaType = loginData.data?.twofa_type || 'totp';
+      console.log(`✅ Credentials accepted. request_id: ${requestId}, twofa_type: ${twoFaType}`);
+
+      // ── Step 2: Submit TOTP ──
+      console.log('🔐 Generating TOTP and posting to twofa API...');
       const totp = this.generateTOTP(this.totpSecret);
       console.log(`   TOTP: ${totp}`);
-      await page.type('#userid', totp);
-      await page.click('button[type="submit"]');
 
-      // Step 4: Wait for redirect (with error handling for navigation issues)
-      console.log('⏳ Waiting for redirect...');
-      
-      let redirectUrl = null;
+      const twoFaParams = new URLSearchParams({
+        user_id: this.userId,
+        request_id: requestId,
+        twofa_value: totp,
+        twofa_type: twoFaType,
+        skip_session: '',
+      });
+
+      const twoFaRes = await axios.post(
+        'https://kite.zerodha.com/api/twofa',
+        twoFaParams.toString(),
+        { headers }
+      );
+
+      const twoFaData = twoFaRes.data;
+      console.log('📥 2FA response status:', twoFaData.status);
+      console.log('📥 2FA response data:', JSON.stringify(twoFaData.data));
+
+      if (twoFaData.status !== 'success') {
+        throw new Error('Login step 2 (TOTP) failed: ' + JSON.stringify(twoFaData));
+      }
+
+      // Extract cookies from the 2FA response for subsequent requests
+      const rawCookies = twoFaRes.headers['set-cookie'] || [];
+      const cookieString = rawCookies.map(c => c.split(';')[0]).join('; ');
+      console.log(`🍪 Session cookies: ${cookieString ? 'present' : 'none'}`);
+
+      // ── Step 3: Follow connect/finish with cookies to get request_token ──
+      console.log('🔄 Following redirect chain to get request_token...');
+
       let requestToken = null;
-      
-      try {
-        // Try to wait for redirect, but handle navigation errors gracefully
-        await page.waitForFunction(
-          () => window.location.href.includes('request_token'),
-          { timeout: 15000 }
-        );
 
-        await new Promise(resolve => setTimeout(resolve, 2000));
-        redirectUrl = page.url();
-        console.log(`🔗 Redirected to: ${redirectUrl}`);
+      const connectUrl = `https://kite.zerodha.com/connect/login?api_key=${this.apiKey}&v=3`;
 
-        // Extract request token from URL
-        const urlParams = new URLSearchParams(redirectUrl.split('?')[1]);
-        requestToken = urlParams.get('request_token');
-        
-      } catch (navigationError) {
-        console.log('⚠️  Navigation error (common with Puppeteer), but login may have succeeded');
-        console.log('🔍 Checking if token was stored in database...');
-        
-        // Wait a bit for the callback to process
-        await new Promise(resolve => setTimeout(resolve, 5000));
-      }
-      
-      // Always check if token was stored, regardless of navigation success
-      const status = await this.checkTokenStatus();
-      if (status.valid) {
-        console.log('✅ Token verified in MongoDB - login successful!');
-        this.lastRunStatus = 'success';
-        return { 
-          success: true, 
-          message: 'Login successful, token stored and verified', 
-          requestToken: requestToken || 'extracted_from_callback'
-        };
-      }
-      
-      // If we got a request token, manually exchange it for access token
-      if (requestToken) {
-        console.log(`🎫 Request token found: ${requestToken}`);
-        console.log('🔄 Manually exchanging request token for access token...');
-        
-        try {
-          // Exchange request token for access token (same as manual login)
-          const tokenResponse = await kiteService.exchangeToken(requestToken);
-          
-          if (tokenResponse.status === "success") {
-            const { access_token, login_time } = tokenResponse.data;
-            
-            // Store access token (same as manual login)
-            await kiteService.storeAccessToken(access_token, login_time);
-            
-            console.log('✅ Token exchanged and stored successfully');
-            this.lastRunStatus = 'success';
-            return { 
-              success: true, 
-              message: 'Login successful, token exchanged and stored', 
-              requestToken,
-              accessToken: access_token
-            };
-          } else {
-            throw new Error('Token exchange failed: ' + JSON.stringify(tokenResponse));
+      const followRedirects = async (url, maxHops = 8) => {
+        for (let i = 0; i < maxHops; i++) {
+          console.log(`   Hop ${i + 1}: GET ${url}`);
+
+          // If this hop is already our callback URL, extract token directly
+          if (url.includes('request_token=')) {
+            const base = url.startsWith('http') ? url : `https://placeholder.com${url}`;
+            return new URL(base).searchParams.get('request_token');
           }
-        } catch (exchangeError) {
-          console.error('❌ Token exchange failed:', exchangeError.message);
-          this.lastRunStatus = 'failed';
-          return { 
-            success: false, 
-            error: `Token exchange failed: ${exchangeError.message}`,
-            requestToken 
-          };
+
+          try {
+            const res = await axios.get(url, {
+              headers: { ...headers, Cookie: cookieString },
+              maxRedirects: 0,
+              validateStatus: (s) => s >= 200 && s < 400,
+            });
+            const loc = res.headers['location'] || '';
+            if (loc) {
+              url = loc.startsWith('http') ? loc : `https://kite.zerodha.com${loc}`;
+              continue;
+            }
+            // 2xx with no redirect — done
+            break;
+          } catch (err) {
+            const loc = err.response?.headers?.['location'] || '';
+            console.log(`   → ${loc || ('Error: ' + err.message)}`);
+            if (loc) {
+              url = loc.startsWith('http') ? loc : `https://kite.zerodha.com${loc}`;
+              // Check immediately if the next URL already has the token
+              if (url.includes('request_token=')) {
+                return new URL(url).searchParams.get('request_token');
+              }
+              continue;
+            }
+            // localhost redirects cause ECONNREFUSED — check url itself
+            if (err.code === 'ECONNREFUSED' || err.code === 'ECONNRESET') {
+              const attempted = err.config?.url || '';
+              if (attempted.includes('request_token=')) {
+                return new URL(attempted).searchParams.get('request_token');
+              }
+            }
+            throw err;
+          }
         }
+        return null;
+      };
+
+      // Start from connect/login — Zerodha will redirect to connect/finish?sess_id=... automatically
+      console.log('   Starting redirect chain from connect/login...');
+      requestToken = await followRedirects(connectUrl);
+
+      if (!requestToken) {
+        throw new Error('Could not extract request_token from redirect after successful login');
       }
-      
-      // No request token found - this shouldn't happen if login succeeded
-      console.log('⚠️  No request token found in URL - login may have failed');
-      throw new Error('Login completed but no request token found in redirect URL');
+
+      console.log(`🎫 Request token: ${requestToken}`);
+
+      // ── Step 4: Exchange request_token for access_token ──
+      console.log('🔄 Exchanging request token for access token...');
+      const tokenResponse = await kiteService.exchangeToken(requestToken);
+
+      if (tokenResponse.status === 'success') {
+        const { access_token, login_time } = tokenResponse.data;
+        await kiteService.storeAccessToken(access_token, login_time);
+        console.log('✅ Access token stored successfully');
+        this.lastRunStatus = 'success';
+        return {
+          success: true,
+          message: 'Login successful via direct API',
+          requestToken,
+          accessToken: access_token
+        };
+      } else {
+        throw new Error('Token exchange failed: ' + JSON.stringify(tokenResponse));
+      }
 
     } catch (error) {
       console.error('❌ Login error:', error.message);
-      
-      // Check if token was stored despite the error (common with navigation issues)
-      try {
-        console.log('🔍 Checking if login succeeded despite error...');
-        await new Promise(resolve => setTimeout(resolve, 3000));
-        
-        const status = await this.checkTokenStatus();
-        if (status.valid) {
-          console.log('✅ Login actually succeeded! Token found in database.');
-          this.lastRunStatus = 'success';
-          return { 
-            success: true, 
-            message: 'Login successful despite navigation error', 
-            warning: error.message 
+      if (error.response) {
+        console.error('   HTTP status:', error.response.status);
+        console.error('   Response body:', JSON.stringify(error.response.data));
+
+        // Zerodha has flagged this IP/account - retrying makes it worse
+        if (error.response.data?.data?.captcha === true) {
+          console.error('');
+          console.error('🚫 ACCOUNT CAPTCHA LOCKOUT DETECTED');
+          console.error('   Zerodha has flagged your account due to repeated failed login attempts.');
+          console.error('   ✅ Fix: Manually login once via browser to clear the flag:');
+          console.error(`        → ${process.env.BASE_URL || 'http://localhost:3000'}/api/kite/login`);
+          console.error('   After manual login succeeds, automated login will work again.');
+          console.error('');
+          this.lastRunStatus = 'captcha_lockout';
+          return {
+            success: false,
+            error: 'CAPTCHA_LOCKOUT',
+            retryable: false,           // ← stops the retry loop
+            message: 'Account captcha lockout — manual login required to clear flag',
+            manualLoginUrl: `${process.env.BASE_URL || 'http://localhost:3000'}/api/kite/login`
           };
         }
-      } catch (checkError) {
-        console.log('❌ Token check also failed:', checkError.message);
       }
-      
       this.lastRunStatus = 'failed';
       return { success: false, error: error.message };
     } finally {
-      if (browser) {
-        await browser.close();
-      }
       this.isRunning = false;
       this.lastRunTime = new Date();
     }
   }
 
   /**
-   * Main login flow with token check
+   * Main login flow with token check and CAPTCHA-aware retry
    */
-  async login() {
+  async login(retryCount = 0) {
+    const MAX_CAPTCHA_RETRIES = 3;
+    const CAPTCHA_RETRY_DELAY_MS = 2 * 60 * 1000; // 2 minutes
+
     console.log('\n🔍 Checking Kite authentication status...');
-    
-    // Check current token status
+
     const status = await this.checkTokenStatus();
-    
     if (status.valid) {
       console.log(`✅ Token is valid for ${status.hoursLeft} more hours`);
       return { success: true, message: 'Token already valid', skipped: true };
@@ -407,9 +451,21 @@ class KiteAuthService {
     console.log(`⚠️  Token invalid: ${status.reason}`);
     console.log('🔄 Starting login process...\n');
 
-    // Perform automated login
     const result = await this.performAutomatedLogin();
-    
+
+    // Handle retryable CAPTCHA
+    if (!result.success && result.error === 'CAPTCHA_DETECTED' && retryCount < MAX_CAPTCHA_RETRIES) {
+      console.log(`⏳ CAPTCHA detected. Waiting ${CAPTCHA_RETRY_DELAY_MS / 1000}s before retry ${retryCount + 1}/${MAX_CAPTCHA_RETRIES}...`);
+      await new Promise(resolve => setTimeout(resolve, CAPTCHA_RETRY_DELAY_MS));
+      return this.login(retryCount + 1);
+    }
+
+    // Hard stop — don't retry lockouts
+    if (!result.success && result.retryable === false) {
+      console.error('🛑 Auto-login permanently stopped: ' + result.message);
+      return result;
+    }
+
     if (result.success) {
       console.log('🎉 Kite authentication completed successfully\n');
     } else {
@@ -421,12 +477,8 @@ class KiteAuthService {
 
   // ==================== MANUAL LOGIN GUIDANCE ====================
 
-  /**
-   * Get authentication instructions for manual login
-   */
   getAuthInstructions() {
     const baseUrl = process.env.BASE_URL || 'http://localhost:3000';
-    
     return {
       manual_steps: [
         '1. Open browser and go to login URL',
@@ -451,9 +503,6 @@ class KiteAuthService {
     };
   }
 
-  /**
-   * Get daily login schedule recommendations
-   */
   getDailyLoginSchedule() {
     return {
       recommended_login_time: '08:00 AM IST',
@@ -463,38 +512,29 @@ class KiteAuthService {
 # Daily automation script (run at 8:00 AM IST)
 #!/bin/bash
 
-# Check if login is needed
 STATUS=$(curl -s http://localhost:3000/api/kite/auth-status | jq -r '.authenticated')
 
 if [ "$STATUS" != "true" ]; then
   echo "🔑 Login required - attempting auto-login"
-  
-  # Try automated login first
   AUTO_RESULT=$(curl -s -X POST http://localhost:3000/api/kite/auth/auto-login)
   AUTO_SUCCESS=$(echo $AUTO_RESULT | jq -r '.success')
-  
   if [ "$AUTO_SUCCESS" == "true" ]; then
     echo "✅ Automated login successful"
   else
     echo "⚠️  Automated login failed - opening manual login"
     open "http://localhost:3000/api/kite/login"
-    
-    # Wait for manual login (check every 30 seconds)
     while [ "$STATUS" != "true" ]; do
       sleep 30
       STATUS=$(curl -s http://localhost:3000/api/kite/auth-status | jq -r '.authenticated')
       echo "⏳ Waiting for login completion..."
     done
   fi
-  
   echo "✅ Login completed successfully"
 else
   echo "✅ Already authenticated"
 fi
 
-# Trigger instrument fetch
 curl -X POST http://localhost:3000/api/kite/instruments/fetch?quick=true
-
 echo "🚀 System ready for market hours"
       `
     };
@@ -502,9 +542,6 @@ echo "🚀 System ready for market hours"
 
   // ==================== STATUS AND MONITORING ====================
 
-  /**
-   * Get status of last automated login run
-   */
   getAutoLoginStatus() {
     return {
       isRunning: this.isRunning,
@@ -514,9 +551,6 @@ echo "🚀 System ready for market hours"
     };
   }
 
-  /**
-   * Get comprehensive authentication status
-   */
   async getComprehensiveStatus() {
     try {
       const [tokenStatus, authStatus, autoLoginStatus] = await Promise.all([
@@ -524,7 +558,6 @@ echo "🚀 System ready for market hours"
         this.checkAuthenticationStatus(),
         Promise.resolve(this.getAutoLoginStatus())
       ]);
-
       return {
         token: tokenStatus,
         authentication: authStatus,
@@ -539,12 +572,8 @@ echo "🚀 System ready for market hours"
     }
   }
 
-  /**
-   * Get recommendations based on current status
-   */
   getRecommendations(tokenStatus, authStatus) {
     const recommendations = [];
-
     if (!tokenStatus.valid) {
       if (tokenStatus.reason === 'No token found') {
         recommendations.push('Perform initial login to get access token');
@@ -560,30 +589,21 @@ echo "🚀 System ready for market hours"
       recommendations.push(`Token is valid for ${tokenStatus.hoursLeft} more hours`);
       recommendations.push('No action needed at this time');
     }
-
     if (authStatus.status === 'expiring_soon') {
       recommendations.push('Schedule login before token expires');
     }
-
     return recommendations;
   }
 
   // ==================== COMBINED METHODS ====================
 
-  /**
-   * Initialize the auth service
-   */
   async initialize() {
     try {
       console.log('🔐 Initializing Kite Auth Service...');
-      
-      // Check current authentication status
       const status = await this.getComprehensiveStatus();
-      
       console.log('✅ Kite Auth Service initialized');
       console.log(`   └─ Token Status: ${status.authentication?.status || 'unknown'}`);
       console.log(`   └─ Auto Login: ${status.autoLogin?.canRunNow ? 'Available' : 'Busy'}`);
-      
       return status;
     } catch (error) {
       console.error('❌ Error initializing Kite Auth Service:', error);
@@ -591,39 +611,27 @@ echo "🚀 System ready for market hours"
     }
   }
 
-  /**
-   * Attempt smart login (auto first, manual fallback)
-   */
   async smartLogin() {
     try {
       console.log('🧠 Attempting smart login...');
-      
-      // First check if we already have a valid token
-      const ensureResult = await this.ensureAuthenticated();
-      if (ensureResult.success) {
-        return ensureResult;
-      }
 
-      // Try automated login
+      const ensureResult = await this.ensureAuthenticated();
+      if (ensureResult.success) return ensureResult;
+
       console.log('🤖 Trying automated login...');
       const autoResult = await this.login();
-      
-      if (autoResult.success) {
-        return autoResult;
-      }
 
-      // Automated login failed - provide manual instructions
+      if (autoResult.success) return autoResult;
+
       console.log('👤 Automated login failed - manual login required');
       const instructions = this.getAuthInstructions();
-      
       return {
         success: false,
         requiresManualLogin: true,
         autoLoginError: autoResult.error,
-        instructions: instructions,
+        instructions,
         message: 'Automated login failed - please use manual login'
       };
-      
     } catch (error) {
       console.error('❌ Smart login failed:', error);
       return {
@@ -635,14 +643,8 @@ echo "🚀 System ready for market hours"
   }
 
   // ==================== LEGACY COMPATIBILITY ====================
-  // Maintain compatibility with existing authService and kiteAutoLogin usage
-
-  // Auto Login compatibility (different method names to avoid conflicts)
   async performLogin() { return this.performAutomatedLogin(); }
   getStatus() { return this.getAutoLoginStatus(); }
-  
-  // Auth Service methods are already available with their original names
 }
 
-// Export singleton
 module.exports = new KiteAuthService();

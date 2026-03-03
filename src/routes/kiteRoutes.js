@@ -24,6 +24,9 @@ const {
   getOptionChain,
   getMarketDepth,
   
+  // Historical Data
+  getHistoricalData,
+  
   // Profile
   getProfile
 } = require('../controllers/kiteController');
@@ -80,6 +83,9 @@ router.get('/option-chain/:tradingSymbol', getOptionChain);
 
 // Get market depth for an instrument
 router.get('/market-depth/:instrumentToken', getMarketDepth);
+
+// Get historical candle data
+router.get('/historical/:instrumentToken/:interval', getHistoricalData);
 
 // ==================== PROFILE ROUTES ====================
 

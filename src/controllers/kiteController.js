@@ -526,6 +526,55 @@ const getMarketDepth = async (req, res) => {
   }
 };
 
+/**
+ * Get historical candle data for an instrument
+ */
+const getHistoricalData = async (req, res) => {
+  try {
+    const { instrumentToken, interval } = req.params;
+    const { from, to } = req.query;
+
+    if (!instrumentToken || !interval) {
+      return res.status(400).json({
+        success: false,
+        message: 'Instrument token and interval are required',
+        data: null
+      });
+    }
+
+    if (!from || !to) {
+      return res.status(400).json({
+        success: false,
+        message: 'From and to dates are required (YYYY-MM-DD format)',
+        data: null
+      });
+    }
+
+    console.log(`📊 Fetching historical data for token: ${instrumentToken}`);
+    console.log(`   Interval: ${interval}, From: ${from}, To: ${to}`);
+
+    const historicalData = await kiteService.getHistoricalData(
+      instrumentToken,
+      interval,
+      from,
+      to
+    );
+
+    res.status(200).json({
+      success: true,
+      message: 'Historical data fetched successfully',
+      data: historicalData
+    });
+  } catch (error) {
+    console.error('❌ Error fetching historical data:', error);
+    res.status(500).json({
+      success: false,
+      message: error.message,
+      data: null
+    });
+  }
+};
+
 module.exports = {
   // Authentication
   initiateLogin,
@@ -548,6 +597,9 @@ module.exports = {
   // Option Chain & Market Depth
   getOptionChain,
   getMarketDepth,
+  
+  // Historical Data
+  getHistoricalData,
   
   // Profile
   getProfile
