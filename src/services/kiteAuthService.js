@@ -51,13 +51,14 @@ class KiteAuthService {
   // ==================== TOTP GENERATION ====================
 
   /**
-   * Generate TOTP code for automated login
+   * Generate TOTP code for a specific time window offset
+   * offset: 0 = current, -1 = previous window, 1 = next window
    */
-  generateTOTP(secret) {
+  generateTOTP(secret, offset = 0) {
     try {
       const key = base32.decode.asBytes(secret);
       const epoch = Math.floor(Date.now() / 1000);
-      const time = Math.floor(epoch / 30);
+      const time = Math.floor(epoch / 30) + offset;
 
       const buffer = Buffer.alloc(8);
       buffer.writeBigInt64BE(BigInt(time));
@@ -66,11 +67,11 @@ class KiteAuthService {
       hmac.update(buffer);
       const hash = hmac.digest();
 
-      const offset = hash[hash.length - 1] & 0xf;
-      const binary = ((hash[offset] & 0x7f) << 24) |
-        ((hash[offset + 1] & 0xff) << 16) |
-        ((hash[offset + 2] & 0xff) << 8) |
-        (hash[offset + 3] & 0xff);
+      const offsetByte = hash[hash.length - 1] & 0xf;
+      const binary = ((hash[offsetByte] & 0x7f) << 24) |
+        ((hash[offsetByte + 1] & 0xff) << 16) |
+        ((hash[offsetByte + 2] & 0xff) << 8) |
+        (hash[offsetByte + 3] & 0xff);
 
       const otp = binary % 1000000;
       return otp.toString().padStart(6, '0');
@@ -117,21 +118,19 @@ class KiteAuthService {
         };
       }
 
-      // Validate token against actual Kite API
-      const isValidOnAPI = await kiteService.validateAccessToken(accessToken);
-      if (!isValidOnAPI) {
-        return {
-          valid: false,
-          reason: 'Token invalid according to Kite API',
-          expiresAt
-        };
-      }
-
+      // Trust the DB expiry time — don't validate against live API
+      // (live validation can fail outside market hours and cause unnecessary re-login)
       return {
         valid: true,
         expiresAt,
         hoursLeft: Math.floor((expiresAt - now) / (60 * 60 * 1000))
       };
+
+      // Validate token against actual Kite API (disabled - causes false negatives outside market hours)
+      // const isValidOnAPI = await kiteService.validateAccessToken(accessToken);
+      // if (!isValidOnAPI) {
+      //   return { valid: false, reason: 'Token invalid according to Kite API', expiresAt };
+      // }
     } catch (error) {
       console.error('Error checking token status:', error);
       return { valid: false, reason: 'Error checking token', error: error.message };
@@ -204,13 +203,9 @@ class KiteAuthService {
       const existingToken = await kiteService.getStoredAccessToken();
 
       if (existingToken) {
-        const isValid = await kiteService.validateAccessToken(existingToken);
-        if (isValid) {
-          console.log('✅ Using existing valid access token');
-          return { success: true, token: existingToken, source: 'existing' };
-        } else {
-          console.log('❌ Stored token is invalid according to Kite API');
-        }
+        // Trust the token if it exists — DB expiry check in checkTokenStatus handles freshness
+        console.log('✅ Using existing valid access token');
+        return { success: true, token: existingToken, source: 'existing' };
       }
 
       console.log('❌ No valid access token found');
@@ -285,30 +280,55 @@ class KiteAuthService {
       const twoFaType = loginData.data?.twofa_type || 'totp';
       console.log(`✅ Credentials accepted. request_id: ${requestId}, twofa_type: ${twoFaType}`);
 
-      // ── Step 2: Submit TOTP ──
+      // ── Step 2: Submit TOTP — try prev/current/next time windows ──
       console.log('🔐 Generating TOTP and posting to twofa API...');
-      const totp = this.generateTOTP(this.totpSecret);
-      console.log(`   TOTP: ${totp}`);
 
-      const twoFaParams = new URLSearchParams({
-        user_id: this.userId,
-        request_id: requestId,
-        twofa_value: totp,
-        twofa_type: twoFaType,
-        skip_session: '',
-      });
+      let twoFaRes = null;
+      let twoFaData = null;
+      const offsets = [0, -1, 1]; // current, previous, next 30s window
 
-      const twoFaRes = await axios.post(
-        'https://kite.zerodha.com/api/twofa',
-        twoFaParams.toString(),
-        { headers }
-      );
+      for (const offset of offsets) {
+        const totp = this.generateTOTP(this.totpSecret, offset);
+        console.log(`   TOTP (offset ${offset}): ${totp}`);
 
-      const twoFaData = twoFaRes.data;
-      console.log('📥 2FA response status:', twoFaData.status);
-      console.log('📥 2FA response data:', JSON.stringify(twoFaData.data));
+        const twoFaParams = new URLSearchParams({
+          user_id: this.userId,
+          request_id: requestId,
+          twofa_value: totp,
+          twofa_type: twoFaType,
+          skip_session: '',
+        });
 
-      if (twoFaData.status !== 'success') {
+        try {
+          twoFaRes = await axios.post(
+            'https://kite.zerodha.com/api/twofa',
+            twoFaParams.toString(),
+            { headers }
+          );
+          twoFaData = twoFaRes.data;
+          console.log('📥 2FA response status:', twoFaData.status);
+          console.log('📥 2FA response data:', JSON.stringify(twoFaData.data));
+
+          if (twoFaData.status === 'success') break; // ✅ done
+
+        } catch (twoFaErr) {
+          const errData = twoFaErr.response?.data;
+          console.warn(`   ⚠️  TOTP offset ${offset} rejected:`, errData?.message || twoFaErr.message);
+
+          // If account is about to lock, stop trying immediately (keep ≥3 attempts as safety margin)
+          const attemptsLeft = errData?.data?.attempts_remaining;
+          if (attemptsLeft !== undefined && attemptsLeft <= 3) {
+            throw new Error(`TOTP failed and only ${attemptsLeft} attempt(s) remain — stopping to prevent account lock. Wait 30 min then login manually at: ${process.env.BASE_URL || 'http://localhost:3000'}/api/kite/login`);
+          }
+
+          // Last offset also failed — re-throw
+          if (offset === offsets[offsets.length - 1]) {
+            throw twoFaErr;
+          }
+        }
+      }
+
+      if (!twoFaData || twoFaData.status !== 'success') {
         throw new Error('Login step 2 (TOTP) failed: ' + JSON.stringify(twoFaData));
       }
 
