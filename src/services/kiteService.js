@@ -311,43 +311,36 @@ class KiteService {
    * Search instruments
    */
   async searchInstruments(query, exchange = null, instrumentType = null) {
-    try {
-      console.log('🔍 Backend: Searching instruments...');
-      console.log('   Query:', query);
-      console.log('   Exchange:', exchange);
-      console.log('   Instrument Type:', instrumentType);
-      
-      const filter = {
-        $or: [
-          { tradingsymbol: { $regex: query, $options: 'i' } },
-          { name: { $regex: query, $options: 'i' } }
-        ],
-        instrument_type: { $in: ['FUT', 'CE', 'PE', 'EQ'] }
-      };
+      try {
+        // Use anchored regex (prefix match) so MongoDB can use the tradingsymbol index
+        const escapedQuery = query.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        const filter = {
+          $or: [
+            { tradingsymbol: { $regex: `^${escapedQuery}`, $options: 'i' } },
+            { name: { $regex: `^${escapedQuery}`, $options: 'i' } }
+          ],
+          instrument_type: { $in: ['FUT', 'CE', 'PE', 'EQ'] }
+        };
 
-      if (exchange) {
-        filter.exchange = exchange;
+        if (exchange) {
+          filter.exchange = exchange;
+        }
+
+        if (instrumentType) {
+          filter.instrument_type = instrumentType;
+        }
+
+        const instruments = await KiteInstrument.find(filter)
+          .select('instrument_token tradingsymbol name instrument_type exchange segment strike expiry lot_size')
+          .limit(50)
+          .lean();
+
+        return instruments;
+      } catch (error) {
+        console.error('❌ Error searching instruments:', error);
+        throw error;
       }
-
-      if (instrumentType) {
-        filter.instrument_type = instrumentType;
-      }
-
-      console.log('   Filter:', JSON.stringify(filter, null, 2));
-      
-      // Check total count in database
-      const totalCount = await KiteInstrument.countDocuments();
-      console.log('   Total instruments in DB:', totalCount);
-      
-      const instruments = await KiteInstrument.find(filter).limit(50);
-      console.log('   ✅ Found', instruments.length, 'matching instruments');
-      
-      return instruments;
-    } catch (error) {
-      console.error('❌ Error searching instruments:', error);
-      throw error;
     }
-  }
 
   /**
    * Get instruments info

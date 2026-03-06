@@ -59,6 +59,53 @@ const placeTrade = async (req, res) => {
                 throw new Error('User not found');
             }
 
+            // 0. Options sell restriction: prevent naked short selling
+            // Users can only SELL options they already own (to close a position)
+            if (transaction_type === 'SELL') {
+                const instrument = await require('../models/KiteInstrument').findOne({
+                    instrument_token: instrument_token
+                }).session(session);
+
+                const isOption = instrument && ['CE', 'PE'].includes(instrument.instrument_type);
+
+                if (isOption) {
+                    // Calculate user's current net position for this exact instrument
+                    const posAgg = await Trade.aggregate([
+                        {
+                            $match: {
+                                user_id: user._id,
+                                instrument_token: instrument_token,
+                                status: 'completed',
+                                deleted_at: null
+                            }
+                        },
+                        {
+                            $group: {
+                                _id: null,
+                                total_buy_qty: {
+                                    $sum: { $cond: [{ $eq: ['$transaction_type', 'BUY'] }, '$executed_quantity', 0] }
+                                },
+                                total_sell_qty: {
+                                    $sum: { $cond: [{ $eq: ['$transaction_type', 'SELL'] }, '$executed_quantity', 0] }
+                                }
+                            }
+                        }
+                    ]).session(session);
+
+                    const netQty = posAgg.length > 0
+                        ? posAgg[0].total_buy_qty - posAgg[0].total_sell_qty
+                        : 0;
+
+                    if (netQty <= 0) {
+                        throw new Error('Option selling is not allowed. You must own this option before you can sell it.');
+                    }
+
+                    if (quantity > netQty) {
+                        throw new Error(`You can only sell up to ${netQty} units of this option (your current holding). Selling ${quantity} would create a short position.`);
+                    }
+                }
+            }
+
             // 1. Determine execution price
             let executedPrice = price;
             let livePrice = null;
@@ -259,6 +306,7 @@ const placeTrade = async (req, res) => {
 
         let statusCode = 500;
         if (error.message === 'User not found') statusCode = 404;
+        else if (error.message.includes('Option selling is not allowed') || error.message.includes('would create a short position')) statusCode = 403;
         else if (error.message.includes('Could not fetch') || error.message.includes('Invalid')) statusCode = 400;
 
         res.status(statusCode).json({

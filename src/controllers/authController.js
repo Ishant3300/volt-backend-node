@@ -293,11 +293,105 @@ const masterLogout = async (req, res) => {
   }
 };
 
+// Universal Login
+const universalLogin = async (req, res) => {
+  try {
+    const { username, password } = req.body;
+
+    if (!username || !password) {
+      return res.status(400).json({
+        success: false,
+        message: 'Username and password are required',
+        data: null
+      });
+    }
+
+    let userAccount = null;
+    let roleType = null;
+
+    // Check Admin
+    const admin = await Admin.findOne({ username });
+    if (admin && !admin.deleted_at && await bcrypt.compare(password, admin.password)) {
+      userAccount = admin;
+      roleType = 'admin';
+    }
+
+    // Check Master
+    if (!userAccount) {
+      const master = await Master.findOne({ username });
+      if (master && !master.deleted_at && await bcrypt.compare(password, master.password)) {
+        if (master.status !== 'active') {
+          return res.status(403).json({
+            success: false,
+            message: 'Account is not active',
+            data: null
+          });
+        }
+        userAccount = master;
+        roleType = 'master';
+      }
+    }
+
+    // Check User
+    if (!userAccount) {
+      const user = await User.findOne({ username });
+      if (user && !user.deleted_at && await bcrypt.compare(password, user.password)) {
+        if (user.status !== 'active') {
+          return res.status(403).json({
+            success: false,
+            message: 'Account is not active',
+            data: null
+          });
+        }
+        userAccount = user;
+        roleType = 'user';
+      }
+    }
+
+    if (!userAccount) {
+      return res.status(401).json({
+        success: false,
+        message: 'Invalid credentials',
+        data: null
+      });
+    }
+
+    // Generate new token (no expiration)
+    const token = generateToken(userAccount._id, roleType);
+
+    // Update active_token, last_login, and IP address
+    userAccount.active_token = token;
+    if (roleType !== 'admin') {
+      userAccount.last_login = new Date();
+      userAccount.ip_address = req.ip || req.connection.remoteAddress || req.socket.remoteAddress || (req.connection.socket ? req.connection.socket.remoteAddress : null);
+    }
+
+    await userAccount.save();
+
+    res.status(200).json({
+      success: true,
+      message: 'Login successful',
+      data: {
+        token,
+        [roleType]: userAccount.toJSON(),
+        role: roleType.toUpperCase()
+      }
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: error.message,
+      data: null
+    });
+  }
+};
+
 module.exports = {
   userLogin,
   adminLogin,
   masterLogin,
   userLogout,
   adminLogout,
-  masterLogout
+  masterLogout,
+  universalLogin
 };

@@ -63,6 +63,16 @@ const PORT = process.env.PORT || 5000;
 server.listen(PORT, async () => {
   console.log(`Server is running on port ${PORT}`);
 
+  // Pre-warm instrument search cache in background
+  try {
+    const instrumentSearchService = require('./services/instrumentSearchService');
+    instrumentSearchService.loadInstrumentCache().then(() => {
+      console.log('🔥 Instrument search cache warmed');
+    }).catch(err => {
+      console.error('⚠️  Failed to warm instrument cache:', err.message);
+    });
+  } catch (_) {}
+
   // Initialize Redis connection
   try {
     redisService.init();

@@ -285,47 +285,33 @@ class KiteAuthService {
 
       let twoFaRes = null;
       let twoFaData = null;
-      const offsets = [0, -1, 1]; // current, previous, next 30s window
+      const totp = this.generateTOTP(this.totpSecret, 0);
+      console.log(`   TOTP: ${totp}`);
 
-      for (const offset of offsets) {
-        const totp = this.generateTOTP(this.totpSecret, offset);
-        console.log(`   TOTP (offset ${offset}): ${totp}`);
+      const twoFaParams = new URLSearchParams({
+        user_id: this.userId,
+        request_id: requestId,
+        twofa_value: totp,
+        twofa_type: twoFaType,
+        skip_session: '',
+      });
 
-        const twoFaParams = new URLSearchParams({
-          user_id: this.userId,
-          request_id: requestId,
-          twofa_value: totp,
-          twofa_type: twoFaType,
-          skip_session: '',
-        });
-
-        try {
-          twoFaRes = await axios.post(
-            'https://kite.zerodha.com/api/twofa',
-            twoFaParams.toString(),
-            { headers }
-          );
-          twoFaData = twoFaRes.data;
-          console.log('📥 2FA response status:', twoFaData.status);
-          console.log('📥 2FA response data:', JSON.stringify(twoFaData.data));
-
-          if (twoFaData.status === 'success') break; // ✅ done
-
-        } catch (twoFaErr) {
-          const errData = twoFaErr.response?.data;
-          console.warn(`   ⚠️  TOTP offset ${offset} rejected:`, errData?.message || twoFaErr.message);
-
-          // If account is about to lock, stop trying immediately (keep ≥3 attempts as safety margin)
-          const attemptsLeft = errData?.data?.attempts_remaining;
-          if (attemptsLeft !== undefined && attemptsLeft <= 3) {
-            throw new Error(`TOTP failed and only ${attemptsLeft} attempt(s) remain — stopping to prevent account lock. Wait 30 min then login manually at: ${process.env.BASE_URL || 'http://localhost:3000'}/api/kite/login`);
-          }
-
-          // Last offset also failed — re-throw
-          if (offset === offsets[offsets.length - 1]) {
-            throw twoFaErr;
-          }
+      try {
+        twoFaRes = await axios.post(
+          'https://kite.zerodha.com/api/twofa',
+          twoFaParams.toString(),
+          { headers }
+        );
+        twoFaData = twoFaRes.data;
+        console.log('📥 2FA response status:', twoFaData.status);
+      } catch (twoFaErr) {
+        const errData = twoFaErr.response?.data;
+        const attemptsLeft = errData?.data?.attempts_remaining;
+        console.error(`❌ TOTP rejected: ${errData?.message || twoFaErr.message}`);
+        if (attemptsLeft !== undefined) {
+          console.error(`   ${attemptsLeft} attempt(s) remain before account lock`);
         }
+        throw twoFaErr;
       }
 
       if (!twoFaData || twoFaData.status !== 'success') {

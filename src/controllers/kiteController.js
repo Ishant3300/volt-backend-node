@@ -231,6 +231,65 @@ const searchInstruments = async (req, res) => {
   }
 };
 
+/**
+ * Smart search instruments with fuzzy matching and grouping
+ */
+const smartSearchInstruments = async (req, res) => {
+  try {
+    const { q, category, limit } = req.query;
+
+    if (!q) {
+      return res.status(400).json({
+        success: false,
+        message: 'Search query (q) is required',
+        data: null
+      });
+    }
+
+    const instrumentSearchService = require('../services/instrumentSearchService');
+    const result = await instrumentSearchService.smartSearch(
+      q,
+      category || 'ALL',
+      limit ? parseInt(limit) : 50
+    );
+
+    res.status(200).json({
+      success: true,
+      message: `Found ${result.total} instruments`,
+      data: result
+    });
+  } catch (error) {
+    console.error('❌ Smart search error:', error);
+    res.status(500).json({
+      success: false,
+      message: error.message,
+      data: null
+    });
+  }
+};
+
+/**
+ * Get search categories
+ */
+const getSearchCategories = async (req, res) => {
+  try {
+    const instrumentSearchService = require('../services/instrumentSearchService');
+    const categories = instrumentSearchService.getCategories();
+
+    res.status(200).json({
+      success: true,
+      message: 'Categories retrieved',
+      data: categories
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: error.message,
+      data: null
+    });
+  }
+};
+
 // ==================== MARKET QUOTES ====================
 
 /**
@@ -588,6 +647,8 @@ module.exports = {
   fetchInstruments,
   getInstrumentsInfo,
   searchInstruments,
+  smartSearchInstruments,
+  getSearchCategories,
   
   // Market Quotes
   fetchQuotes,

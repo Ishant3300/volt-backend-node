@@ -1,140 +1,157 @@
-# Kite API Testing Guide
+# Test Scripts
 
-## Prerequisites
-1. Make sure your backend server is running
-2. Ensure MongoDB is connected
-3. Have your Kite API credentials in `.env` file
+This directory contains test scripts for debugging and verifying backend functionality.
 
-## Step-by-Step Testing
+## Bid/Ask Price Testing
 
-### Step 1: Get Login URL and Authenticate
+### Quick Start
 
-Run the test script to get the Kite login URL:
-
-```bash
-node test/testKite.js
-```
-
-This will output a login URL like:
-```
-https://kite.zerodha.com/connect/login?api_key=xxx&v=3
-```
-
-### Step 2: Login to Kite
-
-1. Copy the login URL and open it in your browser
-2. Login with your Zerodha credentials
-3. After successful login, you'll be redirected to a URL like:
+1. **Run diagnostic tool** (checks your setup):
+   ```bash
+   node test/checkBidAskStatus.js
    ```
-   http://localhost:3000/api/kite/callback?request_token=xxx&action=login&status=success
+
+2. **Find instrument token**:
+   ```bash
+   node test/findGoldToken.js
    ```
-4. Copy the `request_token` value from the URL
+   This will search for GOLD futures in `instruments.csv` and display available tokens.
 
-### Step 3: Generate Session
+3. **Update test script**:
+   Edit `test/testBidAsk.js` and update the `GOLD_INSTRUMENT_TOKEN` constant with the token from step 2.
 
-Run the session generator with your request token:
+4. **Run bid/ask test**:
+   ```bash
+   node test/testBidAsk.js
+   ```
+   This will connect to Kite WebSocket and display bid/ask prices for 30 seconds.
 
+### Understanding the Output
+
+#### Expected Output (Success):
+```
+✅ Connected to Kite WebSocket
+📡 Subscribed to instrument
+📡 Set mode to FULL (market depth enabled)
+
+📦 Received 1 packet(s)
+📊 Parsing packet for token: 116433415
+   Packet size: 184 bytes
+   Mode: FULL (184 bytes) - includes market depth
+   Last Price: 70250.00
+
+   📈 BUY DEPTH (Bids):
+      Level 1: Price=70245.00, Qty=50, Orders=3
+      Level 2: Price=70240.00, Qty=100, Orders=5
+
+   📉 SELL DEPTH (Asks):
+      Level 1: Price=70255.00, Qty=75, Orders=4
+      Level 2: Price=70260.00, Qty=120, Orders=6
+
+   ✅ Best BID (you can SELL at): 70245.00
+   ✅ Best ASK (you can BUY at): 70255.00
+   💰 SPREAD: 10.00 (0.014%)
+```
+
+#### Problem: Small Packet Size
+```
+📊 Parsing packet for token: 116433415
+   Packet size: 8 bytes
+   Mode: LTP (8 bytes)
+   Last Price: 70250.00
+```
+
+**Solution**: Kite is sending LTP mode only. This happens when:
+- Instrument is not actively traded
+- Kite hasn't switched to full mode yet (wait a few seconds)
+- Instrument doesn't support market depth
+
+Try a more liquid instrument like NIFTY or BANKNIFTY futures.
+
+#### Problem: No Access Token
+```
+❌ Error getting access token: No Kite access token found in database
+```
+
+**Solution**: 
+1. Make sure the backend server is running
+2. The backend should auto-login on startup
+3. Check backend logs for "✅ Kite already authenticated"
+
+### Troubleshooting
+
+#### Issue: Both BUY and SELL show same price in Flutter app
+
+**Possible Causes:**
+
+1. **Backend not receiving full mode data**
+   - Check backend logs for "⚠️  Packet size X bytes" warnings
+   - If packet size is 8 or 28 bytes, bid/ask data is not available
+   - Solution: Try a different, more liquid instrument
+
+2. **Spread is too small to notice**
+   - For GOLD at ₹70,000, a 0.05% spread = ₹35
+   - Check if prices differ by small amounts
+   - Solution: This is normal for liquid instruments
+
+3. **Bid/Ask fields are null**
+   - Check Flutter logs for "⚠️  Token X: Bid/Ask=NULL"
+   - Solution: Backend needs to receive 184-byte packets
+
+#### Issue: Test script fails with "MONGO_URI undefined"
+
+**Solution**: Make sure `.env` file exists in `stocker-backend-node/` directory with:
+```
+MONGO_URI=mongodb+srv://...
+KITE_API_KEY=...
+KITE_API_SECRET=...
+```
+
+#### Issue: "instruments.csv not found"
+
+**Solution**: Run the instrument fetch script first:
 ```bash
-node test/generateSession.js <your_request_token>
+node scripts/fetchInstruments.js
 ```
 
-Example:
-```bash
-node test/generateSession.js H06I6Ydv95y23D2Dp7pwzjxzjxjxjxjx
-```
+### Testing with Different Instruments
 
-This will:
-- Generate an access token
-- Save it to the database
-- Display your Kite profile information
+To test with other instruments:
 
-### Step 4: Run Full Tests
+1. Search for the instrument:
+   ```bash
+   # For NIFTY futures
+   grep "NIFTY.*FUT" instruments.csv | head -5
+   
+   # For BANKNIFTY futures
+   grep "BANKNIFTY.*FUT" instruments.csv | head -5
+   ```
 
-Now run the complete test suite:
+2. Update `GOLD_INSTRUMENT_TOKEN` in `testBidAsk.js` with the token
 
-```bash
-node test/testKite.js
-```
+3. Run the test again
 
-This will:
-1. ✓ Verify access token exists
-2. ✓ Download FUT/CE/PE instruments from NFO exchange
-3. ✓ Search for NIFTY instruments
-4. ✓ Get LTP (Last Traded Price) for instruments
-5. ✓ Get your Kite profile
+### Backend Server Logs
 
-## Expected Output
+When the backend is running and receiving bid/ask data, you should see:
 
 ```
-=== Testing Kite Service ===
-
-Step 1: Get Login URL
-Login URL: https://kite.zerodha.com/connect/login?api_key=xxx&v=3
-
-✓ Valid access token found: xxxxxxxxxxxxx...
-
-Step 2: Downloading FUT/CE/PE instruments from NSE...
-Download Result: {
-  "success": true,
-  "message": "Downloaded 1500 FUT/CE/PE instruments from NFO",
-  "data": {
-    "total": 1500,
-    "inserted": 1200,
-    "updated": 300,
-    "breakdown": {
-      "FUT": 500,
-      "CE": 500,
-      "PE": 500
-    }
-  }
-}
-
-Step 3: Searching for NIFTY instruments...
-Found 150 instruments
-First 3 results:
-1. NIFTY24FEB24000FUT (FUT) - Token: 256265
-2. NIFTY24FEB24000CE (CE) - Token: 256266
-3. NIFTY24FEB24000PE (PE) - Token: 256267
-
-Step 4: Getting LTP for first instrument...
-LTP Result: {
-  "NFO:NIFTY24FEB24000FUT": {
-    "instrument_token": 256265,
-    "last_price": 24050.50
-  }
-}
-
-Step 5: Getting Kite profile...
-Profile: {
-  "user_id": "XX1234",
-  "user_name": "Your Name",
-  "email": "your@email.com",
-  "broker": "ZERODHA"
-}
-
-✓ All tests completed successfully!
+📈 Received 1 tick(s):
+   Token: 116433415 | LTP: 70250.00
+   📊 Bid: 70245.00
+   📊 Ask: 70255.00
+   💰 SPREAD: 10.00 (0.014%)
+   📤 Broadcasted to 1 client(s)
 ```
 
-## Troubleshooting
+If you see "⚠️  Packet size 8 bytes" or "⚠️  Packet size 28 bytes", the backend is not receiving full market depth data.
 
-### Error: "No valid access token found"
-- Complete Step 1-3 to authenticate first
-- Access tokens expire after 24 hours, re-authenticate if needed
+### Flutter App Logs
 
-### Error: "Failed to download instruments"
-- Check if you have an active Kite subscription
-- Verify your API credentials in `.env`
-- Ensure you're using NFO exchange for derivatives
+In the Flutter app debug console, you should see:
 
-### Error: "Connection refused"
-- Make sure MongoDB is running
-- Check your MONGO_URI in `.env`
+```
+💰 Token 116433415: LTP=70250.0, Bid=70245.0, Ask=70255.0
+```
 
-## Notes
-
-- Access tokens expire after 24 hours
-- You need to re-authenticate daily
-- Only FUT, CE, and PE instruments are downloaded
-- Use NFO exchange for NSE derivatives
-- Use BFO exchange for BSE derivatives
-- Use MCX exchange for commodity derivatives
+If you see "⚠️  Token X: Bid/Ask=NULL", the Flutter app is not receiving bid/ask data from the backend.

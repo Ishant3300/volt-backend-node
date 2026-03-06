@@ -134,7 +134,7 @@ const authenticateAny = async (req, res, next) => {
 
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
 
-    if (decoded.role !== 'user' && decoded.role !== 'admin') {
+    if (decoded.role !== 'user' && decoded.role !== 'admin' && decoded.role !== 'master') {
       return res.status(403).json({
         success: false,
         message: 'Access denied. Invalid role',
@@ -171,7 +171,8 @@ const authenticateAny = async (req, res, next) => {
 
       req.user = decoded;
       req.admin = null;
-    } else {
+      req.master = null;
+    } else if (decoded.role === 'admin') {
       const admin = await Admin.findById(decoded.id);
 
       if (!admin || admin.deleted_at) {
@@ -192,6 +193,38 @@ const authenticateAny = async (req, res, next) => {
 
       req.user = null;
       req.admin = decoded;
+      req.master = null;
+    } else {
+      // role === 'master'
+      const master = await Master.findById(decoded.id);
+
+      if (!master || master.deleted_at) {
+        return res.status(401).json({
+          success: false,
+          message: 'Master not found',
+          data: null
+        });
+      }
+
+      if (master.active_token !== token) {
+        return res.status(401).json({
+          success: false,
+          message: 'Session expired. Please login again',
+          data: null
+        });
+      }
+
+      if (master.status !== 'active') {
+        return res.status(403).json({
+          success: false,
+          message: 'Account is not active',
+          data: null
+        });
+      }
+
+      req.user = null;
+      req.admin = null;
+      req.master = decoded;
     }
     next();
   } catch (error) {

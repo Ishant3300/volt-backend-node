@@ -14,6 +14,8 @@ const {
   fetchInstruments,
   getInstrumentsInfo,
   searchInstruments,
+  smartSearchInstruments,
+  getSearchCategories,
   
   // Market Quotes
   fetchQuotes,
@@ -64,8 +66,14 @@ router.post('/instruments/fetch', fetchInstruments);
 // Get instruments info
 router.get('/instruments/info', getInstrumentsInfo);
 
-// Search instruments
+// Search instruments (legacy)
 router.get('/instruments/search', searchInstruments);
+
+// Smart search instruments (new - with fuzzy matching and grouping)
+router.get('/instruments/smart-search', smartSearchInstruments);
+
+// Get search categories
+router.get('/instruments/categories', getSearchCategories);
 
 // ==================== MARKET QUOTE ROUTES ====================
 

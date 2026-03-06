@@ -77,4 +77,11 @@ kiteInstrumentSchema.index({ exchange: 1 });
 kiteInstrumentSchema.index({ segment: 1 });
 kiteInstrumentSchema.index({ instrument_type: 1 });
 
+// Compound indexes for smart search cache loading query
+// Covers: { instrument_type: { $in: [...] } } with segment/exchange
+kiteInstrumentSchema.index({ instrument_type: 1, segment: 1, exchange: 1 });
+// Covers: legacy regex search filter
+kiteInstrumentSchema.index({ tradingsymbol: 1, instrument_type: 1 });
+kiteInstrumentSchema.index({ name: 1, instrument_type: 1 });
+
 module.exports = mongoose.model('KiteInstrument', kiteInstrumentSchema);

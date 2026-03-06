@@ -86,7 +86,20 @@ const getAllTrades = async (req, res) => {
       success: true,
       message: 'Trades retrieved successfully',
       data: {
-        trades: trades.map(trade => trade.toJSON()),
+        trades: trades.map(trade => {
+          const t = trade.toJSON();
+          // Flatten populated user_id and master_id into top-level fields
+          if (t.user_id && typeof t.user_id === 'object') {
+            t.user_name = t.user_id.name || null;
+            t.user_username = t.user_id.username || null;
+            t.user_id = t.user_id.id || t.user_id._id || t.user_id;
+          }
+          if (t.master_id && typeof t.master_id === 'object') {
+            t.master_name = t.master_id.name || null;
+            t.master_id = t.master_id.id || t.master_id._id || t.master_id;
+          }
+          return t;
+        }),
         total: count,
         page: parseInt(page),
         pages: Math.ceil(count / limit),

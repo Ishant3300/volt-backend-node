@@ -34,6 +34,12 @@ const {
   getAllTrades
 } = require('../controllers/masterTradeController');
 
+const {
+  getAggregatedPositions,
+  getInstrumentUserBreakdown,
+  getUserMetrics
+} = require('../controllers/masterPositionController');
+
 // All routes require admin or master authentication
 router.use(authenticateAdminOrMaster);
 
@@ -117,5 +123,18 @@ router.delete('/users/:id', deleteUser);
 
 // Get all trades in hierarchy
 router.get('/trades', getAllTrades);
+
+// ============================================
+// Master Position Aggregation Routes
+// ============================================
+
+// Get aggregated positions across all child users
+router.get('/positions/aggregated', getAggregatedPositions);
+
+// Get full metrics per child user (6 metrics like user orders page)
+router.get('/positions/user-metrics', getUserMetrics);
+
+// Get per-user breakdown for a specific instrument
+router.get('/positions/aggregated/:instrumentToken', getInstrumentUserBreakdown);
 
 module.exports = router;
