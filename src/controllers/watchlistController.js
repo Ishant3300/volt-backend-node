@@ -10,8 +10,8 @@ const Master = require('../models/Master');
  */
 const getWatchlist = async (req, res) => {
   try {
-    const userId = req.user?.id || req.admin?.id;
-    const ownerType = req.admin ? 'Admin' : 'User';
+    const userId = req.user?.id || req.admin?.id || req.master?.id;
+    const ownerType = req.admin ? 'Admin' : req.master ? 'Master' : 'User';
 
     console.log('📋 Getting watchlist for:', { userId, ownerType });
 
@@ -105,8 +105,8 @@ const getWatchlist = async (req, res) => {
  */
 const addToWatchlist = async (req, res) => {
   try {
-    const userId = req.user?.id || req.admin?.id;
-    const ownerType = req.admin ? 'Admin' : 'User';
+    const userId = req.user?.id || req.admin?.id || req.master?.id;
+    const ownerType = req.admin ? 'Admin' : req.master ? 'Master' : 'User';
     const { kite_instrument_id, instrument_token } = req.body;
 
     if (!instrument_token) {
@@ -184,8 +184,8 @@ const addToWatchlist = async (req, res) => {
  */
 const removeFromWatchlist = async (req, res) => {
   try {
-    const userId = req.user?.id || req.admin?.id;
-    const ownerType = req.admin ? 'Admin' : 'User';
+    const userId = req.user?.id || req.admin?.id || req.master?.id;
+    const ownerType = req.admin ? 'Admin' : req.master ? 'Master' : 'User';
     const { id } = req.params;
 
     const filter = {

@@ -17,13 +17,13 @@ const watchlistSchema = new mongoose.Schema({
   owner_id: {
     type: mongoose.Schema.Types.ObjectId,
     required: true,
-    // Can reference either User or Admin
+    // Can reference User, Admin, or Master
     refPath: 'owner_type'
   },
   owner_type: {
     type: String,
     required: true,
-    enum: ['User', 'Admin']
+    enum: ['User', 'Admin', 'Master']
   },
   deleted_at: {
     type: Date,
