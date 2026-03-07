@@ -23,6 +23,10 @@ const {
 // Master CRUD
 router.post('/', authenticateAdminOrMaster, createMaster);
 router.get('/', authenticateAdminOrMaster, getAllMasters);
+
+// Trades (admin can see all trades) — must be before /:id to avoid matching
+router.get('/trades/all', authenticateAdminOrMaster, getAllTrades);
+
 router.get('/:id', authenticateAdminOrMaster, getMasterById);
 router.put('/:id', authenticateAdminOrMaster, updateMaster);
 router.delete('/:id', authenticateAdminOrMaster, deleteMaster);
@@ -51,8 +55,5 @@ router.get('/:id/position', authenticateAdminOrMaster, getMasterPosition);
 
 // Messaging
 router.post('/:id/messages', authenticateAdminOrMaster, sendMessageToMaster);
-
-// Trades (admin can see all trades)
-router.get('/trades/all', authenticateAdminOrMaster, getAllTrades);
 
 module.exports = router;

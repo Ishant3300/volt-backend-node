@@ -37,7 +37,8 @@ const {
 const {
   getAggregatedPositions,
   getInstrumentUserBreakdown,
-  getUserMetrics
+  getUserMetrics,
+  getAdminMasterMetrics
 } = require('../controllers/masterPositionController');
 
 // All routes require admin or master authentication
@@ -136,5 +137,8 @@ router.get('/positions/user-metrics', getUserMetrics);
 
 // Get per-user breakdown for a specific instrument
 router.get('/positions/aggregated/:instrumentToken', getInstrumentUserBreakdown);
+
+// Admin: get all masters with their users' positions for live P&L
+router.get('/positions/admin-master-metrics', getAdminMasterMetrics);
 
 module.exports = router;

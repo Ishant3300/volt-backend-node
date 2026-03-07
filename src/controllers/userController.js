@@ -48,7 +48,7 @@ const getUserTrades = async (req, res) => {
     try {
         const userId = req.user.id;
         const { id } = req.params;
-        const { page = 1, limit = 50, date_from, date_to, status } = req.query;
+        const { page = 1, limit = 50, date_from, date_to, status, exchange, tradingsymbol } = req.query;
 
         // Check if the user is requesting their own trades
         if (userId !== id) {
@@ -61,6 +61,8 @@ const getUserTrades = async (req, res) => {
 
         const filter = { user_id: id };
         if (status) filter.status = status;
+        if (exchange) filter.exchange = exchange;
+        if (tradingsymbol) filter.tradingsymbol = { $regex: tradingsymbol, $options: 'i' };
 
         if (date_from || date_to) {
             filter.created_at = {};

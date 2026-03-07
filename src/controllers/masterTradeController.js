@@ -4,56 +4,72 @@ const Master = require('../models/Master');
 // Get All Trades in Hierarchy
 const getAllTrades = async (req, res) => {
   try {
-    const { master_id, user_id, page = 1, limit = 50, date_from, date_to, status } = req.query;
+    const { master_id, user_id, page = 1, limit = 50, date_from, date_to, status, exchange, tradingsymbol } = req.query;
 
-    // Get current master
-    const currentMaster = await Master.findById(req.master.id);
-
-    if (!currentMaster) {
-      return res.status(404).json({
-        success: false,
-        message: 'Master not found',
-        data: null
-      });
-    }
-
-    // Build filter - trades where master_id is current master or any of their children
     const filter = {
       deleted_at: null
     };
 
-    // If specific master_id provided, verify it's a child
-    if (master_id) {
-      const childMaster = await Master.findOne({
-        _id: master_id,
-        master_id: req.master.id,
-        deleted_at: null
-      });
+    // Admin calling with master_id: fetch trades for that master and its children
+    if (req.admin && master_id) {
+      const targetMaster = await Master.findById(master_id);
+      if (!targetMaster) {
+        return res.status(404).json({ success: false, message: 'Master not found', data: null });
+      }
+      const childMasters = await Master.find({ master_id: master_id, deleted_at: null }).select('_id');
+      const masterIds = childMasters.map(m => m._id);
+      masterIds.push(targetMaster._id);
+      filter.master_id = { $in: masterIds };
+    } else if (req.admin) {
+      // Admin without master_id: return all trades for this admin
+      filter.admin_id = req.admin.id;
+    } else {
+      // Master flow
+      const currentMaster = await Master.findById(req.master.id);
 
-      if (!childMaster) {
-        return res.status(403).json({
+      if (!currentMaster) {
+        return res.status(404).json({
           success: false,
-          message: 'You can only view trades from your child masters',
+          message: 'Master not found',
           data: null
         });
       }
 
-      filter.master_id = master_id;
-    } else {
-      // Get all child masters
-      const childMasters = await Master.find({
-        master_id: req.master.id,
-        deleted_at: null
-      }).select('_id');
+      // If specific master_id provided, verify it's a child
+      if (master_id) {
+        const childMaster = await Master.findOne({
+          _id: master_id,
+          master_id: req.master.id,
+          deleted_at: null
+        });
 
-      const childMasterIds = childMasters.map(m => m._id);
-      childMasterIds.push(currentMaster._id); // Include current master's trades
+        if (!childMaster) {
+          return res.status(403).json({
+            success: false,
+            message: 'You can only view trades from your child masters',
+            data: null
+          });
+        }
 
-      filter.master_id = { $in: childMasterIds };
+        filter.master_id = master_id;
+      } else {
+        // Get all child masters
+        const childMasters = await Master.find({
+          master_id: req.master.id,
+          deleted_at: null
+        }).select('_id');
+
+        const childMasterIds = childMasters.map(m => m._id);
+        childMasterIds.push(currentMaster._id); // Include current master's trades
+
+        filter.master_id = { $in: childMasterIds };
+      }
     }
 
     if (user_id) filter.user_id = user_id;
     if (status) filter.status = status;
+    if (exchange) filter.exchange = exchange;
+    if (tradingsymbol) filter.tradingsymbol = { $regex: tradingsymbol, $options: 'i' };
     if (date_from || date_to) {
       filter.createdAt = {};
       if (date_from) filter.createdAt.$gte = new Date(date_from);

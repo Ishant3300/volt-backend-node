@@ -721,7 +721,7 @@ const debitMaster = async (req, res) => {
 // Get All Trades
 const getAllTrades = async (req, res) => {
   try {
-    const { master_id, user_id, page = 1, limit = 50, date_from, date_to, status } = req.query;
+    const { master_id, user_id, page = 1, limit = 50, date_from, date_to, status, exchange, tradingsymbol } = req.query;
 
     const filter = {
       admin_id: req.admin.id,
@@ -731,6 +731,8 @@ const getAllTrades = async (req, res) => {
     if (master_id) filter.master_id = master_id;
     if (user_id) filter.user_id = user_id;
     if (status) filter.status = status;
+    if (exchange) filter.exchange = exchange;
+    if (tradingsymbol) filter.tradingsymbol = { $regex: tradingsymbol, $options: 'i' };
     if (date_from || date_to) {
       filter.created_at = {};
       if (date_from) filter.created_at.$gte = new Date(date_from);
@@ -763,7 +765,20 @@ const getAllTrades = async (req, res) => {
       success: true,
       message: 'Trades retrieved successfully',
       data: {
-        trades: trades.map(trade => trade.toJSON()),
+        trades: trades.map(trade => {
+          const t = trade.toJSON();
+          // Flatten populated user_id and master_id into top-level fields
+          if (t.user_id && typeof t.user_id === 'object') {
+            t.user_name = t.user_id.name || null;
+            t.user_username = t.user_id.username || null;
+            t.user_id = t.user_id.id || t.user_id._id || t.user_id;
+          }
+          if (t.master_id && typeof t.master_id === 'object') {
+            t.master_name = t.master_id.name || null;
+            t.master_id = t.master_id.id || t.master_id._id || t.master_id;
+          }
+          return t;
+        }),
         total: count,
         page: parseInt(page),
         pages: Math.ceil(count / limit),

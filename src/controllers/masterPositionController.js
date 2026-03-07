@@ -1,5 +1,6 @@
 const Trade = require('../models/Trade');
 const User = require('../models/User');
+const Master = require('../models/Master');
 const TradeMargin = require('../models/TradeMargin');
 
 /**
@@ -388,8 +389,117 @@ const getUserMetrics = async (req, res) => {
   }
 };
 
+/**
+ * Admin endpoint: returns all masters with their users' positions
+ * so the admin can see per-master live P&L.
+ */
+const getAdminMasterMetrics = async (req, res) => {
+  try {
+    // Get all active masters
+    const masters = await Master.find({ deleted_at: null })
+      .select('_id name username');
+
+    if (masters.length === 0) {
+      return res.status(200).json({ success: true, data: [] });
+    }
+
+    const masterIds = masters.map(m => m._id);
+
+    // Get all users grouped by master
+    const allUsers = await User.find({
+      master_id: { $in: masterIds },
+      deleted_at: null
+    }).select('_id name username master_id');
+
+    // Group users by master_id
+    const usersByMaster = {};
+    for (const u of allUsers) {
+      const mid = u.master_id.toString();
+      if (!usersByMaster[mid]) usersByMaster[mid] = [];
+      usersByMaster[mid].push(u);
+    }
+
+    const allUserIds = allUsers.map(u => u._id);
+
+    // Get all completed trades for all users
+    const trades = await Trade.find({
+      user_id: { $in: allUserIds },
+      status: 'completed',
+      deleted_at: null
+    }).select('user_id instrument_token tradingsymbol exchange transaction_type executed_quantity executed_price').lean();
+
+    // Group trades by user_id then instrument_token
+    const userTradeMap = {};
+    for (const t of trades) {
+      const uid = t.user_id.toString();
+      if (!userTradeMap[uid]) userTradeMap[uid] = {};
+      const iToken = t.instrument_token;
+      if (!userTradeMap[uid][iToken]) {
+        userTradeMap[uid][iToken] = {
+          exchange: t.exchange,
+          tradingsymbol: t.tradingsymbol,
+          totalBuyQty: 0, totalSellQty: 0,
+          totalBuyValue: 0, totalSellValue: 0
+        };
+      }
+      const agg = userTradeMap[uid][iToken];
+      if (t.transaction_type === 'BUY') {
+        agg.totalBuyQty += t.executed_quantity;
+        agg.totalBuyValue += t.executed_quantity * t.executed_price;
+      } else if (t.transaction_type === 'SELL') {
+        agg.totalSellQty += t.executed_quantity;
+        agg.totalSellValue += t.executed_quantity * t.executed_price;
+      }
+    }
+
+    // Build per-master result
+    const result = masters.map(master => {
+      const mid = master._id.toString();
+      const users = usersByMaster[mid] || [];
+      const positions = []; // all open positions across this master's users
+
+      for (const user of users) {
+        const uid = user._id.toString();
+        const instruments = userTradeMap[uid] || {};
+        for (const [iToken, agg] of Object.entries(instruments)) {
+          const netQty = agg.totalBuyQty - agg.totalSellQty;
+          if (netQty !== 0) {
+            positions.push({
+              instrument_token: iToken,
+              tradingsymbol: agg.tradingsymbol,
+              exchange: agg.exchange,
+              total_buy_qty: agg.totalBuyQty,
+              total_sell_qty: agg.totalSellQty,
+              total_buy_value: Math.round(agg.totalBuyValue * 100) / 100,
+              total_sell_value: Math.round(agg.totalSellValue * 100) / 100,
+              net_qty: netQty,
+              avg_buy_price: agg.totalBuyQty > 0
+                ? Math.round((agg.totalBuyValue / agg.totalBuyQty) * 100) / 100 : 0,
+              avg_sell_price: agg.totalSellQty > 0
+                ? Math.round((agg.totalSellValue / agg.totalSellQty) * 100) / 100 : 0
+            });
+          }
+        }
+      }
+
+      return {
+        master_id: mid,
+        name: master.name,
+        username: master.username,
+        user_count: users.length,
+        positions
+      };
+    });
+
+    res.status(200).json({ success: true, data: result });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message, data: null });
+  }
+};
+
 module.exports = {
   getAggregatedPositions,
   getInstrumentUserBreakdown,
-  getUserMetrics
+  getUserMetrics,
+  getAdminMasterMetrics
 };
