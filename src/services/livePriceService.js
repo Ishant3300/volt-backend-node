@@ -275,6 +275,29 @@ class LivePriceService {
 
   /**
    * Parse a single tick packet from Kite binary data
+   * Ref: https://kite.trade/docs/connect/v3/websocket/
+   *
+   * Quote packet (44 bytes):
+   *   0-3   instrument_token
+   *   4-7   last_price (/100)
+   *   8-11  last_traded_quantity
+   *  12-15  average_traded_price (/100)
+   *  16-19  volume
+   *  20-23  total_buy_quantity
+   *  24-27  total_sell_quantity
+   *  28-31  open (/100)
+   *  32-35  high (/100)
+   *  36-39  low (/100)
+   *  40-43  close (/100)
+   *
+   * Full packet (184 bytes) adds:
+   *  44-47  last_traded_timestamp
+   *  48-51  oi
+   *  52-55  oi_day_high
+   *  56-59  oi_day_low
+   *  60-63  exchange_timestamp
+   *  64-183 market depth (10 entries × 12 bytes: qty(4) + price(4) + orders(2) + pad(2))
+   *         entries 0-4 = bids, entries 5-9 = asks
    */
   _parseTick(packet) {
     try {
@@ -282,30 +305,61 @@ class LivePriceService {
 
       const instrumentToken = packet.readInt32BE(0);
 
-      // LTP mode (8 bytes)
+      // Determine divisor: currencies use 10000000, everything else 100
+      // Segment = token & 0xFF (last byte). CDS segment = 3
+      const segment = instrumentToken & 0xFF;
+      const divisor = (segment === 3) ? 10000000 : 100;
+
+      // LTP mode (8 bytes) — all instruments
       if (packet.length === 8) {
-        const lastPrice = packet.readInt32BE(4) / 100;
+        const lastPrice = packet.readInt32BE(4) / divisor;
         return {
           instrument_token: instrumentToken.toString(),
           last_price: lastPrice,
         };
       }
 
-      // Quote/Full mode (28+ bytes)
-      if (packet.length >= 28) {
-        const lastPrice = packet.readInt32BE(4) / 100;
-        const highPrice = packet.readInt32BE(8) / 100;
-        const lowPrice = packet.readInt32BE(12) / 100;
-        const openPrice = packet.readInt32BE(16) / 100;
-        const closePrice = packet.readInt32BE(20) / 100;
+      // Index packets: quote=28 bytes, full=32 bytes
+      // Structure: token(4), ltp(4), high(4), low(4), open(4), close(4), change(4), [exchange_ts(4)]
+      if (packet.length === 28 || packet.length === 32) {
+        const lastPrice = packet.readInt32BE(4) / divisor;
+        const highPrice = packet.readInt32BE(8) / divisor;
+        const lowPrice = packet.readInt32BE(12) / divisor;
+        const openPrice = packet.readInt32BE(16) / divisor;
+        const closePrice = packet.readInt32BE(20) / divisor;
+
+        const change = lastPrice - closePrice;
+        let changePercent = 0;
+        if (closePrice > 0.01) {
+          changePercent = (change / closePrice) * 100;
+          changePercent = Math.max(-100, Math.min(1000, changePercent));
+        }
+
+        return {
+          instrument_token: instrumentToken.toString(),
+          last_price: lastPrice,
+          high: highPrice,
+          low: lowPrice,
+          open: openPrice,
+          close: closePrice,
+          change,
+          change_percent: changePercent,
+        };
+      }
+
+      // Quote mode (44 bytes) or Full mode (184 bytes)
+      if (packet.length >= 44) {
+        const lastPrice = packet.readInt32BE(4) / divisor;
+        const openPrice = packet.readInt32BE(28) / divisor;
+        const highPrice = packet.readInt32BE(32) / divisor;
+        const lowPrice = packet.readInt32BE(36) / divisor;
+        const closePrice = packet.readInt32BE(40) / divisor;
 
         const change = lastPrice - closePrice;
         let changePercent = 0;
 
-        // Only calculate percentage if closePrice is valid and reasonable
         if (closePrice > 0.01) {
           changePercent = (change / closePrice) * 100;
-          // Cap percentage to reasonable values (-100% to +1000%)
           changePercent = Math.max(-100, Math.min(1000, changePercent));
         }
 
@@ -320,39 +374,24 @@ class LivePriceService {
           change_percent: changePercent,
         };
 
-        // Full mode (184 bytes) includes market depth with bid/ask
+        // Full mode (184 bytes) includes market depth starting at byte 64
         if (packet.length >= 184) {
-          // Market depth starts at offset 60
-          // Each depth entry is 12 bytes: 4 (quantity) + 4 (price) + 4 (orders)
-          // Best bid is at offset 60 (first buy entry)
-          // Best ask is at offset 120 (first sell entry, after 5 buy entries)
-          
           try {
-            // Best bid (buy) - quantity at 60, price at 64
-            const bestBidPrice = packet.readInt32BE(64) / 100;
-            // Best ask (sell) - quantity at 120, price at 124
-            const bestAskPrice = packet.readInt32BE(124) / 100;
+            // Market depth: each entry = qty(4) + price(4) + orders(2) + pad(2) = 12 bytes
+            // Best bid (first buy entry): price at offset 64 + 4 = 68
+            // Best ask (first sell entry, after 5 buy entries): price at offset 64 + (5*12) + 4 = 128
+            const bestBidPrice = packet.readInt32BE(68) / divisor;
+            const bestAskPrice = packet.readInt32BE(128) / divisor;
 
             if (bestBidPrice > 0) {
               tick.bid_price = bestBidPrice;
-              console.log(`   📊 Bid: ${bestBidPrice}`);
             }
             if (bestAskPrice > 0) {
               tick.ask_price = bestAskPrice;
-              console.log(`   📊 Ask: ${bestAskPrice}`);
-            }
-            
-            // Log if both are present
-            if (bestBidPrice > 0 && bestAskPrice > 0) {
-              const spread = bestAskPrice - bestBidPrice;
-              const spreadPercent = (spread / bestBidPrice) * 100;
-              console.log(`   💰 SPREAD: ${spread.toFixed(2)} (${spreadPercent.toFixed(3)}%)`);
             }
           } catch (err) {
             console.log(`   ⚠️  Error parsing market depth: ${err.message}`);
           }
-        } else {
-          console.log(`   ⚠️  Packet size ${packet.length} bytes - no market depth (need 184 bytes for full mode)`);
         }
 
         return tick;

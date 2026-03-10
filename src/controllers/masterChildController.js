@@ -452,7 +452,11 @@ const creditChildMaster = async (req, res) => {
     }
 
     const previousCredits = childMaster.credits;
-    childMaster.credits += amount;
+    const previousBalance = childMaster.balance;
+
+    // Balance increases; credits only rises if balance exceeds it
+    childMaster.balance += amount;
+    childMaster.credits = Math.max(childMaster.credits, childMaster.balance);
     await childMaster.save();
 
     // Create transaction record
@@ -516,16 +520,19 @@ const debitChildMaster = async (req, res) => {
       });
     }
 
-    if (childMaster.credits < amount) {
+    if (childMaster.balance < amount) {
       return res.status(400).json({
         success: false,
-        message: 'Insufficient credits',
+        message: 'Insufficient balance',
         data: null
       });
     }
 
     const previousCredits = childMaster.credits;
-    childMaster.credits -= amount;
+    const previousBalance = childMaster.balance;
+
+    // Deduct from balance only; credits stay unchanged
+    childMaster.balance -= amount;
     await childMaster.save();
 
     // Create transaction record

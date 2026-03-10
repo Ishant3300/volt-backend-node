@@ -454,9 +454,9 @@ const creditUser = async (req, res) => {
       // Master pays from balance
       master.balance -= amount;
 
-      // User receives in both balance and assigned credits
-      user.credits += amount;
+      // User receives in balance; credits only rises if balance exceeds it
       user.balance += amount;
+      user.credits = Math.max(user.credits, user.balance);
 
       await master.save({ session });
       await user.save({ session });
@@ -510,7 +510,7 @@ const creditUser = async (req, res) => {
         previous_balance: previousUserCredits,
         new_balance: user.credits,
         note: note || 'Credit from master'
-      }], { session });
+      }], { session, ordered: true });
 
       resultData = {
         user: {
@@ -580,9 +580,9 @@ const debitUser = async (req, res) => {
 
       if (!user) throw new Error('User not found');
 
-      // User pays from their assigned limit.
-      if (user.credits < amount) {
-        throw new Error('Insufficient credits on user account');
+      // User pays from their balance, not credits
+      if (user.balance < amount) {
+        throw new Error('Insufficient balance on user account');
       }
 
       const master = await Master.findById(req.master.id).session(session);
@@ -594,8 +594,8 @@ const debitUser = async (req, res) => {
       const previousMasterCredits = master.credits;
       const previousMasterBalance = master.balance;
 
-      // Deduct ONLY from user's assigned limit (credits). Balance is reset at the weekend.
-      user.credits -= amount;
+      // Deduct from user's balance only; credits stay unchanged
+      user.balance -= amount;
 
       // Add back to master's working balance (master's credits remain unaffected)
       master.balance += amount;
@@ -652,7 +652,7 @@ const debitUser = async (req, res) => {
         previous_balance: previousUserCredits,
         new_balance: user.credits,
         note: note || 'Debit to master'
-      }], { session });
+      }], { session, ordered: true });
 
       resultData = {
         user: {

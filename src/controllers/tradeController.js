@@ -7,6 +7,7 @@ const TradeMargin = require('../models/TradeMargin');
 const mongoose = require('mongoose');
 const Transaction = require('../models/Transaction');
 const orderBookService = require('../services/orderBookService');
+const { calculateMargin } = require('../services/marginService');
 
 const _getLivePricesFromKite = async (instrumentTokens) => {
     if (!instrumentTokens || instrumentTokens.length === 0) return new Map();
@@ -140,9 +141,10 @@ const placeTrade = async (req, res) => {
 
             // 3. Calculate realised P&L if this trade closes (or partially closes) a position
             let realisedPnl = 0;
+            let existingAgg = [];
             if (shouldExecuteNow) {
                 // Aggregate existing completed trades for this instrument
-                const existingAgg = await Trade.aggregate([
+                existingAgg = await Trade.aggregate([
                     {
                         $match: {
                             user_id: user._id,
@@ -224,16 +226,36 @@ const placeTrade = async (req, res) => {
 
             await newTrade.save({ session });
 
-            // Update user balance with realised P&L
-            if (shouldExecuteNow && realisedPnl !== 0) {
-                user.balance = user.balance + realisedPnl;
-                await user.save({ session });
-            }
-
-            // Log transaction if executed now
+            // Calculate margin impact and update balance
             if (shouldExecuteNow) {
-                const tradeValue = executedPrice * quantity;
+                // Determine previous net qty for this instrument
+                let prevNetQtyForMargin = 0;
+                if (existingAgg && existingAgg.length > 0) {
+                    prevNetQtyForMargin = existingAgg[0].total_buy_qty - existingAgg[0].total_sell_qty;
+                }
+                const isBuy = transaction_type === 'BUY';
+                const newNetQty = prevNetQtyForMargin + (isBuy ? quantity : -quantity);
 
+                // Margin per unit at execution price
+                const marginPerUnit = await calculateMargin(exchange, 1, executedPrice);
+
+                const prevMargin = Math.abs(prevNetQtyForMargin) * marginPerUnit;
+                const newMargin = Math.abs(newNetQty) * marginPerUnit;
+                const marginDelta = newMargin - prevMargin; // +ve = more margin needed
+
+                const balanceBefore = user.balance;
+                const balanceChange = realisedPnl - marginDelta;
+
+                // Block if insufficient balance for opening positions
+                if (marginDelta > 0 && (user.balance + balanceChange) < 0) {
+                    throw new Error(`Insufficient balance. Available: ₹${user.balance.toFixed(2)}, Required margin: ₹${marginDelta.toFixed(2)}`);
+                }
+
+                user.balance = user.balance + balanceChange;
+                await user.save({ session });
+
+                // Log transaction
+                const tradeValue = executedPrice * quantity;
                 const tx = new Transaction({
                     transactionId: `TXN_${Date.now()}_${Math.random().toString(36).substr(2, 6)}_T`,
                     userId: user._id,
@@ -243,7 +265,7 @@ const placeTrade = async (req, res) => {
                     amount: tradeValue,
                     referenceId: newTrade._id,
                     referenceModel: 'Trade',
-                    balanceBefore: user.balance - realisedPnl,
+                    balanceBefore,
                     balanceAfter: user.balance,
                     metadata: {
                         tradingsymbol,
@@ -251,10 +273,11 @@ const placeTrade = async (req, res) => {
                         executedPrice,
                         order_type,
                         realisedPnl,
+                        marginDelta,
+                        balanceChange,
                         positionClosed: realisedPnl !== 0
                     }
                 });
-
                 await tx.save({ session });
             }
 
@@ -307,6 +330,7 @@ const placeTrade = async (req, res) => {
         let statusCode = 500;
         if (error.message === 'User not found') statusCode = 404;
         else if (error.message.includes('Option selling is not allowed') || error.message.includes('would create a short position')) statusCode = 403;
+        else if (error.message.includes('Insufficient balance')) statusCode = 400;
         else if (error.message.includes('Could not fetch') || error.message.includes('Invalid')) statusCode = 400;
 
         res.status(statusCode).json({

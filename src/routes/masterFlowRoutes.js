@@ -1,6 +1,9 @@
 const express = require('express');
 const router = express.Router();
 const { authenticateAdminOrMaster } = require('../middlewares/auth');
+const User = require('../models/User');
+const Master = require('../models/Master');
+const LoginHistory = require('../models/LoginHistory');
 
 // Import controllers
 const {
@@ -35,11 +38,18 @@ const {
 } = require('../controllers/masterTradeController');
 
 const {
+  getTransactionHistory
+} = require('../controllers/transactionController');
+
+const {
   getAggregatedPositions,
   getInstrumentUserBreakdown,
   getUserMetrics,
   getAdminMasterMetrics
 } = require('../controllers/masterPositionController');
+
+const { getPnlSummary } = require('../controllers/pnlSummaryController');
+const { getWeeklyAdminReport } = require('../controllers/weeklyAdminController');
 
 // All routes require admin or master authentication
 router.use(authenticateAdminOrMaster);
@@ -126,6 +136,11 @@ router.delete('/users/:id', deleteUser);
 router.get('/trades', getAllTrades);
 
 // ============================================
+// Transaction History Routes
+// ============================================
+router.get('/transactions', getTransactionHistory);
+
+// ============================================
 // Master Position Aggregation Routes
 // ============================================
 
@@ -140,5 +155,65 @@ router.get('/positions/aggregated/:instrumentToken', getInstrumentUserBreakdown)
 
 // Admin: get all masters with their users' positions for live P&L
 router.get('/positions/admin-master-metrics', getAdminMasterMetrics);
+
+// P&L summary: Master sees per-user, Admin sees per-master
+router.get('/pnl-summary', getPnlSummary);
+
+// Weekly admin report: Master sees per-user, Admin sees per-master
+router.get('/weekly-admin-report', getWeeklyAdminReport);
+
+// ============================================
+// Login History Route
+// ============================================
+router.get('/login-history', async (req, res) => {
+  try {
+    const { search, page = 1, limit = 50 } = req.query;
+    const skip = (parseInt(page) - 1) * parseInt(limit);
+
+    const role = req.admin ? 'admin' : 'master';
+    const callerId = req.admin ? req.admin.id : req.master.id;
+
+    // Build filter: admin sees all, master sees own children + self
+    const filter = {};
+    if (role === 'master') {
+      // Get child user IDs and child master IDs
+      const childUserIds = await User.find({ master_id: callerId, deleted_at: null }).distinct('_id');
+      const childMasterIds = await Master.find({ parent_master_id: callerId, deleted_at: null }).distinct('_id');
+      const mongoose = require('mongoose');
+      const selfId = new mongoose.Types.ObjectId(callerId);
+      filter.userId = { $in: [selfId, ...childUserIds, ...childMasterIds] };
+    }
+
+    if (search) {
+      filter.$or = [
+        { username: { $regex: search, $options: 'i' } },
+        { name: { $regex: search, $options: 'i' } },
+      ];
+    }
+
+    const [entries, total] = await Promise.all([
+      LoginHistory.find(filter)
+        .sort({ createdAt: -1 })
+        .skip(skip)
+        .limit(parseInt(limit))
+        .lean(),
+      LoginHistory.countDocuments(filter)
+    ]);
+
+    // Map to consistent shape
+    const data = entries.map(e => ({
+      _id: e._id,
+      username: e.username,
+      name: e.name,
+      role: e.userModel?.toUpperCase() || 'USER',
+      ip_address: e.ip_address,
+      logged_in_at: e.createdAt,
+    }));
+
+    res.status(200).json({ success: true, data, total, page: parseInt(page), limit: parseInt(limit) });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
 
 module.exports = router;

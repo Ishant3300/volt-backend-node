@@ -1,9 +1,11 @@
 const Trade = require('../models/Trade');
 const Transaction = require('../models/Transaction');
 const User = require('../models/User');
+const mongoose = require('mongoose');
 const kiteService = require('./kiteService');
 const orderBookService = require('./orderBookService');
 const redisService = require('./redisService');
+const { calculateMargin } = require('./marginService');
 
 /**
  * Fetches live prices from Kite for a list of instrument tokens.
@@ -69,9 +71,12 @@ const processPendingOrders = async () => {
             }
 
             if (shouldExecute) {
+                const session = await mongoose.startSession();
+                try {
+                    await session.withTransaction(async () => {
                 // Idempotency: re-check status before executing
-                const freshTrade = await Trade.findById(trade._id);
-                if (!freshTrade || freshTrade.status !== 'pending') continue;
+                const freshTrade = await Trade.findById(trade._id).session(session);
+                if (!freshTrade || freshTrade.status !== 'pending') return;
 
                 // Calculate realised P&L if this trade closes a position
                 let realisedPnl = 0;
@@ -113,7 +118,7 @@ const processPendingOrders = async () => {
                             }
                         }
                     }
-                ]);
+                ]).session(session);
 
                 if (existingAgg.length > 0) {
                     const agg = existingAgg[0];
@@ -137,61 +142,92 @@ const processPendingOrders = async () => {
                 freshTrade.executed_quantity = freshTrade.quantity;
                 freshTrade.pnl = realisedPnl;
                 freshTrade.net_amount = realisedPnl;
-                await freshTrade.save();
+                await freshTrade.save({ session });
 
-                // Update user balance with realised P&L
-                if (realisedPnl !== 0) {
-                    await User.findByIdAndUpdate(freshTrade.user_id, { $inc: { balance: realisedPnl } });
+                // Calculate margin impact and update balance
+                let prevNetQtyForMargin = 0;
+                if (existingAgg.length > 0) {
+                    prevNetQtyForMargin = existingAgg[0].total_buy_qty - existingAgg[0].total_sell_qty;
                 }
+                const isBuy = freshTrade.transaction_type === 'BUY';
+                const newNetQty = prevNetQtyForMargin + (isBuy ? freshTrade.quantity : -freshTrade.quantity);
+                const marginPerUnit = await calculateMargin(freshTrade.exchange, 1, freshTrade.price);
+                const prevMargin = Math.abs(prevNetQtyForMargin) * marginPerUnit;
+                const newMargin = Math.abs(newNetQty) * marginPerUnit;
+                const marginDelta = newMargin - prevMargin;
+                const balanceChange = realisedPnl - marginDelta;
 
-                // Log a transaction for this execution
-                try {
-                    const user = await User.findById(freshTrade.user_id);
-                    const tradeValue = freshTrade.price * freshTrade.quantity;
+                const user = await User.findById(freshTrade.user_id).session(session);
+                if (user) {
+                    // Skip trade if insufficient balance for opening positions
+                    if (marginDelta > 0 && (user.balance + balanceChange) < 0) {
+                        // Revert trade status
+                        freshTrade.status = 'rejected';
+                        freshTrade.pnl = 0;
+                        freshTrade.net_amount = 0;
+                        await freshTrade.save({ session });
+                        console.log(`⚠️ [OrderExecution] Rejected ${freshTrade.tradingsymbol} - insufficient balance (need ₹${marginDelta.toFixed(2)}, have ₹${user.balance.toFixed(2)})`);
+                        return;
+                    }
 
-                    const tx = new Transaction({
-                        transactionId: `TXN_${Date.now()}_${Math.random().toString(36).substr(2, 6)}_LE`,
-                        userId: freshTrade.user_id,
-                        userModel: 'User',
-                        type: freshTrade.transaction_type,
-                        status: 'SUCCESS',
-                        amount: tradeValue,
-                        referenceId: freshTrade._id,
-                        referenceModel: 'Trade',
-                        balanceBefore: user ? (user.balance - realisedPnl) : 0,
-                        balanceAfter: user ? user.balance : 0,
-                        metadata: {
-                            tradingsymbol: freshTrade.tradingsymbol,
-                            quantity: freshTrade.quantity,
-                            executedPrice: freshTrade.price,
-                            order_type: freshTrade.order_type,
-                            realisedPnl,
-                            positionClosed: realisedPnl !== 0,
-                            executedBy: 'db_fallback_engine'
-                        }
-                    });
+                    const balanceBefore = user.balance;
+                    user.balance += balanceChange;
+                    await user.save({ session });
 
-                    await tx.save();
-                } catch (txErr) {
-                    console.error(`[OrderExecution] Error logging transaction for trade ${freshTrade._id}:`, txErr.message);
+                    // Log transaction
+                    try {
+                        const tradeValue = freshTrade.price * freshTrade.quantity;
+                        const tx = new Transaction({
+                            transactionId: `TXN_${Date.now()}_${Math.random().toString(36).substr(2, 6)}_LE`,
+                            userId: freshTrade.user_id,
+                            userModel: 'User',
+                            type: freshTrade.transaction_type,
+                            status: 'SUCCESS',
+                            amount: tradeValue,
+                            referenceId: freshTrade._id,
+                            referenceModel: 'Trade',
+                            balanceBefore,
+                            balanceAfter: user.balance,
+                            metadata: {
+                                tradingsymbol: freshTrade.tradingsymbol,
+                                quantity: freshTrade.quantity,
+                                executedPrice: freshTrade.price,
+                                order_type: freshTrade.order_type,
+                                realisedPnl,
+                                marginDelta,
+                                balanceChange,
+                                positionClosed: realisedPnl !== 0,
+                                executedBy: 'db_fallback_engine'
+                            }
+                        });
+                        await tx.save({ session });
+                    } catch (txErr) {
+                        console.error(`[OrderExecution] Error logging transaction for trade ${freshTrade._id}:`, txErr.message);
+                    }
                 }
+                    }); // end session.withTransaction
+                    session.endSession();
 
                 executedCount++;
-                console.log(`✅ [OrderExecution/Fallback] Executed ${freshTrade.transaction_type} LIMIT for ${freshTrade.tradingsymbol} @ ${freshTrade.price} (live: ${livePrice})`);
+                console.log(`✅ [OrderExecution/Fallback] Executed ${trade.transaction_type} LIMIT for ${trade.tradingsymbol} @ ${trade.price} (live: ${livePrice})`);
 
                 // Notify the user's Flutter client via WebSocket
                 const livePriceService = require('./livePriceService');
-                livePriceService.broadcastToUser(freshTrade.user_id.toString(), {
+                livePriceService.broadcastToUser(trade.user_id.toString(), {
                     type: 'trade_executed',
-                    trade_id: freshTrade._id.toString(),
-                    instrument_token: freshTrade.instrument_token,
-                    tradingsymbol: freshTrade.tradingsymbol,
-                    transaction_type: freshTrade.transaction_type,
-                    quantity: freshTrade.quantity,
-                    executed_price: freshTrade.price,
-                    pnl: realisedPnl,
+                    trade_id: trade._id.toString(),
+                    instrument_token: trade.instrument_token,
+                    tradingsymbol: trade.tradingsymbol,
+                    transaction_type: trade.transaction_type,
+                    quantity: trade.quantity,
+                    executed_price: trade.price,
+                    pnl: trade.pnl || 0,
                     status: 'completed',
                 });
+                } catch (sessionErr) {
+                    session.endSession();
+                    console.error(`❌ [OrderExecution] Session error for trade ${trade._id}:`, sessionErr.message);
+                }
             }
         }
 

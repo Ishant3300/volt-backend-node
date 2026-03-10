@@ -3,6 +3,7 @@ const User = require('../models/User');
 const Master = require('../models/Master');
 const orderExecutionService = require('./orderExecutionService');
 const redisService = require('./redisService');
+const { snapshotWeeklySummary } = require('./weeklySummaryService');
 
 class CronService {
     constructor() {
@@ -14,6 +15,18 @@ class CronService {
      */
     init() {
         console.log('🕒 Initializing Cron Scheduler...');
+
+        // Snapshot weekly P&L every Sunday at 23:55 (before midnight balance reset)
+        const weeklySummarySnapshot = cron.schedule('55 23 * * 0', async () => {
+            console.log('📊 [CRON] Starting Weekly Summary Snapshot...');
+            try {
+                await snapshotWeeklySummary();
+                console.log('✅ [CRON] Weekly Summary Snapshot completed.');
+            } catch (error) {
+                console.error('❌ [CRON] Error during Weekly Summary Snapshot:', error);
+            }
+        });
+        this.jobs.push(weeklySummarySnapshot);
 
         // Schedule Weekly Balance Reset at Sunday 00:00 AM
         const weeklyBalanceReset = cron.schedule('0 0 * * 0', async () => {

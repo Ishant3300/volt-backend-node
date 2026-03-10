@@ -543,8 +543,9 @@ const creditMaster = async (req, res) => {
       const previousCredits = master.credits;
       const previousBalance = master.balance;
 
-      master.credits += amount;
-      master.balance += amount; // Also update balance as per new logic
+      // Balance increases; credits only rises if balance exceeds it
+      master.balance += amount;
+      master.credits = Math.max(master.credits, master.balance);
 
       await master.save({ session });
 
@@ -577,7 +578,7 @@ const creditMaster = async (req, res) => {
         previous_balance: previousCredits,
         new_balance: master.credits,
         note: note || ''
-      }], { session });
+      }], { session, ordered: true });
 
       resultData = {
         id: master._id,
@@ -640,15 +641,15 @@ const debitMaster = async (req, res) => {
         throw new Error('Master not found');
       }
 
-      if (master.credits < amount) {
-        throw new Error('Insufficient credits');
+      if (master.balance < amount) {
+        throw new Error('Insufficient balance');
       }
 
       const previousCredits = master.credits;
       const previousBalance = master.balance;
 
-      master.credits -= amount;
-      // Balance is deliberately excluded here per user logic. Balance resets at weekend.
+      // Deduct from balance only; credits stay unchanged
+      master.balance -= amount;
 
       await master.save({ session });
 
@@ -681,7 +682,7 @@ const debitMaster = async (req, res) => {
         previous_balance: previousCredits,
         new_balance: master.credits,
         note: note || ''
-      }], { session });
+      }], { session, ordered: true });
 
       resultData = {
         id: master._id,

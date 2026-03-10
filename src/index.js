@@ -37,6 +37,7 @@ const tradeRoutes = require('./routes/tradeRoutes');
 require('./models/Trade');
 require('./models/CreditTransaction');
 require('./models/Transaction');
+require('./models/LoginHistory');
 
 // Routes
 app.get('/', (req, res) => {
@@ -57,6 +58,44 @@ app.use('/api/master', masterFlowRoutes); // Master Flow routes
 app.use('/api/master/messages', messageRoutes);
 app.use('/api/servers', serverRoutes); // Server routes
 app.use('/api/trade', tradeRoutes); // Trade & Metrics routes
+
+// Self login history (accessible by all roles)
+const { authenticateAny } = require('./middlewares/auth');
+const LoginHistory = require('./models/LoginHistory');
+const { getAccountSummary } = require('./controllers/accountSummaryController');
+
+app.get('/api/my/login-history', authenticateAny, async (req, res) => {
+  try {
+    const callerId = req.user?.id || req.admin?.id || req.master?.id;
+    const { page = 1, limit = 50 } = req.query;
+    const skip = (parseInt(page) - 1) * parseInt(limit);
+
+    const [entries, total] = await Promise.all([
+      LoginHistory.find({ userId: callerId })
+        .sort({ createdAt: -1 })
+        .skip(skip)
+        .limit(parseInt(limit))
+        .lean(),
+      LoginHistory.countDocuments({ userId: callerId })
+    ]);
+
+    const data = entries.map(e => ({
+      _id: e._id,
+      username: e.username,
+      name: e.name,
+      role: e.userModel?.toUpperCase() || 'USER',
+      ip_address: e.ip_address,
+      logged_in_at: e.createdAt,
+    }));
+
+    res.status(200).json({ success: true, data, total });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+// Account summary (accessible by all roles)
+app.get('/api/account-summary', authenticateAny, getAccountSummary);
 
 // Start server
 const PORT = process.env.PORT || 5000;

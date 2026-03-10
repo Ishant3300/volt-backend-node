@@ -17,6 +17,7 @@
 const { Queue, Worker } = require('bullmq');
 const redisService = require('./redisService');
 const orderBookService = require('./orderBookService');
+const { calculateMargin } = require('./marginService');
 
 const QUEUE_NAME = 'price-updates';
 
@@ -171,40 +172,67 @@ const _processJob = async (job) => {
       trade.net_amount = realisedPnl;
       await trade.save();
 
-      // Update user balance with realised P&L
-      if (realisedPnl !== 0) {
-        await User.findByIdAndUpdate(trade.user_id, { $inc: { balance: realisedPnl } });
+      // Calculate margin impact and update balance
+      let prevNetQtyForMargin = 0;
+      if (existingAgg.length > 0) {
+        prevNetQtyForMargin = existingAgg[0].total_buy_qty - existingAgg[0].total_sell_qty;
       }
+      const isBuy = trade.transaction_type === 'BUY';
+      const newNetQty = prevNetQtyForMargin + (isBuy ? trade.quantity : -trade.quantity);
+      const marginPerUnit = await calculateMargin(trade.exchange, 1, trade.price);
+      const prevMargin = Math.abs(prevNetQtyForMargin) * marginPerUnit;
+      const newMargin = Math.abs(newNetQty) * marginPerUnit;
+      const marginDelta = newMargin - prevMargin;
+      const balanceChange = realisedPnl - marginDelta;
 
-      // Log transaction
-      try {
-        const user = await User.findById(trade.user_id);
-        const tradeValue = trade.price * trade.quantity;
+      const user = await User.findById(trade.user_id);
+      if (user) {
+        // Reject if insufficient balance for opening positions
+        if (marginDelta > 0 && (user.balance + balanceChange) < 0) {
+          trade.status = 'rejected';
+          trade.pnl = 0;
+          trade.net_amount = 0;
+          await trade.save();
+          console.log(`⚠️ [PriceQueue] Rejected ${trade.tradingsymbol} - insufficient balance (need ₹${marginDelta.toFixed(2)}, have ₹${user.balance.toFixed(2)})`);
+          if (match.side === 'BUY') executedBuys.push(match.id);
+          else executedSells.push(match.id);
+          continue;
+        }
 
-        await new Transaction({
-          transactionId: `TXN_${Date.now()}_${Math.random().toString(36).substr(2, 6)}_RQ`,
-          userId: trade.user_id,
-          userModel: 'User',
-          type: trade.transaction_type,
-          status: 'SUCCESS',
-          amount: tradeValue,
-          referenceId: trade._id,
-          referenceModel: 'Trade',
-          balanceBefore: user ? (user.balance - realisedPnl) : 0,
-          balanceAfter: user ? user.balance : 0,
-          metadata: {
-            tradingsymbol: trade.tradingsymbol,
-            quantity: trade.quantity,
-            executedPrice: trade.price,
-            livePrice: live_price,
-            realisedPnl,
-            positionClosed: realisedPnl !== 0,
-            order_type: trade.order_type,
-            executedBy: 'redis_queue_engine',
-          },
-        }).save();
-      } catch (txErr) {
-        console.error(`❌ [PriceQueue] Transaction log error for ${match.id}: ${txErr.message}`);
+        const balanceBefore = user.balance;
+        user.balance += balanceChange;
+        await user.save();
+
+        // Log transaction
+        try {
+          const tradeValue = trade.price * trade.quantity;
+          await new Transaction({
+            transactionId: `TXN_${Date.now()}_${Math.random().toString(36).substr(2, 6)}_RQ`,
+            userId: trade.user_id,
+            userModel: 'User',
+            type: trade.transaction_type,
+            status: 'SUCCESS',
+            amount: tradeValue,
+            referenceId: trade._id,
+            referenceModel: 'Trade',
+            balanceBefore,
+            balanceAfter: user.balance,
+            metadata: {
+              tradingsymbol: trade.tradingsymbol,
+              quantity: trade.quantity,
+              executedPrice: trade.price,
+              livePrice: live_price,
+              realisedPnl,
+              marginDelta,
+              balanceChange,
+              positionClosed: realisedPnl !== 0,
+              order_type: trade.order_type,
+              executedBy: 'redis_queue_engine',
+            },
+          }).save();
+        } catch (txErr) {
+          console.error(`❌ [PriceQueue] Transaction log error for ${match.id}: ${txErr.message}`);
+        }
       }
 
       // Track for bulk Redis removal
