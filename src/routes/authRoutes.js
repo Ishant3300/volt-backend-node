@@ -1,7 +1,8 @@
 const express = require('express');
 const router = express.Router();
-const { userLogin, adminLogin, masterLogin, userLogout, adminLogout, masterLogout, universalLogin } = require('../controllers/authController');
+const { userLogin, adminLogin, masterLogin, userLogout, adminLogout, masterLogout, universalLogin, changePassword, getNotificationSettings, updateNotificationSettings, registerFcmToken, removeFcmToken } = require('../controllers/authController');
 const { authenticateUser, authenticateAdmin, authenticateMaster } = require('../middlewares/auth');
+const { authenticateAny } = require('../middlewares/auth');
 
 // User login
 router.post('/user/login', userLogin);
@@ -23,5 +24,16 @@ router.post('/master/logout', authenticateMaster, masterLogout);
 
 // Universal login
 router.post('/login', universalLogin);
+
+// Change password (any role)
+router.post('/change-password', authenticateAny, changePassword);
+
+// Notification settings (any role)
+router.get('/notification-settings', authenticateAny, getNotificationSettings);
+router.put('/notification-settings', authenticateAny, updateNotificationSettings);
+
+// FCM token management (any role)
+router.post('/fcm-token', authenticateAny, registerFcmToken);
+router.delete('/fcm-token', authenticateAny, removeFcmToken);
 
 module.exports = router;

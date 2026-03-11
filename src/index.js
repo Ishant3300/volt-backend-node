@@ -9,6 +9,7 @@ const cronService = require('./services/cronService');
 const redisService = require('./services/redisService');
 const orderBookService = require('./services/orderBookService');
 const priceQueueService = require('./services/priceQueueService');
+const firebaseService = require('./services/firebaseService');
 
 const app = express();
 const server = http.createServer(app);
@@ -20,6 +21,9 @@ app.use(express.urlencoded({ extended: true }));
 
 // Connect to database
 connectDatabase();
+
+// Initialize Firebase Admin SDK
+firebaseService.init();
 
 // Import routes
 const authRoutes = require('./routes/authRoutes');

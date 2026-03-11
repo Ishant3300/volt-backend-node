@@ -422,6 +422,153 @@ const universalLogin = async (req, res) => {
   }
 };
 
+// Change password for any role (user/admin/master)
+const changePassword = async (req, res) => {
+  try {
+    const { current_password, new_password } = req.body;
+    if (!current_password || !new_password) {
+      return res.status(400).json({ success: false, message: 'Current and new password are required' });
+    }
+    if (new_password.length < 6) {
+      return res.status(400).json({ success: false, message: 'New password must be at least 6 characters' });
+    }
+
+    let account, Model;
+    if (req.admin) {
+      Model = Admin;
+      account = await Admin.findById(req.admin.id);
+    } else if (req.master) {
+      Model = Master;
+      account = await Master.findById(req.master.id);
+    } else if (req.user) {
+      Model = User;
+      account = await User.findById(req.user.id);
+    }
+
+    if (!account) {
+      return res.status(404).json({ success: false, message: 'Account not found' });
+    }
+
+    const isMatch = await bcrypt.compare(current_password, account.password);
+    if (!isMatch) {
+      return res.status(400).json({ success: false, message: 'Current password is incorrect' });
+    }
+
+    account.password = await bcrypt.hash(new_password, 10);
+    await account.save();
+
+    return res.status(200).json({ success: true, message: 'Password changed successfully' });
+  } catch (error) {
+    console.error('❌ Change password error:', error);
+    return res.status(500).json({ success: false, message: 'Server error' });
+  }
+};
+
+// Get notification settings
+const getNotificationSettings = async (req, res) => {
+  try {
+    let account;
+    if (req.admin) account = await Admin.findById(req.admin.id);
+    else if (req.master) account = await Master.findById(req.master.id);
+    else if (req.user) account = await User.findById(req.user.id);
+
+    if (!account) return res.status(404).json({ success: false, message: 'Account not found' });
+
+    const defaults = { market_order: false, pending_order: true, admin_order_execution: false, admin_order_deletion: true, trading_sound: false };
+    const settings = account.notification_settings || defaults;
+
+    return res.status(200).json({ success: true, data: { notification_settings: settings } });
+  } catch (error) {
+    console.error('❌ Get notification settings error:', error);
+    return res.status(500).json({ success: false, message: 'Server error' });
+  }
+};
+
+// Update notification settings
+const updateNotificationSettings = async (req, res) => {
+  try {
+    const { notification_settings } = req.body;
+    if (!notification_settings || typeof notification_settings !== 'object') {
+      return res.status(400).json({ success: false, message: 'notification_settings object is required' });
+    }
+
+    let account;
+    if (req.admin) account = await Admin.findById(req.admin.id);
+    else if (req.master) account = await Master.findById(req.master.id);
+    else if (req.user) account = await User.findById(req.user.id);
+
+    if (!account) return res.status(404).json({ success: false, message: 'Account not found' });
+
+    const allowed = ['market_order', 'pending_order', 'admin_order_execution', 'admin_order_deletion', 'trading_sound'];
+    for (const key of allowed) {
+      if (notification_settings[key] !== undefined) {
+        account.notification_settings[key] = !!notification_settings[key];
+      }
+    }
+    account.markModified('notification_settings');
+    await account.save();
+
+    return res.status(200).json({ success: true, message: 'Notification settings updated', data: { notification_settings: account.notification_settings } });
+  } catch (error) {
+    console.error('❌ Update notification settings error:', error);
+    return res.status(500).json({ success: false, message: 'Server error' });
+  }
+};
+
+// Register FCM token for push notifications
+const registerFcmToken = async (req, res) => {
+  try {
+    const { fcm_token } = req.body;
+    if (!fcm_token) {
+      return res.status(400).json({ success: false, message: 'fcm_token is required' });
+    }
+
+    let account;
+    if (req.admin) account = await Admin.findById(req.admin.id);
+    else if (req.master) account = await Master.findById(req.master.id);
+    else if (req.user) account = await User.findById(req.user.id);
+
+    if (!account) return res.status(404).json({ success: false, message: 'Account not found' });
+
+    // Add token if not already present
+    if (!account.fcm_tokens) account.fcm_tokens = [];
+    if (!account.fcm_tokens.includes(fcm_token)) {
+      account.fcm_tokens.push(fcm_token);
+      await account.save();
+    }
+
+    return res.status(200).json({ success: true, message: 'FCM token registered' });
+  } catch (error) {
+    console.error('❌ Register FCM token error:', error);
+    return res.status(500).json({ success: false, message: 'Server error' });
+  }
+};
+
+// Remove FCM token (on logout or token refresh)
+const removeFcmToken = async (req, res) => {
+  try {
+    const { fcm_token } = req.body;
+    if (!fcm_token) {
+      return res.status(400).json({ success: false, message: 'fcm_token is required' });
+    }
+
+    let account;
+    if (req.admin) account = await Admin.findById(req.admin.id);
+    else if (req.master) account = await Master.findById(req.master.id);
+    else if (req.user) account = await User.findById(req.user.id);
+
+    if (!account) return res.status(404).json({ success: false, message: 'Account not found' });
+
+    account.fcm_tokens = (account.fcm_tokens || []).filter(t => t !== fcm_token);
+    await account.save();
+
+    return res.status(200).json({ success: true, message: 'FCM token removed' });
+  } catch (error) {
+    console.error('❌ Remove FCM token error:', error);
+    return res.status(500).json({ success: false, message: 'Server error' });
+  }
+};
+
 module.exports = {
   userLogin,
   adminLogin,
@@ -429,5 +576,10 @@ module.exports = {
   userLogout,
   adminLogout,
   masterLogout,
-  universalLogin
+  universalLogin,
+  changePassword,
+  getNotificationSettings,
+  updateNotificationSettings,
+  registerFcmToken,
+  removeFcmToken
 };

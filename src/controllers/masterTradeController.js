@@ -21,8 +21,7 @@ const getAllTrades = async (req, res) => {
       masterIds.push(targetMaster._id);
       filter.master_id = { $in: masterIds };
     } else if (req.admin) {
-      // Admin without master_id: return all trades for this admin
-      filter.admin_id = req.admin.id;
+      // Admin without master_id: return all trades (no filter needed)
     } else {
       // Master flow
       const currentMaster = await Master.findById(req.master.id);

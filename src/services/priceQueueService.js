@@ -18,6 +18,7 @@ const { Queue, Worker } = require('bullmq');
 const redisService = require('./redisService');
 const orderBookService = require('./orderBookService');
 const { calculateMargin } = require('./marginService');
+const firebaseService = require('./firebaseService');
 
 const QUEUE_NAME = 'price-updates';
 
@@ -253,6 +254,13 @@ const _processJob = async (job) => {
         executed_price: trade.price,
         pnl: realisedPnl,
         status: 'completed',
+      });
+
+      // FCM push notification for pending order execution
+      firebaseService.sendNotification(trade.user_id.toString(), 'pending_order', {
+        title: 'Limit Order Executed',
+        body: `${trade.transaction_type} ${trade.quantity} ${trade.tradingsymbol} @ ₹${trade.price}`,
+        data: { trade_id: trade._id.toString(), tradingsymbol: trade.tradingsymbol },
       });
     } catch (execErr) {
       console.error(`❌ [PriceQueue] Execution error for trade ${match.id}: ${execErr.message}`);

@@ -9,14 +9,17 @@ const priceQueueService = require('./priceQueueService');
 
 class LivePriceService {
   constructor() {
-    this.wss = null;           // WebSocket server for Flutter clients
-    this.kiteTicker = null;    // Kite WebSocket connection
-    this.subscribedTokens = new Set();
-    this.clients = new Set();
-    this.latestPrices = new Map();
-    this.reconnectTimer = null;
-    this.isKiteConnected = false;
-  }
+      this.wss = null;           // WebSocket server for Flutter clients
+      this.kiteTicker = null;    // Kite WebSocket connection
+      this.subscribedTokens = new Set();
+      this.clients = new Set();
+      this.latestPrices = new Map();
+      this.reconnectTimer = null;
+      this.isKiteConnected = false;
+      this.autoLoginAttempted = false;
+      this._consecutiveFails = 0;
+      this._lastErrorWas403 = false;
+    }
 
   /**
    * Initialize WebSocket server on the HTTP server
@@ -107,77 +110,111 @@ class LivePriceService {
    * Connect to Kite WebSocket for live market data
    */
   async _connectToKite() {
-    try {
-      const accessToken = await kiteService.getStoredAccessToken();
-      if (!accessToken) {
-        console.log('⚠️  No Kite access token available for WebSocket');
+      try {
+        const accessToken = await kiteService.getStoredAccessToken();
+        if (!accessToken) {
+          console.log('⚠️  No Kite access token available for WebSocket');
 
-        // Try auto-login once
-        if (!this.autoLoginAttempted) {
-          this.autoLoginAttempted = true;
-          console.log('🤖 Attempting auto-login...');
+          // Try auto-login once
+          if (!this.autoLoginAttempted) {
+            this.autoLoginAttempted = true;
+            console.log('🤖 Attempting auto-login...');
 
-          const kiteAuthService = require('./kiteAuthService');
-          const loginResult = await kiteAuthService.performAutomatedLogin();
+            const kiteAuthService = require('./kiteAuthService');
+            const loginResult = await kiteAuthService.performAutomatedLogin();
 
-          if (loginResult.success) {
-            console.log('✅ Auto-login successful, connecting to WebSocket...');
-            // Retry connection immediately
-            return this._connectToKite();
-          } else {
-            console.log('❌ Auto-login failed:', loginResult.error);
+            if (loginResult.success) {
+              console.log('✅ Auto-login successful, connecting to WebSocket...');
+              return this._connectToKite();
+            } else {
+              console.log('❌ Auto-login failed:', loginResult.error);
+            }
           }
+
+          console.log('   Will retry in 30 seconds...');
+          this.reconnectTimer = setTimeout(() => this._connectToKite(), 30000);
+          return;
         }
 
-        console.log('   Will retry in 30 seconds...');
-        this.reconnectTimer = setTimeout(() => this._connectToKite(), 30000);
-        return;
+        const apiKey = process.env.KITE_API_KEY;
+        const wsUrl = `wss://ws.kite.trade?api_key=${apiKey}&access_token=${accessToken}`;
+
+        console.log('🔌 Connecting to Kite WebSocket...');
+
+        this.kiteTicker = new WebSocket(wsUrl);
+
+        this.kiteTicker.on('open', () => {
+          console.log('✅ Connected to Kite WebSocket');
+          this.isKiteConnected = true;
+          this.autoLoginAttempted = false; // Reset for next disconnect
+          this._consecutiveFails = 0;
+          this._broadcastToClients({
+            type: 'kite_status',
+            connected: true,
+          });
+          this._updateKiteSubscription();
+        });
+
+        this.kiteTicker.on('message', (data) => {
+          this._processKiteTick(data);
+        });
+
+        this.kiteTicker.on('close', (code, reason) => {
+          console.log(`⚠️  Kite WebSocket closed: ${code} - ${reason}`);
+          this.isKiteConnected = false;
+          this._broadcastToClients({
+            type: 'kite_status',
+            connected: false,
+          });
+
+          // Track consecutive failures
+          this._consecutiveFails = (this._consecutiveFails || 0) + 1;
+
+          // 1006 with a prior 403 error means token is rejected by Kite
+          // Try auto-login to get a fresh token before reconnecting
+          if (this._lastErrorWas403 && !this.autoLoginAttempted) {
+            this._lastErrorWas403 = false;
+            this.autoLoginAttempted = true;
+            console.log('🔑 403 detected — attempting auto-login for fresh token...');
+            const kiteAuthService = require('./kiteAuthService');
+            kiteAuthService.performAutomatedLogin().then(result => {
+              if (result.success) {
+                console.log('✅ Auto-login successful, reconnecting WebSocket...');
+                this.autoLoginAttempted = false;
+                this._consecutiveFails = 0;
+                this._connectToKite();
+              } else {
+                console.log('❌ Auto-login failed:', result.error);
+                console.log('   Will retry in 60 seconds...');
+                this.reconnectTimer = setTimeout(() => {
+                  this.autoLoginAttempted = false;
+                  this._connectToKite();
+                }, 60000);
+              }
+            });
+            return;
+          }
+
+          // Back off on repeated failures: 5s, 10s, 20s, 30s max
+          const delay = Math.min(5000 * Math.pow(2, this._consecutiveFails - 1), 30000);
+          console.log(`   Reconnecting in ${delay / 1000}s... (attempt ${this._consecutiveFails})`);
+          this.reconnectTimer = setTimeout(() => this._connectToKite(), delay);
+        });
+
+        this.kiteTicker.on('error', (err) => {
+          console.log('❌ Kite WebSocket error:', err.message);
+          this.isKiteConnected = false;
+          // Flag if this was a 403 so the close handler can act on it
+          if (err.message && err.message.includes('403')) {
+            this._lastErrorWas403 = true;
+          }
+        });
+
+      } catch (error) {
+        console.error('❌ Error connecting to Kite WebSocket:', error.message);
+        this.reconnectTimer = setTimeout(() => this._connectToKite(), 10000);
       }
-
-      const apiKey = process.env.KITE_API_KEY;
-      const wsUrl = `wss://ws.kite.trade?api_key=${apiKey}&access_token=${accessToken}`;
-
-      console.log('🔌 Connecting to Kite WebSocket...');
-
-      this.kiteTicker = new WebSocket(wsUrl);
-
-      this.kiteTicker.on('open', () => {
-        console.log('✅ Connected to Kite WebSocket');
-        this.isKiteConnected = true;
-        this.autoLoginAttempted = false; // Reset for next disconnect
-        this._broadcastToClients({
-          type: 'kite_status',
-          connected: true,
-        });
-        this._updateKiteSubscription();
-      });
-
-      this.kiteTicker.on('message', (data) => {
-        this._processKiteTick(data);
-      });
-
-      this.kiteTicker.on('close', (code, reason) => {
-        console.log(`⚠️  Kite WebSocket closed: ${code} - ${reason}`);
-        this.isKiteConnected = false;
-        this._broadcastToClients({
-          type: 'kite_status',
-          connected: false,
-        });
-        // Reconnect after 5 seconds
-        console.log('   Reconnecting in 5 seconds...');
-        this.reconnectTimer = setTimeout(() => this._connectToKite(), 5000);
-      });
-
-      this.kiteTicker.on('error', (err) => {
-        console.log('❌ Kite WebSocket error:', err.message);
-        this.isKiteConnected = false;
-      });
-
-    } catch (error) {
-      console.error('❌ Error connecting to Kite WebSocket:', error.message);
-      this.reconnectTimer = setTimeout(() => this._connectToKite(), 10000);
     }
-  }
 
   /**
    * Update Kite subscription with current tokens

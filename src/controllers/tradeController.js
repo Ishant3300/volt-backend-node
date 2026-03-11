@@ -8,6 +8,7 @@ const mongoose = require('mongoose');
 const Transaction = require('../models/Transaction');
 const orderBookService = require('../services/orderBookService');
 const { calculateMargin } = require('../services/marginService');
+const firebaseService = require('../services/firebaseService');
 
 const _getLivePricesFromKite = async (instrumentTokens) => {
     if (!instrumentTokens || instrumentTokens.length === 0) return new Map();
@@ -30,7 +31,7 @@ const _getLivePricesFromKite = async (instrumentTokens) => {
 const placeTrade = async (req, res) => {
     const session = await mongoose.startSession();
     try {
-        const userId = req.user?.id || req.body.user_id;
+        const userId = req.user?.id || req.master?.id || req.admin?.id || req.body.user_id;
         if (!userId) {
             return res.status(401).json({ success: false, message: 'Unauthorized / User ID missing' });
         }
@@ -324,6 +325,33 @@ const placeTrade = async (req, res) => {
             message,
             data: resultTrade
         });
+
+        // --- FCM Push Notifications (fire-and-forget, after response) ---
+        try {
+            const callerId = req.user?.id || req.master?.id || req.admin?.id;
+            const targetUserId = resultTrade.user_id.toString();
+            const callerIdStr = callerId?.toString();
+
+            if (resultTrade.status === 'completed' && resultTrade.order_type === 'MARKET') {
+                if (req.body.user_id && callerIdStr !== targetUserId) {
+                    // Admin/Master placed trade on behalf of user
+                    firebaseService.sendNotification(targetUserId, 'admin_order_execution', {
+                        title: 'Trade Executed by Admin',
+                        body: `${resultTrade.transaction_type} ${resultTrade.quantity} ${resultTrade.tradingsymbol} @ ₹${resultTrade.executed_price}`,
+                        data: { trade_id: resultTrade._id.toString(), tradingsymbol: resultTrade.tradingsymbol },
+                    });
+                } else {
+                    // User's own market order
+                    firebaseService.sendNotification(targetUserId, 'market_order', {
+                        title: `${resultTrade.transaction_type} Order Executed`,
+                        body: `${resultTrade.quantity} ${resultTrade.tradingsymbol} @ ₹${resultTrade.executed_price}`,
+                        data: { trade_id: resultTrade._id.toString(), tradingsymbol: resultTrade.tradingsymbol },
+                    });
+                }
+            }
+        } catch (fcmErr) {
+            console.error('⚠️  [FCM] placeTrade notification error:', fcmErr.message);
+        }
     } catch (error) {
         session.endSession();
 
@@ -346,7 +374,7 @@ const placeTrade = async (req, res) => {
  */
 const getAccountMetrics = async (req, res) => {
     try {
-        const userId = req.user?.id || req.body.user_id;
+        const userId = req.user?.id || req.master?.id || req.admin?.id || req.body.user_id;
         if (!userId) {
             return res.status(401).json({ success: false, message: 'Unauthorized' });
         }
@@ -377,14 +405,20 @@ const getAccountMetrics = async (req, res) => {
 /**
  * Get user's active and completed positions for local frontend metric calculation
  */
-const getPositions = async (req, res) => {
+getPositions = async (req, res) => {
     try {
-        const userId = req.user?.id || req.body.user_id;
+        const userId = req.user?.id || req.master?.id || req.admin?.id || req.body.user_id;
         if (!userId) {
             return res.status(401).json({ success: false, message: 'Unauthorized' });
         }
 
-        const trades = await Trade.find({ user_id: userId, deleted_at: null }).sort({ executed_at: -1 });
+        // For master/admin, optionally filter by user_id query param, otherwise show own trades
+        let targetUserId = userId;
+        if ((req.master || req.admin) && req.query.user_id) {
+            targetUserId = req.query.user_id;
+        }
+
+        const trades = await Trade.find({ user_id: targetUserId, deleted_at: null }).sort({ executed_at: -1 });
 
         res.status(200).json({
             success: true,
@@ -398,7 +432,7 @@ const getPositions = async (req, res) => {
             data: null
         });
     }
-};
+}
 
 /**
  * Get exchange margin rules for frontend calculation
@@ -426,7 +460,7 @@ const getMargins = async (req, res) => {
  */
 const cancelTrade = async (req, res) => {
     try {
-        const userId = req.user?.id;
+        const userId = req.user?.id || req.master?.id || req.admin?.id;
         const { tradeId } = req.params;
 
         if (!userId) {
@@ -471,9 +505,60 @@ const cancelTrade = async (req, res) => {
     }
 };
 
+/**
+ * Soft-delete a trade (admin/master only)
+ * Sends admin_order_deletion notification to the trade owner.
+ */
+const deleteTrade = async (req, res) => {
+    try {
+        const callerId = req.admin?.id || req.master?.id;
+        const { tradeId } = req.params;
+
+        if (!callerId) {
+            return res.status(403).json({ success: false, message: 'Only admin/master can delete trades' });
+        }
+
+        const trade = await Trade.findById(tradeId);
+        if (!trade || trade.deleted_at) {
+            return res.status(404).json({ success: false, message: 'Trade not found' });
+        }
+
+        trade.deleted_at = new Date();
+        await trade.save();
+
+        // If the trade was pending, also remove from Redis order book
+        if (trade.status === 'pending') {
+            try {
+                await orderBookService.removeOrder(
+                    trade._id.toString(),
+                    trade.instrument_token,
+                    trade.transaction_type
+                );
+            } catch (_) {}
+        }
+
+        res.status(200).json({ success: true, message: 'Trade deleted', data: trade });
+
+        // FCM notification to trade owner
+        try {
+            const targetUserId = trade.user_id.toString();
+            firebaseService.sendNotification(targetUserId, 'admin_order_deletion', {
+                title: 'Trade Deleted by Admin',
+                body: `${trade.transaction_type} ${trade.quantity} ${trade.tradingsymbol} has been deleted`,
+                data: { trade_id: trade._id.toString(), tradingsymbol: trade.tradingsymbol },
+            });
+        } catch (fcmErr) {
+            console.error('⚠️  [FCM] deleteTrade notification error:', fcmErr.message);
+        }
+    } catch (error) {
+        res.status(500).json({ success: false, message: error.message });
+    }
+};
+
 module.exports = {
     placeTrade,
     cancelTrade,
+    deleteTrade,
     getAccountMetrics,
     getPositions,
     getMargins

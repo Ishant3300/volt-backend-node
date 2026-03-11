@@ -17,6 +17,9 @@ router.post('/', tradeController.placeTrade);
 // Cancel a pending trade
 router.put('/:tradeId/cancel', tradeController.cancelTrade);
 
+// Soft-delete a trade (admin/master)
+router.delete('/:tradeId', tradeController.deleteTrade);
+
 // Get current user metrics
 router.get('/metrics', tradeController.getAccountMetrics);
 

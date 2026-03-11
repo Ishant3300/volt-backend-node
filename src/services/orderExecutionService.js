@@ -6,6 +6,7 @@ const kiteService = require('./kiteService');
 const orderBookService = require('./orderBookService');
 const redisService = require('./redisService');
 const { calculateMargin } = require('./marginService');
+const firebaseService = require('./firebaseService');
 
 /**
  * Fetches live prices from Kite for a list of instrument tokens.
@@ -223,6 +224,13 @@ const processPendingOrders = async () => {
                     executed_price: trade.price,
                     pnl: trade.pnl || 0,
                     status: 'completed',
+                });
+
+                // FCM push notification for pending order execution
+                firebaseService.sendNotification(trade.user_id.toString(), 'pending_order', {
+                    title: 'Limit Order Executed',
+                    body: `${trade.transaction_type} ${trade.quantity} ${trade.tradingsymbol} @ ₹${trade.price}`,
+                    data: { trade_id: trade._id.toString(), tradingsymbol: trade.tradingsymbol },
                 });
                 } catch (sessionErr) {
                     session.endSession();

@@ -18,6 +18,17 @@ const adminSchema = new mongoose.Schema({
   deleted_at: {
     type: Date,
     default: null
+  },
+  notification_settings: {
+    market_order: { type: Boolean, default: false },
+    pending_order: { type: Boolean, default: true },
+    admin_order_execution: { type: Boolean, default: false },
+    admin_order_deletion: { type: Boolean, default: true },
+    trading_sound: { type: Boolean, default: false }
+  },
+  fcm_tokens: {
+    type: [String],
+    default: []
   }
 }, {
   timestamps: true
