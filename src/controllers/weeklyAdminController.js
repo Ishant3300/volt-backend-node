@@ -114,15 +114,15 @@ const getWeeklyAdminReport = async (req, res) => {
 
 /**
  * Map trade exchange+instrumentType to brokerage category
- * NFO CE/PE -> CALLPUT, MCX CE/PE -> MCX-OPT, else exchange
+ * NFO CE/PE -> NFO-OPT, MCX CE/PE -> MCX-OPT, else exchange
  */
 function _getBrkCategory(exchange, tradingsymbol) {
   // CE/PE suffix detection for options
   const sym = tradingsymbol.toUpperCase();
   const isOption = sym.endsWith('CE') || sym.endsWith('PE');
 
-  if (exchange === 'NFO' && isOption) return 'CALLPUT';
-  if (exchange === 'BFO' && isOption) return 'CALLPUT';
+  if (exchange === 'NFO' && isOption) return 'NFO-OPT';
+  if (exchange === 'BFO' && isOption) return 'NFO-OPT';
   if (exchange === 'MCX' && isOption) return 'MCX-OPT';
   if (exchange === 'NSE' || exchange === 'BSE') return 'NSE';
   if (exchange === 'NFO') return 'NSE'; // NFO futures -> NSE turnover
@@ -159,7 +159,7 @@ function _getBrkForTrade(category, tradingsymbol, buyPrice, sellPrice, qty, brkM
 
   if (!setting) {
     // Hardcoded defaults
-    if (category === 'CALLPUT' || category === 'MCX-OPT') {
+    if (category === 'NFO-OPT' || category === 'MCX-OPT') {
       setting = { type: 'LOT WISE', value: 20 };
     } else {
       setting = { type: 'TURNOVER WISE', value: 0.0002 };

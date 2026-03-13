@@ -4,6 +4,8 @@ const Master = require('../models/Master');
 const tradeMetricsService = require('../services/tradeMetricsService');
 const kiteService = require('../services/kiteService');
 const TradeMargin = require('../models/TradeMargin');
+const ScriptQuantity = require('../models/ScriptQuantity');
+const GroupedQuantity = require('../models/GroupedQuantity');
 const mongoose = require('mongoose');
 const Transaction = require('../models/Transaction');
 const orderBookService = require('../services/orderBookService');
@@ -104,6 +106,126 @@ const placeTrade = async (req, res) => {
 
                     if (quantity > netQty) {
                         throw new Error(`You can only sell up to ${netQty} units of this option (your current holding). Selling ${quantity} would create a short position.`);
+                    }
+                }
+            }
+
+            // 1.5 Margin-based lot limit validation (only for BUY / opening positions)
+            // Rule: Max tradeable lots = floor(Available Balance / Margin per lot), capped by assigned lot limit
+            if (transaction_type === 'BUY') {
+                const normalizedExchange = exchange.toUpperCase() === 'GLOBAL' ? 'INDICES' : exchange.toUpperCase();
+                // Get user's exchange assignment to find their group_name
+                const userExchange = user.exchanges_allowed?.find(ex => ex.exchange_name.toUpperCase() === normalizedExchange);
+                const groupName = userExchange?.group_name;
+
+                // Find lot limit from GroupedQuantity (if user has a group) or ScriptQuantity (global)
+                let lotLimit = null;
+                let lotSize = 1;
+
+                if (groupName) {
+                    // Check GroupedQuantity for this specific instrument
+                    const groupQty = await GroupedQuantity.findOne({
+                        exchange_name: normalizedExchange,
+                        lot_name: groupName,
+                        instrument_id: instrument_token,
+                        deleted_at: null
+                    }).session(session);
+                    if (groupQty) {
+                        lotLimit = groupQty.max_qty;
+                        lotSize = groupQty.lot_size || 1;
+                    }
+                }
+
+                // Fallback to ScriptQuantity if no group-specific limit found
+                if (lotLimit === null) {
+                    const scriptQty = await ScriptQuantity.findOne({
+                        exchange_name: normalizedExchange,
+                        script_name: tradingsymbol,
+                        deleted_at: null
+                    }).session(session);
+                    if (scriptQty) {
+                        lotLimit = scriptQty.max_qty;
+                        lotSize = scriptQty.lot_size || 1;
+                    }
+                }
+
+                // If we have a lot limit, validate against available balance
+                if (lotLimit !== null && lotLimit > 0) {
+                    // Get current position for this instrument
+                    const posAgg = await Trade.aggregate([
+                        {
+                            $match: {
+                                user_id: user._id,
+                                instrument_token: instrument_token,
+                                status: 'completed',
+                                deleted_at: null
+                            }
+                        },
+                        {
+                            $group: {
+                                _id: null,
+                                total_buy_qty: {
+                                    $sum: { $cond: [{ $eq: ['$transaction_type', 'BUY'] }, '$executed_quantity', 0] }
+                                },
+                                total_sell_qty: {
+                                    $sum: { $cond: [{ $eq: ['$transaction_type', 'SELL'] }, '$executed_quantity', 0] }
+                                }
+                            }
+                        }
+                    ]).session(session);
+
+                    const currentNetQty = posAgg.length > 0 ? posAgg[0].total_buy_qty - posAgg[0].total_sell_qty : 0;
+                    const currentLots = Math.floor(Math.abs(currentNetQty) / lotSize);
+
+                    // Calculate remaining lots allowed by lot limit
+                    const remainingLotsByLimit = Math.max(0, lotLimit - currentLots);
+
+                    // Get price for margin calculation - fetch live price if not provided (MARKET orders)
+                    let priceForMargin = price;
+                    if (!priceForMargin || priceForMargin <= 0) {
+                        const ltpMapForMargin = await _getLivePricesFromKite([parseInt(instrument_token)]);
+                        priceForMargin = ltpMapForMargin.get(parseInt(instrument_token)) || ltpMapForMargin.get(instrument_token.toString());
+                    }
+                    if (!priceForMargin || priceForMargin <= 0) {
+                        throw new Error('Could not determine price for margin calculation');
+                    }
+
+                    // Calculate margin per lot
+                    const marginPerLot = await calculateMargin(normalizedExchange, lotSize, priceForMargin);
+
+                    // Calculate max affordable lots based on available balance
+                    const availableBalance = user.balance || 0;
+                    const maxAffordableLots = marginPerLot > 0 ? Math.floor(availableBalance / marginPerLot) : remainingLotsByLimit;
+
+                    // Effective max lots = min(remaining by limit, affordable by balance)
+                    const effectiveMaxLots = Math.min(remainingLotsByLimit, maxAffordableLots);
+                    const effectiveMaxQty = effectiveMaxLots * lotSize;
+
+                    // Convert requested quantity to lots
+                    const requestedLots = Math.ceil(quantity / lotSize);
+
+                    if (requestedLots > effectiveMaxLots) {
+                        const requiredMargin = requestedLots * marginPerLot;
+                        if (maxAffordableLots === 0) {
+                            // Cannot afford even 1 lot
+                            throw new Error(
+                                `Insufficient margin to place even 1 lot. ` +
+                                `Available: ₹${availableBalance.toFixed(2)}, Required per lot: ₹${marginPerLot.toFixed(2)}.`
+                            );
+                        } else if (maxAffordableLots < remainingLotsByLimit) {
+                            // Balance is the limiting factor
+                            throw new Error(
+                                `Insufficient balance for ${requestedLots} lot(s). ` +
+                                `Available: ₹${availableBalance.toFixed(2)}, Required: ₹${requiredMargin.toFixed(2)}. ` +
+                                `Max affordable: ${maxAffordableLots} lot(s) (${effectiveMaxQty} qty).`
+                            );
+                        } else {
+                            // Lot limit is the limiting factor
+                            throw new Error(
+                                `Quantity exceeds lot limit. Max allowed: ${lotLimit} lot(s), ` +
+                                `Current position: ${currentLots} lot(s), Remaining: ${remainingLotsByLimit} lot(s).`
+                            );
+                        }
                     }
                 }
             }
@@ -237,8 +359,9 @@ const placeTrade = async (req, res) => {
                 const isBuy = transaction_type === 'BUY';
                 const newNetQty = prevNetQtyForMargin + (isBuy ? quantity : -quantity);
 
+                const normalizedExchange = exchange.toUpperCase() === 'GLOBAL' ? 'INDICES' : exchange.toUpperCase();
                 // Margin per unit at execution price
-                const marginPerUnit = await calculateMargin(exchange, 1, executedPrice);
+                const marginPerUnit = await calculateMargin(normalizedExchange, 1, executedPrice);
 
                 const prevMargin = Math.abs(prevNetQtyForMargin) * marginPerUnit;
                 const newMargin = Math.abs(newNetQty) * marginPerUnit;
@@ -534,7 +657,7 @@ const deleteTrade = async (req, res) => {
                     trade.instrument_token,
                     trade.transaction_type
                 );
-            } catch (_) {}
+            } catch (_) { }
         }
 
         res.status(200).json({ success: true, message: 'Trade deleted', data: trade });

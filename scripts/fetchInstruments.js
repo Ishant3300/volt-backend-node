@@ -5,8 +5,232 @@ const path = require('path');
 const kiteService = require('../src/services/kiteService');
 const KiteInstrument = require('../src/models/KiteInstrument');
 
+// ══════════════════════════════════════════════════════════════════════════════
+// CONFIGURATION
+// ══════════════════════════════════════════════════════════════════════════════
+
+// Allowed exchanges for derivatives (FUT, CE, PE)
+const ALLOWED_EXCHANGES = ['BFO', 'NFO', 'MCX'];
+
+// Allowed instrument types for derivatives
+const ALLOWED_INSTRUMENT_TYPES = ['FUT', 'CE', 'PE'];
+
+// Global indices name mapping for user-friendly display
+const GLOBAL_INDICES_MAP = {
+  'US 100': 'Nasdaq 100',
+  'US 500': 'S&P 500',
+  'US 30': 'Dow Jones 30',
+  'UK 100': 'FTSE 100',
+  'DE 40': 'DAX 40',
+  'EU 50': 'Euro Stoxx 50',
+  'JP 225': 'Nikkei 225',
+  'HK 50': 'Hang Seng 50',
+  'AU 200': 'ASX 200',
+  'FR 40': 'CAC 40',
+  'SG 30': 'SGX Nifty',
+  'CN 50': 'FTSE China 50',
+  'INDIA VIX': 'India VIX',
+  'NIFTY 50': 'Nifty 50',
+  'NIFTY BANK': 'Bank Nifty',
+  'NIFTY FIN SERVICE': 'Nifty Financial Services',
+  'NIFTY MIDCAP 50': 'Nifty Midcap 50',
+  'NIFTY IT': 'Nifty IT',
+  'NIFTY NEXT 50': 'Nifty Next 50'
+};
+
+// ══════════════════════════════════════════════════════════════════════════════
+// HELPER FUNCTIONS
+// ══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Check if instrument passes the filter criteria
+ * - Derivatives (FUT, CE, PE) from BFO, NFO, MCX
+ * - Global indices from INDICES segment
+ */
+function shouldIncludeInstrument(instrument) {
+  // Include global indices
+  if (instrument.segment === 'INDICES' && instrument.exchange === 'NSE') {
+    return true;
+  }
+  
+  // Include derivatives from allowed exchanges
+  if (
+    ALLOWED_INSTRUMENT_TYPES.includes(instrument.instrument_type) &&
+    ALLOWED_EXCHANGES.includes(instrument.exchange)
+  ) {
+    return true;
+  }
+  
+  return false;
+}
+
+/**
+ * Generate display name for an instrument
+ */
+function generateDisplayName(instrument) {
+  // For global indices, use mapped name
+  if (instrument.segment === 'INDICES') {
+    const mappedName = GLOBAL_INDICES_MAP[instrument.name] || GLOBAL_INDICES_MAP[instrument.tradingsymbol];
+    if (!mappedName) {
+      console.warn(`⚠️  Unmapped global index: ${instrument.name} (${instrument.tradingsymbol})`);
+    }
+    return mappedName || instrument.name;
+  }
+  
+  // For derivatives, create descriptive name
+  if (['FUT', 'CE', 'PE'].includes(instrument.instrument_type)) {
+    const baseName = instrument.name || instrument.tradingsymbol.split(/\d/)[0];
+    const expiryStr = instrument.expiry 
+      ? new Date(instrument.expiry).toLocaleDateString('en-US', { month: 'short', year: 'numeric' })
+      : '';
+    
+    if (instrument.instrument_type === 'FUT') {
+      return `${baseName} FUT ${expiryStr}`.trim();
+    } else {
+      // Options: include strike price
+      const strike = instrument.strike || '';
+      return `${baseName} ${strike} ${instrument.instrument_type} ${expiryStr}`.trim();
+    }
+  }
+  
+  return instrument.name || instrument.tradingsymbol;
+}
+
+/**
+ * Parse CSV and apply filtering + mapping
+ */
+function parseAndFilterInstruments(csvText) {
+  const lines = csvText.trim().split('\n');
+  const headers = lines[0].split(',').map(h => h.trim());
+  
+  console.log('📋 CSV Headers:', headers.slice(0, 12).join(', '));
+  
+  const instruments = [];
+  const unmappedIndices = [];
+  const stats = {
+    total: 0,
+    filtered: 0,
+    derivatives: { FUT: 0, CE: 0, PE: 0 },
+    indices: 0,
+    byExchange: {}
+  };
+
+  for (let i = 1; i < lines.length; i++) {
+    const values = lines[i].split(',');
+    const instrument = {};
+
+    headers.forEach((key, index) => {
+      let value = values[index]?.trim() || '';
+
+      // Remove quotes
+      if (value.startsWith('"') && value.endsWith('"')) {
+        value = value.slice(1, -1);
+      }
+
+      // Type casting
+      if (['instrument_token', 'exchange_token'].includes(key)) {
+        instrument[key] = value;
+      } else if (['last_price', 'strike', 'tick_size'].includes(key)) {
+        instrument[key] = parseFloat(value) || 0;
+      } else if (['lot_size'].includes(key)) {
+        instrument[key] = parseInt(value, 10) || 1;
+      } else if (key === 'expiry' && value) {
+        instrument[key] = new Date(value);
+      } else {
+        instrument[key] = value;
+      }
+    });
+
+    stats.total++;
+
+    // Apply filter
+    if (!shouldIncludeInstrument(instrument)) {
+      stats.filtered++;
+      continue;
+    }
+
+    // Store raw name before mapping
+    instrument.raw_name = instrument.name;
+    
+    // Generate display name
+    instrument.display_name = generateDisplayName(instrument);
+    
+    // Track unmapped indices
+    if (instrument.segment === 'INDICES' && instrument.display_name === instrument.raw_name) {
+      if (!GLOBAL_INDICES_MAP[instrument.name] && !GLOBAL_INDICES_MAP[instrument.tradingsymbol]) {
+        unmappedIndices.push({ name: instrument.name, symbol: instrument.tradingsymbol });
+      }
+    }
+    
+    // Set is_active flag (all newly fetched instruments are active)
+    instrument.is_active = true;
+    instrument.updated_at = new Date();
+
+    // Update stats
+    if (instrument.segment === 'INDICES') {
+      stats.indices++;
+    } else if (ALLOWED_INSTRUMENT_TYPES.includes(instrument.instrument_type)) {
+      stats.derivatives[instrument.instrument_type]++;
+    }
+    
+    const exch = instrument.exchange;
+    if (!stats.byExchange[exch]) {
+      stats.byExchange[exch] = { FUT: 0, CE: 0, PE: 0, INDICES: 0, total: 0 };
+    }
+    stats.byExchange[exch].total++;
+    if (instrument.segment === 'INDICES') {
+      stats.byExchange[exch].INDICES++;
+    } else {
+      stats.byExchange[exch][instrument.instrument_type]++;
+    }
+
+    instruments.push(instrument);
+  }
+
+  // Log unmapped indices for manual review
+  if (unmappedIndices.length > 0) {
+    console.log('\n⚠️  Unmapped Global Indices (need to add to GLOBAL_INDICES_MAP):');
+    unmappedIndices.forEach(idx => {
+      console.log(`   - "${idx.name}": "${idx.name}", // ${idx.symbol}`);
+    });
+  }
+
+  return { instruments, stats, unmappedIndices };
+}
+
+/**
+ * Deduplicate instruments by token
+ */
+function deduplicateByToken(instruments) {
+  const seen = new Map();
+  const duplicates = [];
+  
+  for (const inst of instruments) {
+    if (seen.has(inst.instrument_token)) {
+      duplicates.push(inst.instrument_token);
+    } else {
+      seen.set(inst.instrument_token, inst);
+    }
+  }
+  
+  if (duplicates.length > 0) {
+    console.log(`⚠️  Found ${duplicates.length} duplicate tokens, keeping first occurrence`);
+  }
+  
+  return Array.from(seen.values());
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// MAIN FUNCTION
+// ══════════════════════════════════════════════════════════════════════════════
+
 async function fetchInstruments() {
   try {
+    console.log('═══════════════════════════════════════════════════════════════');
+    console.log('  INSTRUMENT FETCH & SYNC');
+    console.log('  Filtering: FUT, CE, PE from BFO, NFO, MCX + Global Indices');
+    console.log('═══════════════════════════════════════════════════════════════\n');
+
     console.log('🔌 Connecting to MongoDB...');
     console.log('   URI:', process.env.MONGO_URI ? 'Found' : 'NOT FOUND');
 
@@ -15,7 +239,7 @@ async function fetchInstruments() {
     }
 
     await mongoose.connect(process.env.MONGO_URI);
-    console.log('✅ Connected to MongoDB');
+    console.log('✅ Connected to MongoDB\n');
 
     // Create downloads directory if it doesn't exist
     const downloadsDir = path.join(__dirname, 'downloads');
@@ -24,86 +248,81 @@ async function fetchInstruments() {
       console.log('📁 Created downloads directory');
     }
 
-    console.log('\n📊 Fetching ALL instruments from Kite API...');
-    console.log('This may take a few minutes...\n');
-    console.log('This may take a few minutes...\n');
+    console.log('📊 Fetching ALL instruments from Kite API...');
+    console.log('   This may take a few minutes...\n');
 
-    // Drop the collection once at the beginning
-    console.log('🗑️  Clearing existing instruments...');
+    // Fetch all instruments
+    const csvData = await kiteService.fetchInstrumentsFromKite();
+    
+    // Save raw CSV for reference
+    const timestamp = new Date().toISOString().replace(/[:.]/g, '-').split('T')[0];
+    const rawFilename = `raw_instruments_${timestamp}.csv`;
+    const rawFilepath = path.join(downloadsDir, rawFilename);
+    fs.writeFileSync(rawFilepath, csvData, 'utf8');
+    console.log(`💾 Saved raw CSV: ${rawFilename}`);
+
+    // Parse and filter instruments
+    console.log('\n🔍 Parsing and filtering instruments...');
+    const { instruments, stats, unmappedIndices } = parseAndFilterInstruments(csvData);
+    
+    // Deduplicate by token
+    const uniqueInstruments = deduplicateByToken(instruments);
+    
+    console.log('\n📊 Filter Results:');
+    console.log(`   Total in CSV: ${stats.total}`);
+    console.log(`   Filtered out: ${stats.filtered}`);
+    console.log(`   Kept: ${uniqueInstruments.length}`);
+    console.log(`   - Derivatives: FUT=${stats.derivatives.FUT}, CE=${stats.derivatives.CE}, PE=${stats.derivatives.PE}`);
+    console.log(`   - Indices: ${stats.indices}`);
+
+    // Save filtered CSV
+    const filteredFilename = `filtered_instruments_${timestamp}.csv`;
+    const filteredFilepath = path.join(downloadsDir, filteredFilename);
+    const filteredHeaders = Object.keys(uniqueInstruments[0] || {}).join(',');
+    const filteredRows = uniqueInstruments.map(inst => 
+      Object.values(inst).map(v => 
+        typeof v === 'string' && v.includes(',') ? `"${v}"` : v
+      ).join(',')
+    );
+    fs.writeFileSync(filteredFilepath, [filteredHeaders, ...filteredRows].join('\n'), 'utf8');
+    console.log(`💾 Saved filtered CSV: ${filteredFilename}`);
+
+    // Drop and recreate collection
+    console.log('\n🗑️  Clearing existing instruments...');
     await KiteInstrument.collection.drop().catch(() => {
       console.log('   Collection does not exist, creating new one');
     });
 
-    let allInstruments = [];
-    let allCsvData = [];
-    let csvHeader = '';
-    const exchangeBreakdown = {};
-
-    // Fetch all instruments at once without specifying an exchange
-    console.log(`\n📡 Fetching ALL instruments...`);
-
-    try {
-      const csvData = await kiteService.fetchInstrumentsFromKite(); // No exchange passed
-
-      // Store raw CSV data
-      allCsvData = csvData.trim().split('\n');
-      if (allCsvData.length > 0) {
-        csvHeader = allCsvData[0];
-        allCsvData = allCsvData.slice(1); // Remove header for processing
-      }
-
-      const instruments = kiteService.parseInstrumentsCsv(csvData);
-
-      console.log(`✅ Parsed: ${instruments.length} instruments total`);
-
-      // Calculate breakdown by exchange instead of by type since we have all now
-      instruments.forEach(inst => {
-        const exch = inst.exchange || 'UNKNOWN';
-        if (!exchangeBreakdown[exch]) {
-          exchangeBreakdown[exch] = { FUT: 0, CE: 0, PE: 0, EQ: 0, total: 0 };
-        }
-
-        exchangeBreakdown[exch].total++;
-        if (inst.instrument_type === 'FUT') exchangeBreakdown[exch].FUT++;
-        else if (inst.instrument_type === 'CE') exchangeBreakdown[exch].CE++;
-        else if (inst.instrument_type === 'PE') exchangeBreakdown[exch].PE++;
-        else if (inst.instrument_type === 'EQ') exchangeBreakdown[exch].EQ++;
-      });
-
-      allInstruments = instruments;
-    } catch (error) {
-      console.error(`❌ Error fetching instruments:`, error.message);
-      throw error;
-    }
-
-    // Save combined CSV file
-    const timestamp = new Date().toISOString().replace(/[:.]/g, '-').split('T')[0];
-    const filename = `all_instruments_${timestamp}.csv`;
-    const filepath = path.join(downloadsDir, filename);
-
-    const combinedCsv = [csvHeader, ...allCsvData].join('\n');
-    fs.writeFileSync(filepath, combinedCsv, 'utf8');
-    console.log(`\n💾 Saved comprehensive CSV: ${filename}`);
-    console.log(`   Total rows: ${allCsvData.length}`);
-
-    console.log(`\n💾 Storing ${allInstruments.length} total instruments...`);
-
-    // Bulk insert all instruments at once
-    const result = await KiteInstrument.insertMany(allInstruments, {
+    // Bulk insert
+    console.log(`\n💾 Storing ${uniqueInstruments.length} instruments...`);
+    const result = await KiteInstrument.insertMany(uniqueInstruments, {
       ordered: false
     });
 
     const insertedCount = Array.isArray(result) ? result.length : (result.insertedCount || 0);
 
-    console.log('\n✅ All instruments fetched and stored successfully!');
-    console.log(`   Total instruments: ${allInstruments.length}`);
-    console.log(`   Total inserted: ${insertedCount}`);
-    console.log(`   CSV file saved: ${filepath}`);
+    // Print summary
+    console.log('\n═══════════════════════════════════════════════════════════════');
+    console.log('  ✅ SYNC COMPLETE');
+    console.log('═══════════════════════════════════════════════════════════════');
+    console.log(`   Total instruments stored: ${insertedCount}`);
+    console.log(`   Raw CSV: ${rawFilepath}`);
+    console.log(`   Filtered CSV: ${filteredFilepath}`);
+    
     console.log('\n📊 Exchange Breakdown:');
-    for (const [exchange, breakdown] of Object.entries(exchangeBreakdown)) {
+    for (const [exchange, breakdown] of Object.entries(stats.byExchange)) {
       console.log(`   ${exchange}:`);
       console.log(`      Total: ${breakdown.total}`);
-      console.log(`      FUT: ${breakdown.FUT}, CE: ${breakdown.CE}, PE: ${breakdown.PE}, EQ: ${breakdown.EQ}`);
+      if (breakdown.INDICES > 0) {
+        console.log(`      Indices: ${breakdown.INDICES}`);
+      }
+      if (breakdown.FUT > 0 || breakdown.CE > 0 || breakdown.PE > 0) {
+        console.log(`      FUT: ${breakdown.FUT}, CE: ${breakdown.CE}, PE: ${breakdown.PE}`);
+      }
+    }
+
+    if (unmappedIndices.length > 0) {
+      console.log(`\n⚠️  ${unmappedIndices.length} unmapped indices need manual mapping`);
     }
 
     await mongoose.connection.close();
@@ -112,7 +331,7 @@ async function fetchInstruments() {
   } catch (error) {
     console.error('\n❌ Error:', error.message);
     console.error(error);
-    await mongoose.connection.close().catch(() => { });
+    await mongoose.connection.close().catch(() => {});
     process.exit(1);
   }
 }

@@ -10,7 +10,8 @@ const TradeMargin = require('../models/TradeMargin');
  * @returns {Promise<number>} margin amount
  */
 const calculateMargin = async (exchange, quantity, price) => {
-  const rule = await TradeMargin.findOne({ exchange_name: exchange, deleted_at: null });
+  const normalizedExchange = exchange.toUpperCase() === 'GLOBAL' ? 'INDICES' : exchange.toUpperCase();
+  const rule = await TradeMargin.findOne({ exchange_name: normalizedExchange, deleted_at: null });
   console.log(`💰 [Margin] exchange=${exchange}, rule=${rule ? JSON.stringify({ amount_type: rule.amount_type, trade_margin: rule.trade_margin, script_name: rule.script_name }) : 'NOT FOUND'}`);
   if (!rule) return 0;
 

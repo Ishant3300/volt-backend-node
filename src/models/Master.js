@@ -28,7 +28,7 @@ const masterSchema = new mongoose.Schema({
   },
   note: {
     type: String,
-    required: true,
+    required: false,
     default: ''
   },
   pnl_sharing: {
@@ -48,7 +48,7 @@ const masterSchema = new mongoose.Schema({
   exchanges_allowed: {
     type: [String],
     required: true,
-    enum: ['NSE', 'MCX', 'SGX', 'CALLPUT', 'OTHERS', 'MCX-OPT'],
+    enum: ['NSE', 'NFO', 'MCX', 'SGX', 'OTHERS', 'NFO-FUT', 'NFO-OPT', 'MCX-FUT', 'MCX-OPT', 'BFO-FUT', 'BFO-OPT', 'INDICES', 'GLOBAL'],
     default: []
   },
   intraday_squareoff: {
@@ -56,7 +56,7 @@ const masterSchema = new mongoose.Schema({
       exchange_name: {
         type: String,
         required: true,
-        enum: ['NSE', 'MCX', 'SGX', 'CALLPUT', 'OTHERS', 'MCX-OPT']
+        enum: ['NSE', 'NFO', 'MCX', 'SGX', 'OTHERS', 'NFO-FUT', 'NFO-OPT', 'MCX-FUT', 'MCX-OPT', 'BFO-FUT', 'BFO-OPT', 'INDICES', 'GLOBAL']
       },
       enabled: {
         type: Boolean,
@@ -75,7 +75,7 @@ const masterSchema = new mongoose.Schema({
   trade_limit: {
     type: [String],
     required: true,
-    enum: ['NSE', 'MCX', 'SGX', 'CALLPUT', 'OTHERS', 'MCX-OPT'],
+    enum: ['NSE', 'NFO', 'MCX', 'SGX', 'OTHERS', 'NFO-FUT', 'NFO-OPT', 'MCX-FUT', 'MCX-OPT', 'BFO-FUT', 'BFO-OPT', 'INDICES', 'GLOBAL'],
     default: []
   },
   server_id: {
@@ -166,6 +166,11 @@ const masterSchema = new mongoose.Schema({
   fcm_tokens: {
     type: [String],
     default: []
+  },
+  account_limit: {
+    enabled: { type: Boolean, default: false },
+    max_masters: { type: Number, default: 0 },
+    max_users: { type: Number, default: 0 }
   }
 }, {
   timestamps: true

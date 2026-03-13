@@ -33,13 +33,23 @@ const createMaster = async (req, res) => {
       permissions
     } = req.body;
 
-    if (!name || !username || !password || !server_id || credits === undefined || !note || pnl_sharing === undefined || brokerage_sharing === undefined || !exchanges_allowed || !trade_limit) {
+    if (!name || !username || !password || !server_id || credits === undefined || pnl_sharing === undefined || brokerage_sharing === undefined || !exchanges_allowed || !trade_limit) {
       return res.status(400).json({
         success: false,
-        message: 'Name, username, password, credits, note, pnl_sharing, brokerage_sharing, exchanges_allowed, trade_limit, and server_id are required',
+        message: 'Name, username, password, credits, pnl_sharing, brokerage_sharing, exchanges_allowed, trade_limit, and server_id are required',
         data: null
       });
     }
+
+    // Map GLOBAL back to INDICES for backend compatibility
+    const finalExchangesAllowed = exchanges_allowed.map(ex => {
+      const name = ex.toUpperCase();
+      return name === 'GLOBAL' ? 'INDICES' : name;
+    });
+    const finalTradeLimit = trade_limit.map(ex => {
+      const name = ex.toUpperCase();
+      return name === 'GLOBAL' ? 'INDICES' : name;
+    });
 
     if (pnl_sharing < 0 || pnl_sharing > 100) {
       return res.status(400).json({
@@ -85,8 +95,8 @@ const createMaster = async (req, res) => {
         note,
         pnl_sharing,
         brokerage_sharing,
-        exchanges_allowed,
-        trade_limit,
+        exchanges_allowed: finalExchangesAllowed,
+        trade_limit: finalTradeLimit,
         add_master: add_master !== undefined ? add_master : false,
         change_pass_on_first_login: change_pass_on_first_login !== undefined ? change_pass_on_first_login : false,
         server_id,
@@ -310,8 +320,18 @@ const updateMaster = async (req, res) => {
       master.brokerage_sharing = brokerage_sharing;
     }
 
-    if (exchanges_allowed !== undefined) master.exchanges_allowed = exchanges_allowed;
-    if (trade_limit !== undefined) master.trade_limit = trade_limit;
+    if (exchanges_allowed !== undefined) {
+      master.exchanges_allowed = exchanges_allowed.map(ex => {
+        const name = ex.toUpperCase();
+        return name === 'GLOBAL' ? 'INDICES' : name;
+      });
+    }
+    if (trade_limit !== undefined) {
+      master.trade_limit = trade_limit.map(ex => {
+        const name = ex.toUpperCase();
+        return name === 'GLOBAL' ? 'INDICES' : name;
+      });
+    }
     if (add_master !== undefined) master.add_master = add_master;
     if (change_pass_on_first_login !== undefined) master.change_pass_on_first_login = change_pass_on_first_login;
 
@@ -906,8 +926,18 @@ const updateMasterDetails = async (req, res) => {
     if (name) master.name = name;
     if (credits !== undefined) master.credits = credits;
     if (note) master.note = note;
-    if (exchanges_allowed) master.exchanges_allowed = exchanges_allowed;
-    if (trade_limit) master.trade_limit = trade_limit;
+    if (exchanges_allowed) {
+      master.exchanges_allowed = exchanges_allowed.map(ex => {
+        const name = ex.toUpperCase();
+        return name === 'GLOBAL' ? 'INDICES' : name;
+      });
+    }
+    if (trade_limit) {
+      master.trade_limit = trade_limit.map(ex => {
+        const name = ex.toUpperCase();
+        return name === 'GLOBAL' ? 'INDICES' : name;
+      });
+    }
 
     await master.save();
 
@@ -1026,8 +1056,14 @@ const updateMasterIntradaySquareoff = async (req, res) => {
     }
 
     // Normalize existing exchange data to uppercase before saving
-    master.exchanges_allowed = master.exchanges_allowed.map(ex => ex.toUpperCase());
-    master.trade_limit = master.trade_limit.map(ex => ex.toUpperCase());
+    master.exchanges_allowed = master.exchanges_allowed.map(ex => {
+      const name = ex.toUpperCase();
+      return name === 'GLOBAL' ? 'INDICES' : name;
+    });
+    master.trade_limit = master.trade_limit.map(ex => {
+      const name = ex.toUpperCase();
+      return name === 'GLOBAL' ? 'INDICES' : name;
+    });
 
     await master.save();
 
@@ -1097,6 +1133,76 @@ const updateMasterMarginSquareoffPercentage = async (req, res) => {
   }
 };
 
+// Get Account Limit for a Master
+const getAccountLimit = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const master = await Master.findOne({ _id: id, deleted_at: null });
+    if (!master) {
+      return res.status(404).json({ success: false, message: 'Master not found', data: null });
+    }
+
+    const mastersCreated = await Master.countDocuments({ master_id: id, deleted_at: null });
+    const usersCreated = await User.countDocuments({ master_id: id, deleted_at: null });
+
+    // Get parent limit info if this master has a parent
+    let parentLimit = null;
+    if (master.master_id) {
+      const parent = await Master.findById(master.master_id);
+      if (parent && parent.account_limit && parent.account_limit.enabled) {
+        parentLimit = {
+          enabled: parent.account_limit.enabled,
+          max_masters: parent.account_limit.max_masters,
+          max_users: parent.account_limit.max_users
+        };
+      }
+    }
+
+    res.status(200).json({
+      success: true,
+      message: 'Account limit retrieved',
+      data: {
+        enabled: master.account_limit?.enabled || false,
+        max_masters: master.account_limit?.max_masters || 0,
+        max_users: master.account_limit?.max_users || 0,
+        masters_created: mastersCreated,
+        users_created: usersCreated,
+        parent_limit: parentLimit
+      }
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message, data: null });
+  }
+};
+
+// Update Account Limit for a Master
+const updateAccountLimit = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { enabled, max_masters, max_users } = req.body;
+
+    const master = await Master.findOne({ _id: id, deleted_at: null });
+    if (!master) {
+      return res.status(404).json({ success: false, message: 'Master not found', data: null });
+    }
+
+    master.account_limit = {
+      enabled: enabled !== undefined ? enabled : master.account_limit?.enabled || false,
+      max_masters: max_masters !== undefined ? max_masters : master.account_limit?.max_masters || 0,
+      max_users: max_users !== undefined ? max_users : master.account_limit?.max_users || 0
+    };
+    await master.save();
+
+    res.status(200).json({
+      success: true,
+      message: 'Account limit updated',
+      data: master.account_limit
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message, data: null });
+  }
+};
+
 module.exports = {
   createMaster,
   getAllMasters,
@@ -1112,5 +1218,7 @@ module.exports = {
   debitMaster,
   getAllTrades,
   getMasterPosition,
-  sendMessageToMaster
+  sendMessageToMaster,
+  getAccountLimit,
+  updateAccountLimit
 };

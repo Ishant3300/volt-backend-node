@@ -185,8 +185,38 @@ class KiteService {
 
   /**
    * Parse CSV instruments data
+   * Filters to only include:
+   * - Derivatives (FUT, CE, PE) from BFO, NFO, MCX exchanges
+   * - Global indices from INDICES segment
    */
   parseInstrumentsCsv(csvText) {
+    // Allowed exchanges for derivatives
+    const ALLOWED_EXCHANGES = ['BFO', 'NFO', 'MCX'];
+    const ALLOWED_INSTRUMENT_TYPES = ['FUT', 'CE', 'PE'];
+    
+    // Global indices name mapping
+    const GLOBAL_INDICES_MAP = {
+      'US 100': 'Nasdaq 100',
+      'US 500': 'S&P 500',
+      'US 30': 'Dow Jones 30',
+      'UK 100': 'FTSE 100',
+      'DE 40': 'DAX 40',
+      'EU 50': 'Euro Stoxx 50',
+      'JP 225': 'Nikkei 225',
+      'HK 50': 'Hang Seng 50',
+      'AU 200': 'ASX 200',
+      'FR 40': 'CAC 40',
+      'SG 30': 'SGX Nifty',
+      'CN 50': 'FTSE China 50',
+      'INDIA VIX': 'India VIX',
+      'NIFTY 50': 'Nifty 50',
+      'NIFTY BANK': 'Bank Nifty',
+      'NIFTY FIN SERVICE': 'Nifty Financial Services',
+      'NIFTY MIDCAP 50': 'Nifty Midcap 50',
+      'NIFTY IT': 'Nifty IT',
+      'NIFTY NEXT 50': 'Nifty Next 50'
+    };
+
     try {
       const lines = csvText.trim().split('\n');
       const headers = lines[0].split(',').map(h => h.trim());
@@ -213,7 +243,7 @@ class KiteService {
           } else if (['last_price', 'strike', 'tick_size'].includes(key)) {
             instrument[key] = parseFloat(value) || 0;
           } else if (['lot_size'].includes(key)) {
-            instrument[key] = parseInt(value, 10) || 0;
+            instrument[key] = parseInt(value, 10) || 1;
           } else if (key === 'expiry' && value) {
             instrument[key] = new Date(value);
           } else {
@@ -221,8 +251,38 @@ class KiteService {
           }
         });
 
-        // Filter: FUT, CE, PE (derivatives) and EQ (equity/indices)
-        if (['FUT', 'CE', 'PE', 'EQ'].includes(instrument.instrument_type)) {
+        // Check if instrument should be included
+        const isDerivative = ALLOWED_INSTRUMENT_TYPES.includes(instrument.instrument_type) &&
+                            ALLOWED_EXCHANGES.includes(instrument.exchange);
+        const isIndex = instrument.segment === 'INDICES' && instrument.exchange === 'NSE';
+
+        if (isDerivative || isIndex) {
+          // Store raw name
+          instrument.raw_name = instrument.name;
+          
+          // Generate display name
+          if (isIndex) {
+            const mappedName = GLOBAL_INDICES_MAP[instrument.name] || GLOBAL_INDICES_MAP[instrument.tradingsymbol];
+            instrument.display_name = mappedName || instrument.name;
+            if (!mappedName) {
+              console.warn(`⚠️  Unmapped index: ${instrument.name}`);
+            }
+          } else {
+            // For derivatives, create descriptive name
+            const baseName = instrument.name || instrument.tradingsymbol.split(/\d/)[0];
+            const expiryStr = instrument.expiry 
+              ? new Date(instrument.expiry).toLocaleDateString('en-US', { month: 'short', year: 'numeric' })
+              : '';
+            
+            if (instrument.instrument_type === 'FUT') {
+              instrument.display_name = `${baseName} FUT ${expiryStr}`.trim();
+            } else {
+              const strike = instrument.strike || '';
+              instrument.display_name = `${baseName} ${strike} ${instrument.instrument_type} ${expiryStr}`.trim();
+            }
+          }
+          
+          instrument.is_active = true;
           instrument.updated_at = new Date();
           instruments.push(instrument);
         }
@@ -310,31 +370,67 @@ class KiteService {
   /**
    * Search instruments
    */
-  async searchInstruments(query, exchange = null, instrumentType = null) {
+  /**
+     * Search instruments with nearest expiry filter
+     * Returns only the nearest upcoming expiry contract per symbol
+     */
+    async searchInstruments(query, exchange = null, instrumentType = null) {
       try {
-        // Use anchored regex (prefix match) so MongoDB can use the tradingsymbol index
+        const ALLOWED_EXCHANGES = ['BFO', 'NFO', 'MCX'];
+        const ALLOWED_INSTRUMENT_TYPES = ['FUT', 'CE', 'PE'];
+
+        const today = new Date();
+        today.setHours(0, 0, 0, 0);
+
         const escapedQuery = query.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-        const filter = {
+
+        // Build match stage for aggregation
+        const matchStage = {
           $or: [
             { tradingsymbol: { $regex: `^${escapedQuery}`, $options: 'i' } },
-            { name: { $regex: `^${escapedQuery}`, $options: 'i' } }
+            { name: { $regex: `^${escapedQuery}`, $options: 'i' } },
+            { display_name: { $regex: escapedQuery, $options: 'i' } }
           ],
-          instrument_type: { $in: ['FUT', 'CE', 'PE', 'EQ'] }
+          instrument_type: { $in: instrumentType ? [instrumentType] : ALLOWED_INSTRUMENT_TYPES },
+          exchange: { $in: exchange ? [exchange] : ALLOWED_EXCHANGES },
+          expiry: { $gte: today }
         };
 
-        if (exchange) {
-          filter.exchange = exchange;
-        }
+        // Aggregation pipeline to get nearest expiry per symbol/strike combination
+        const pipeline = [
+          { $match: matchStage },
+          { $sort: { expiry: 1 } },
+          {
+            $group: {
+              _id: {
+                name: '$name',
+                instrument_type: '$instrument_type',
+                // For options, include strike in grouping
+                strike: { $cond: [{ $in: ['$instrument_type', ['CE', 'PE']] }, '$strike', null] }
+              },
+              doc: { $first: '$$ROOT' }
+            }
+          },
+          { $replaceRoot: { newRoot: '$doc' } },
+          {
+            $project: {
+              instrument_token: 1,
+              tradingsymbol: 1,
+              name: 1,
+              display_name: 1,
+              instrument_type: 1,
+              exchange: 1,
+              segment: 1,
+              strike: 1,
+              expiry: 1,
+              lot_size: 1
+            }
+          },
+          { $sort: { name: 1, strike: 1, instrument_type: 1 } },
+          { $limit: 50 }
+        ];
 
-        if (instrumentType) {
-          filter.instrument_type = instrumentType;
-        }
-
-        const instruments = await KiteInstrument.find(filter)
-          .select('instrument_token tradingsymbol name instrument_type exchange segment strike expiry lot_size')
-          .limit(50)
-          .lean();
-
+        const instruments = await KiteInstrument.aggregate(pipeline);
         return instruments;
       } catch (error) {
         console.error('❌ Error searching instruments:', error);

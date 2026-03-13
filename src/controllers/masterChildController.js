@@ -33,10 +33,10 @@ const createChildMaster = async (req, res) => {
     } = req.body;
 
     // Validate required fields
-    if (!name || !username || !password || !server_id || credits === undefined || !note || pnl_sharing === undefined || brokerage_sharing === undefined || !exchanges_allowed || !trade_limit) {
+    if (!name || !username || !password || !server_id || credits === undefined || pnl_sharing === undefined || brokerage_sharing === undefined || !exchanges_allowed || !trade_limit) {
       return res.status(400).json({
         success: false,
-        message: 'Name, username, password, credits, note, pnl_sharing, brokerage_sharing, exchanges_allowed, trade_limit, and server_id are required',
+        message: 'Name, username, password, credits, pnl_sharing, brokerage_sharing, exchanges_allowed, trade_limit, and server_id are required',
         data: null
       });
     }
@@ -70,6 +70,14 @@ const createChildMaster = async (req, res) => {
         if (!parentMaster.add_master) throw new Error('No permission to create child masters');
         if (parentMaster.balance < credits) {
           throw new Error(`Insufficient balance. Available: ${parentMaster.balance}, Required: ${credits}`);
+        }
+
+        // Account limit enforcement
+        if (parentMaster.account_limit && parentMaster.account_limit.enabled) {
+          const mastersCreated = await Master.countDocuments({ master_id: parentMaster._id, deleted_at: null }).session(session);
+          if (mastersCreated >= parentMaster.account_limit.max_masters) {
+            throw new Error(`Account limit reached. Maximum ${parentMaster.account_limit.max_masters} masters allowed.`);
+          }
         }
 
         adminId = parentMaster.admin_id;
@@ -199,7 +207,7 @@ const createChildMaster = async (req, res) => {
     let statusCode = 500;
     if (error.message.includes('not found')) statusCode = 404;
     else if (error.message === 'Unauthorized' || error.message.includes('No permission')) statusCode = 403;
-    else if (error.message.includes('Insufficient') || error.message.includes('exists') || error.message.includes('between 0 and 100') || error.message.includes('grant permission')) statusCode = 400;
+    else if (error.message.includes('Insufficient') || error.message.includes('exists') || error.message.includes('between 0 and 100') || error.message.includes('grant permission') || error.message.includes('Account limit reached')) statusCode = 400;
 
     res.status(statusCode).json({
       success: false,

@@ -14,7 +14,7 @@ async function loginAsAdmin() {
   try {
     console.log('🔐 Logging in as admin...');
     const response = await axios.post(`${BASE_URL}/auth/admin/login`, ADMIN_CREDENTIALS);
-    
+
     if (response.data.success && response.data.data.token) {
       adminToken = response.data.data.token;
       console.log('✅ Admin login successful');
@@ -40,7 +40,7 @@ async function testGetLotNamesByExchange(exchangeName) {
         }
       }
     );
-    
+
     console.log('✅ Response:', response.data);
     console.log(`   Found ${response.data.data?.length || 0} lot names`);
     if (response.data.data && response.data.data.length > 0) {
@@ -55,20 +55,20 @@ async function runTests() {
   console.log('='.repeat(50));
   console.log('Testing Lot Names API');
   console.log('='.repeat(50));
-  
+
   // Login first
   const loginSuccess = await loginAsAdmin();
   if (!loginSuccess) {
     console.log('\n❌ Cannot proceed without admin login');
     return;
   }
-  
+
   // Test different exchanges
   await testGetLotNamesByExchange('NSE');
   await testGetLotNamesByExchange('MCX');
   await testGetLotNamesByExchange('SGX');
-  await testGetLotNamesByExchange('CALLPUT');
-  
+  await testGetLotNamesByExchange('NFO-OPT');
+
   console.log('\n' + '='.repeat(50));
   console.log('Tests completed');
   console.log('='.repeat(50));

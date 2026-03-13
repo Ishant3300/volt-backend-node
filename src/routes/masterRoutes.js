@@ -16,7 +16,9 @@ const {
   debitMaster,
   getAllTrades,
   getMasterPosition,
-  sendMessageToMaster
+  sendMessageToMaster,
+  getAccountLimit,
+  updateAccountLimit
 } = require('../controllers/masterController');
 
 
@@ -55,5 +57,9 @@ router.get('/:id/position', authenticateAdminOrMaster, getMasterPosition);
 
 // Messaging
 router.post('/:id/messages', authenticateAdminOrMaster, sendMessageToMaster);
+
+// Account Limit
+router.get('/:id/account-limit', authenticateAdminOrMaster, getAccountLimit);
+router.put('/:id/account-limit', authenticateAdminOrMaster, updateAccountLimit);
 
 module.exports = router;

@@ -229,13 +229,31 @@ const getInstrumentUserBreakdown = async (req, res) => {
  */
 const getUserMetrics = async (req, res) => {
   try {
-    const masterId = req.master.id;
+    // Admin passes ?master_id=xxx to view a specific master's users
+    // Or ?user_id=xxx to view a single user's metrics
+    const masterId = req.master?.id ?? req.query.master_id;
+    const singleUserId = req.query.user_id;
 
-    // Get all child users with credit/balance
-    const childUsers = await User.find({
-      master_id: masterId,
-      deleted_at: null
-    }).select('_id name username credits balance');
+    let childUsers;
+    if (singleUserId) {
+      // Fetch single user by ID
+      const user = await User.findOne({ _id: singleUserId, deleted_at: null })
+        .select('_id name username credits balance');
+      childUsers = user ? [user] : [];
+    } else if (masterId) {
+      // Get all child users with credit/balance
+      childUsers = await User.find({
+        master_id: masterId,
+        deleted_at: null
+      }).select('_id name username credits balance');
+    } else {
+      // Admin without filter: return empty (or could return all users)
+      return res.status(200).json({
+        success: true,
+        message: 'No master_id or user_id provided',
+        data: []
+      });
+    }
 
     const childUserIds = childUsers.map(u => u._id);
 

@@ -26,16 +26,15 @@ const ALIASES = {
 
 const INSTRUMENT_TYPES = new Set(['FUT', 'CE', 'PE', 'EQ', 'IDX']);
 const EXCHANGES = new Set(['NSE', 'NFO', 'MCX', 'BSE', 'SGX', 'CDS']);
-const MONTHS = new Set(['JAN','FEB','MAR','APR','MAY','JUN','JUL','AUG','SEP','OCT','NOV','DEC']);
+const MONTHS = new Set(['JAN', 'FEB', 'MAR', 'APR', 'MAY', 'JUN', 'JUL', 'AUG', 'SEP', 'OCT', 'NOV', 'DEC']);
 
 // ── Category filters ───────────────────────────────────────
 const CATEGORIES = {
-  'NSE-FUT': { label: 'NSE Futures', match: i => i.segment === 'NFO-FUT' && i.instrument_type === 'FUT' },
+  'NFO-FUT': { label: 'NFO Futures', match: i => i.segment === 'NFO-FUT' && i.instrument_type === 'FUT' },
   'MCX-FUT': { label: 'MCX Futures', match: i => i.exchange === 'MCX' && i.instrument_type === 'FUT' },
-  'NSE-OPT': { label: 'NSE Options', match: i => i.segment === 'NFO-OPT' && (i.instrument_type === 'CE' || i.instrument_type === 'PE') },
+  'NFO-OPT': { label: 'NFO Options', match: i => i.segment === 'NFO-OPT' && (i.instrument_type === 'CE' || i.instrument_type === 'PE') },
   'MCX-OPT': { label: 'MCX Options', match: i => i.exchange === 'MCX' && (i.instrument_type === 'CE' || i.instrument_type === 'PE') },
-  'NSEIX':   { label: 'NSE Indices', match: i => i.segment === 'INDICES' && i.exchange === 'NSE' },
-  'OTHERS':  { label: 'International', match: i => i.exchange === 'SGX' || i.exchange === 'CDS' },
+  'GLOBAL': { label: 'Global Indices', match: i => i.segment === 'INDICES' },
 };
 
 // ── Lean projection — only fields the UI needs ─────────────
@@ -60,11 +59,28 @@ const queryCache = new Map();
 const QUERY_CACHE_TTL = 60 * 1000;
 const MAX_QUERY_CACHE_SIZE = 200;
 
+const getEditDistance = (a, b) => {
+  if (!a || !b) return (a || b).length;
+  let matrix = [];
+  for (let i = 0; i <= b.length; i++) matrix[i] = [i];
+  for (let j = 0; j <= a.length; j++) matrix[0][j] = j;
+  for (let i = 1; i <= b.length; i++) {
+    for (let j = 1; j <= a.length; j++) {
+      if (b[i - 1] === a[j - 1]) {
+        matrix[i][j] = matrix[i - 1][j - 1];
+      } else {
+        matrix[i][j] = Math.min(matrix[i - 1][j - 1] + 1, Math.min(matrix[i][j - 1] + 1, matrix[i - 1][j] + 1));
+      }
+    }
+  }
+  return matrix[b.length][a.length];
+};
+
 // ── Underlying extraction ──────────────────────────────────
 const RE_EXPIRY1 = /\d{2}(?:JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)\d{0,4}/gi;
 const RE_EXPIRY2 = /\d{2}[A-Z]{3}\d{2,4}/gi;
-const RE_SUFFIX  = /(?:FUT|CE|PE)$/i;
-const RE_TRAIL   = /\d+$/g;
+const RE_SUFFIX = /(?:FUT|CE|PE)$/i;
+const RE_TRAIL = /\d+$/g;
 
 const extractUnderlying = (sym) => {
   return sym
@@ -279,6 +295,23 @@ const gatherCandidates = (resolved, category, rawQuery) => {
         for (const idx of prefixHits) termCandidates.add(idx);
       }
 
+      // Fuzzy check for underlyings if no exact hits
+      if (term.length >= 4 && termCandidates.size === 0) {
+        const maxTypos = term.length >= 6 ? 2 : 1;
+        for (const u of byUnderlying.keys()) {
+          const uPrefix = u.substring(0, term.length);
+          if (uPrefix.length >= 3) {
+            const dist = getEditDistance(term, uPrefix);
+            if (dist <= maxTypos) {
+              const fuzzyHits = byUnderlying.get(u);
+              if (fuzzyHits) {
+                for (const idx of fuzzyHits) termCandidates.add(idx);
+              }
+            }
+          }
+        }
+      }
+
       if (termCandidates.size > 0) termSets.push(termCandidates);
     }
 
@@ -397,6 +430,13 @@ const scoreInstrument = (inst, resolved, rawQuery) => {
     else if (underlying.startsWith(token)) score += 10;
     else if (sym.includes(token)) score += 6;
     else if (name.includes(token)) score += 4;
+    else if (token.length >= 4) {
+      const uPrefix = underlying.substring(0, Math.min(token.length, underlying.length));
+      if (uPrefix.length >= 3) {
+        const dist = getEditDistance(token, uPrefix);
+        if (dist <= (token.length >= 6 ? 2 : 1)) score += 5;
+      }
+    }
   }
 
   if (resolved.instrumentTypes.length > 0) {
@@ -468,12 +508,13 @@ const scoreAndRank = (candidateSet, resolved, rawQuery, topK) => {
 const groupResults = (instruments) => {
   const groups = {
     'Index': [], 'Futures': [], 'Call Options (CE)': [],
-    'Put Options (PE)': [], 'Equity': [], 'Other': []
+    'Put Options (PE)': [], 'MCX-OPT': [], 'Equity': [], 'Other': []
   };
 
   for (const inst of instruments) {
     if (inst.segment === 'INDICES' || inst.instrument_type === 'IDX') groups['Index'].push(inst);
     else if (inst.instrument_type === 'FUT') groups['Futures'].push(inst);
+    else if (inst.segment === 'MCX-OPT' || (inst.exchange === 'MCX' && (inst.instrument_type === 'CE' || inst.instrument_type === 'PE'))) groups['MCX-OPT'].push(inst);
     else if (inst.instrument_type === 'CE') groups['Call Options (CE)'].push(inst);
     else if (inst.instrument_type === 'PE') groups['Put Options (PE)'].push(inst);
     else if (inst.instrument_type === 'EQ') groups['Equity'].push(inst);

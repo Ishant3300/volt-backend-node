@@ -5,7 +5,7 @@ const tradeController = require('../controllers/tradeController');
 const { getTradeReport } = require('../controllers/tradeReportController');
 const { getRejectionLog } = require('../controllers/rejectionLogController');
 const { getUserwisePositions } = require('../controllers/userwisePositionController');
-const { getScriptQtyDetails, getAllLots } = require('../controllers/scriptQtyDetailController');
+const { getScriptQtyDetails, getAllLots, getInstrumentLimit } = require('../controllers/scriptQtyDetailController');
 const { getDeletedTrades } = require('../controllers/deletedTradeController');
 
 // All trade routes require authentication
@@ -40,6 +40,7 @@ router.get('/script-qty-details', getScriptQtyDetails);
 
 // All lots overview (admin/master read-only)
 router.get('/script-qty-all-lots', getAllLots);
+router.get('/instrument-limit', getInstrumentLimit);
 
 // Deleted trades history
 router.get('/deleted-trades', getDeletedTrades);

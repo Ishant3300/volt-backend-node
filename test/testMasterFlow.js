@@ -34,7 +34,7 @@ const testConfig = {
     note: 'Parent master with add_master permission',
     pnl_sharing: 70.0,
     brokerage_sharing: 50.0,
-    exchanges_allowed: ['nse', 'mcx', 'sgx', 'callput'],
+    exchanges_allowed: ['NFO-FUT', 'NFO-OPT', 'MCX-FUT', 'MCX-OPT', 'GLOBAL'],
     trade_limit: ['nse', 'mcx', 'sgx'],
     add_master: true, // Can create child masters
     change_pass_on_first_login: false,
@@ -147,7 +147,7 @@ async function apiCall(method, endpoint, data = null, token = null) {
 async function testAdminLogin() {
   console.log('\n📝 Test 1: Admin Login');
   const result = await apiCall('POST', '/auth/admin/login', testConfig.adminCredentials);
-  
+
   if (result.success && result.data.success) {
     adminToken = result.data.data.token;
     console.log('✅ Admin login successful');
@@ -163,7 +163,7 @@ async function testAdminLogin() {
 async function testCreateParentMaster() {
   console.log('\n📝 Test 2: Create Parent Master (by Admin)');
   const result = await apiCall('POST', '/masters', testConfig.parentMasterData, adminToken);
-  
+
   if (result.success && result.data.success) {
     parentMasterId = result.data.data.id;
     console.log('✅ Parent master created successfully');
@@ -187,9 +187,9 @@ async function testParentMasterLogin() {
     username: testConfig.parentMasterData.username,
     password: testConfig.parentMasterData.password
   };
-  
+
   const result = await apiCall('POST', '/auth/master/login', credentials);
-  
+
   if (result.success && result.data.success) {
     parentMasterToken = result.data.data.token;
     console.log('✅ Parent master login successful');
@@ -207,7 +207,7 @@ async function testParentMasterLogin() {
 async function testCreateChildMaster() {
   console.log('\n📝 Test 4: Create Child Master (by Parent Master)');
   const result = await apiCall('POST', '/master/masters', testConfig.childMasterData, parentMasterToken);
-  
+
   if (result.success && result.data.success) {
     childMasterId = result.data.data.id;
     console.log('✅ Child master created successfully');
@@ -228,7 +228,7 @@ async function testCreateChildMaster() {
 async function testCreateUser() {
   console.log('\n📝 Test 5: Create User (by Parent Master)');
   const result = await apiCall('POST', '/master/users', testConfig.userData, parentMasterToken);
-  
+
   if (result.success && result.data.success) {
     userId = result.data.data.id;
     console.log('✅ User created successfully');
@@ -250,7 +250,7 @@ async function testCreateUser() {
 async function testGetAllChildMasters() {
   console.log('\n📝 Test 6: Get All Child Masters');
   const result = await apiCall('GET', '/master/masters?page=1&limit=10', null, parentMasterToken);
-  
+
   if (result.success && result.data.success) {
     console.log('✅ Child masters retrieved successfully');
     console.log('   Total:', result.data.data.total);
@@ -270,7 +270,7 @@ async function testGetAllChildMasters() {
 async function testGetAllUsers() {
   console.log('\n📝 Test 7: Get All Users');
   const result = await apiCall('GET', '/master/users?page=1&limit=10', null, parentMasterToken);
-  
+
   if (result.success && result.data.success) {
     console.log('✅ Users retrieved successfully');
     console.log('   Total:', result.data.data.total);
@@ -289,19 +289,19 @@ async function testGetAllUsers() {
 // Test 8: Credit Child Master
 async function testCreditChildMaster() {
   console.log('\n📝 Test 8: Credit Child Master');
-  
+
   if (!childMasterId) {
     console.log('⚠️  Skipping - no child master created');
     return true; // Skip if no child master
   }
-  
+
   const creditData = {
     amount: 15000,
     note: 'Monthly credit allocation'
   };
-  
+
   const result = await apiCall('POST', `/master/masters/${childMasterId}/credit`, creditData, parentMasterToken);
-  
+
   if (result.success && result.data.success) {
     console.log('✅ Credit added successfully');
     console.log('   Previous Credits:', result.data.data.previous_credits);
@@ -318,19 +318,19 @@ async function testCreditChildMaster() {
 // Test 9: Debit Child Master
 async function testDebitChildMaster() {
   console.log('\n📝 Test 9: Debit Child Master');
-  
+
   if (!childMasterId) {
     console.log('⚠️  Skipping - no child master created');
     return true; // Skip if no child master
   }
-  
+
   const debitData = {
     amount: 5000,
     note: 'Settlement adjustment'
   };
-  
+
   const result = await apiCall('POST', `/master/masters/${childMasterId}/debit`, debitData, parentMasterToken);
-  
+
   if (result.success && result.data.success) {
     console.log('✅ Amount debited successfully');
     console.log('   Previous Credits:', result.data.data.previous_credits);
@@ -351,9 +351,9 @@ async function testCreditUser() {
     amount: 5000,
     note: 'Trading credit allocation'
   };
-  
+
   const result = await apiCall('POST', `/master/users/${userId}/credit`, creditData, parentMasterToken);
-  
+
   if (result.success && result.data.success) {
     console.log('✅ Credit added successfully');
     console.log('   Previous Credits:', result.data.data.previous_credits);
@@ -373,9 +373,9 @@ async function testDebitUser() {
     amount: 2000,
     note: 'Fee deduction'
   };
-  
+
   const result = await apiCall('POST', `/master/users/${userId}/debit`, debitData, parentMasterToken);
-  
+
   if (result.success && result.data.success) {
     console.log('✅ Amount debited successfully');
     console.log('   Previous Credits:', result.data.data.previous_credits);
@@ -391,12 +391,12 @@ async function testDebitUser() {
 // Test 12: Update Child Master Permissions
 async function testUpdateChildMasterPermissions() {
   console.log('\n📝 Test 12: Update Child Master Permissions');
-  
+
   if (!childMasterId) {
     console.log('⚠️  Skipping - no child master created');
     return true; // Skip if no child master
   }
-  
+
   const permissions = {
     permissions: {
       account_summary: false,
@@ -404,9 +404,9 @@ async function testUpdateChildMasterPermissions() {
       bet: false
     }
   };
-  
+
   const result = await apiCall('PUT', `/master/masters/${childMasterId}/permissions`, permissions, parentMasterToken);
-  
+
   if (result.success && result.data.success) {
     console.log('✅ Permissions updated successfully');
     console.log('   Updated permissions:', result.data.data.permissions);
@@ -420,12 +420,12 @@ async function testUpdateChildMasterPermissions() {
 // Test 13: Update Child Master Details
 async function testUpdateChildMasterDetails() {
   console.log('\n📝 Test 13: Update Child Master Details');
-  
+
   if (!childMasterId) {
     console.log('⚠️  Skipping - no child master created');
     return true; // Skip if no child master
   }
-  
+
   const updateData = {
     name: 'Child Master One Updated',
     credits: 45000,
@@ -433,9 +433,9 @@ async function testUpdateChildMasterDetails() {
     exchanges_allowed: ['nse', 'mcx', 'sgx'],
     trade_limit: ['nse', 'mcx']
   };
-  
+
   const result = await apiCall('PUT', `/master/masters/${childMasterId}/details`, updateData, parentMasterToken);
-  
+
   if (result.success && result.data.success) {
     console.log('✅ Master details updated successfully');
     console.log('   Name:', result.data.data.name);
@@ -466,9 +466,9 @@ async function testUpdateUserDetails() {
     ],
     trade_limit: ['nse', 'mcx']
   };
-  
+
   const result = await apiCall('PUT', `/master/users/${userId}/details`, updateData, parentMasterToken);
-  
+
   if (result.success && result.data.success) {
     console.log('✅ User details updated successfully');
     console.log('   Name:', result.data.data.name);
@@ -485,14 +485,14 @@ async function testUpdateUserDetails() {
 // Test 15: Get Child Master Position
 async function testGetChildMasterPosition() {
   console.log('\n📝 Test 15: Get Child Master Position');
-  
+
   if (!childMasterId) {
     console.log('⚠️  Skipping - no child master created');
     return true; // Skip if no child master
   }
-  
+
   const result = await apiCall('GET', `/master/masters/${childMasterId}/position`, null, parentMasterToken);
-  
+
   if (result.success && result.data.success) {
     console.log('✅ Child master position retrieved successfully');
     console.log('   Realised P&L:', result.data.data.position.realised_pnl);
@@ -512,7 +512,7 @@ async function testGetChildMasterPosition() {
 async function testGetUserPosition() {
   console.log('\n📝 Test 16: Get User Position');
   const result = await apiCall('GET', `/master/users/${userId}/position`, null, parentMasterToken);
-  
+
   if (result.success && result.data.success) {
     console.log('✅ User position retrieved successfully');
     console.log('   Realised P&L:', result.data.data.position.realised_pnl);
@@ -530,7 +530,7 @@ async function testGetUserPosition() {
 async function testGetAllTrades() {
   console.log('\n📝 Test 17: Get All Trades in Hierarchy');
   const result = await apiCall('GET', '/master/trades?page=1&limit=50', null, parentMasterToken);
-  
+
   if (result.success && result.data.success) {
     console.log('✅ Trades retrieved successfully');
     console.log('   Total:', result.data.data.total);
@@ -550,19 +550,19 @@ async function testGetAllTrades() {
 // Test 18: Send Message to Child Master
 async function testSendMessageToChildMaster() {
   console.log('\n📝 Test 18: Send Message to Child Master');
-  
+
   if (!childMasterId) {
     console.log('⚠️  Skipping - no child master created');
     return true; // Skip if no child master
   }
-  
+
   const message = {
     subject: 'Credit Update',
     message: 'Your credit has been updated. Please check your account.'
   };
-  
+
   const result = await apiCall('POST', `/master/masters/${childMasterId}/messages`, message, parentMasterToken);
-  
+
   if (result.success && result.data.success) {
     messageId = result.data.data.id;
     console.log('✅ Message sent successfully');
@@ -583,9 +583,9 @@ async function testSendMessageToUser() {
     subject: 'Trading Alert',
     message: 'Please review your trading limits and positions.'
   };
-  
+
   const result = await apiCall('POST', `/master/users/${userId}/messages`, message, parentMasterToken);
-  
+
   if (result.success && result.data.success) {
     console.log('✅ Message sent successfully');
     console.log('   Message ID:', result.data.data.id);
@@ -600,14 +600,14 @@ async function testSendMessageToUser() {
 // Test 20: Get Child Master by ID
 async function testGetChildMasterById() {
   console.log('\n📝 Test 20: Get Child Master by ID');
-  
+
   if (!childMasterId) {
     console.log('⚠️  Skipping - no child master created');
     return true; // Skip if no child master
   }
-  
+
   const result = await apiCall('GET', `/master/masters/${childMasterId}`, null, parentMasterToken);
-  
+
   if (result.success && result.data.success) {
     console.log('✅ Child master retrieved successfully');
     console.log('   Name:', result.data.data.name);
@@ -626,7 +626,7 @@ async function testGetChildMasterById() {
 async function testGetUserById() {
   console.log('\n📝 Test 21: Get User by ID');
   const result = await apiCall('GET', `/master/users/${userId}`, null, parentMasterToken);
-  
+
   if (result.success && result.data.success) {
     console.log('✅ User retrieved successfully');
     console.log('   Name:', result.data.data.name);
@@ -645,7 +645,7 @@ async function testGetUserById() {
 async function runAllTests() {
   console.log('🚀 Starting Master Flow Tests...');
   console.log('================================');
-  
+
   const tests = [
     testAdminLogin,
     testCreateParentMaster,
@@ -669,10 +669,10 @@ async function runAllTests() {
     testGetChildMasterById,
     testGetUserById
   ];
-  
+
   let passed = 0;
   let failed = 0;
-  
+
   for (const test of tests) {
     const result = await test();
     if (result) {
@@ -682,7 +682,7 @@ async function runAllTests() {
     }
     await new Promise(resolve => setTimeout(resolve, 500)); // Small delay between tests
   }
-  
+
   console.log('\n================================');
   console.log('📊 Test Results:');
   console.log(`   ✅ Passed: ${passed}`);

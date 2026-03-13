@@ -29,10 +29,10 @@ const createUser = async (req, res) => {
     } = req.body;
 
     // Validate required fields
-    if (!name || !username || !password || !server_id || credits === undefined || !note || pnl_sharing === undefined || brokerage_sharing === undefined || !exchanges_allowed || !trade_limit) {
+    if (!name || !username || !password || !server_id || credits === undefined || pnl_sharing === undefined || brokerage_sharing === undefined || !exchanges_allowed || !trade_limit) {
       return res.status(400).json({
         success: false,
-        message: 'Name, username, password, credits, note, pnl_sharing, brokerage_sharing, exchanges_allowed, trade_limit, and server_id are required',
+        message: 'Name, username, password, credits, pnl_sharing, brokerage_sharing, exchanges_allowed, trade_limit, and server_id are required',
         data: null
       });
     }
@@ -79,12 +79,20 @@ const createUser = async (req, res) => {
       }
     }
 
-    const normalizedExchangesAllowed = exchanges_allowed.map(ex => ({
-      ...ex,
-      exchange_name: ex.exchange_name.toUpperCase()
-    }));
+    const normalizedExchangesAllowed = exchanges_allowed.map(ex => {
+      let name = ex.exchange_name.toUpperCase();
+      if (name === 'GLOBAL') name = 'INDICES';
+      return {
+        ...ex,
+        exchange_name: name
+      };
+    });
 
-    const normalizedTradeLimit = trade_limit.map(ex => ex.toUpperCase());
+    const normalizedTradeLimit = trade_limit.map(ex => {
+      let name = ex.toUpperCase();
+      if (name === 'GLOBAL') name = 'INDICES';
+      return name;
+    });
 
     let resultData;
 
@@ -94,6 +102,14 @@ const createUser = async (req, res) => {
 
       if (!parentMaster) {
         throw new Error('Parent master not found');
+      }
+
+      // Account limit enforcement
+      if (parentMaster.account_limit && parentMaster.account_limit.enabled) {
+        const usersCreated = await User.countDocuments({ master_id: parentMaster._id, deleted_at: null }).session(session);
+        if (usersCreated >= parentMaster.account_limit.max_users) {
+          throw new Error(`Account limit reached. Maximum ${parentMaster.account_limit.max_users} users allowed.`);
+        }
       }
 
       // Check if parent master has sufficient balance
@@ -189,7 +205,7 @@ const createUser = async (req, res) => {
 
     let statusCode = 500;
     if (error.message === 'Parent master not found' || error.message === 'Server not found') statusCode = 404;
-    else if (error.message.includes('Insufficient balance') || error.message.includes('Username already exists')) statusCode = 400;
+    else if (error.message.includes('Insufficient balance') || error.message.includes('Username already exists') || error.message.includes('Account limit reached')) statusCode = 400;
 
     res.status(statusCode).json({
       success: false,
@@ -373,16 +389,24 @@ const updateUserDetails = async (req, res) => {
         }
       }
 
-      // Normalize exchange names to uppercase
-      user.exchanges_allowed = exchanges_allowed.map(ex => ({
-        ...ex,
-        exchange_name: ex.exchange_name.toUpperCase()
-      }));
+      // Normalize exchange names to uppercase and map GLOBAL to INDICES
+      user.exchanges_allowed = exchanges_allowed.map(ex => {
+        let name = ex.exchange_name.toUpperCase();
+        if (name === 'GLOBAL') name = 'INDICES';
+        return {
+          ...ex,
+          exchange_name: name
+        };
+      });
     }
 
-    // Normalize trade_limit to uppercase if provided
+    // Normalize trade_limit to uppercase and map GLOBAL to INDICES if provided
     if (trade_limit) {
-      user.trade_limit = trade_limit.map(ex => ex.toUpperCase());
+      user.trade_limit = trade_limit.map(ex => {
+        let name = ex.toUpperCase();
+        if (name === 'GLOBAL') name = 'INDICES';
+        return name;
+      });
     }
 
     if (name) user.name = name;

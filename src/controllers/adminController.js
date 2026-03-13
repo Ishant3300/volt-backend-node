@@ -335,21 +335,17 @@ const createGroupedQuantity = async (req, res) => {
       });
     }
 
-    const groupedQty = await GroupedQuantity.create({
-      exchange_name,
-      lot_name,
-      instrument_id,
-      instrument_symbol,
-      max_qty,
-      break_qty,
-      lot_size
-    });
+    const groupedQty = await GroupedQuantity.findOneAndUpdate(
+      { exchange_name, lot_name, instrument_symbol, deleted_at: null },
+      { exchange_name, lot_name, instrument_id, instrument_symbol, max_qty, break_qty, lot_size, deleted_at: null },
+      { upsert: true, new: true, setDefaultsOnInsert: true }
+    );
 
-    console.log('✅ Grouped quantity created:', groupedQty._id);
+    console.log('✅ Grouped quantity upserted:', groupedQty._id);
 
     res.status(201).json({
       success: true,
-      message: 'Grouped quantity created successfully',
+      message: 'Grouped quantity saved successfully',
       data: groupedQty.toJSON()
     });
   } catch (error) {
@@ -513,17 +509,15 @@ const createScriptQuantity = async (req, res) => {
       });
     }
 
-    const scriptQty = await ScriptQuantity.create({
-      exchange_name,
-      script_name,
-      lot_size,
-      max_qty,
-      brk_qty
-    });
+    const scriptQty = await ScriptQuantity.findOneAndUpdate(
+      { exchange_name, script_name, deleted_at: null },
+      { exchange_name, script_name, lot_size, max_qty, brk_qty, deleted_at: null },
+      { upsert: true, new: true, setDefaultsOnInsert: true }
+    );
 
     res.status(201).json({
       success: true,
-      message: 'Script quantity created successfully',
+      message: 'Script quantity saved successfully',
       data: scriptQty.toJSON()
     });
   } catch (error) {
@@ -684,16 +678,15 @@ const createTradeMargin = async (req, res) => {
       });
     }
 
-    const tradeMarginDoc = await TradeMargin.create({
-      exchange_name,
-      script_name,
-      amount_type,
-      trade_margin
-    });
+    const tradeMarginDoc = await TradeMargin.findOneAndUpdate(
+      { exchange_name, script_name, amount_type, deleted_at: null },
+      { exchange_name, script_name, amount_type, trade_margin, deleted_at: null },
+      { upsert: true, new: true, setDefaultsOnInsert: true }
+    );
 
     res.status(201).json({
       success: true,
-      message: 'Trade margin created successfully',
+      message: 'Trade margin saved successfully',
       data: tradeMarginDoc.toJSON()
     });
   } catch (error) {
@@ -851,18 +844,15 @@ const createBrokerageSettings = async (req, res) => {
       });
     }
 
-    const newBrokerageSettings = new BrokerageSettings({
-      type,
-      exchange_name,
-      script_name,
-      brk_value
-    });
-
-    await newBrokerageSettings.save();
+    const newBrokerageSettings = await BrokerageSettings.findOneAndUpdate(
+      { type, exchange_name, script_name, deleted_at: null },
+      { type, exchange_name, script_name, brk_value, deleted_at: null },
+      { upsert: true, new: true, setDefaultsOnInsert: true }
+    );
 
     res.status(201).json({
       success: true,
-      message: 'Brokerage settings created successfully',
+      message: 'Brokerage settings saved successfully',
       data: newBrokerageSettings.toJSON()
     });
   } catch (error) {

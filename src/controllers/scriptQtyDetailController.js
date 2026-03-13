@@ -104,6 +104,111 @@ const getScriptQtyDetails = async (req, res) => {
 };
 
 /**
+ * GET /api/trade/instrument-limit
+ * Returns specific lot/turnover limits for a single instrument
+ * Query params: segment (required), instrument_id (required), user_id (optional for admin/master)
+ */
+const getInstrumentLimit = async (req, res) => {
+  try {
+    const { segment, instrument_id } = req.query;
+    const role = req.admin ? 'admin' : req.master ? 'master' : 'user';
+    let targetUserId;
+
+    if (role === 'user') {
+      targetUserId = req.user.id;
+    } else {
+      targetUserId = req.query.user_id;
+    }
+
+    if (!segment || !instrument_id) {
+      return res.status(400).json({
+        success: false,
+        message: 'segment and instrument_id are required'
+      });
+    }
+
+    if (!targetUserId) {
+      return res.status(400).json({
+        success: false,
+        message: 'user_id required'
+      });
+    }
+
+    const user = await User.findById(targetUserId).select('exchanges_allowed');
+    if (!user || user.deleted_at) {
+      return res.status(404).json({ success: false, message: 'User not found' });
+    }
+
+    // Find if the user is allowed this segment (map GLOBAL to INDICES)
+    const normalizedSegment = segment.toUpperCase() === 'GLOBAL' ? 'INDICES' : segment.toUpperCase();
+    const allowedExchange = user.exchanges_allowed.find(ex =>
+      ex.exchange_name.toUpperCase() === normalizedSegment
+    );
+
+    if (!allowedExchange) {
+      return res.status(403).json({
+        success: false,
+        message: `Exchange/Segment ${segment} not allowed for this user`,
+        data: null
+      });
+    }
+
+    let limit = null;
+
+    // 1. Try GroupedQuantity first (if user has a lot assignment)
+    if (allowedExchange.group_name) {
+      limit = await GroupedQuantity.findOne({
+        exchange_name: normalizedSegment,
+        lot_name: allowedExchange.group_name,
+        instrument_id: instrument_id,
+        deleted_at: null
+      }).lean();
+    }
+
+    // 2. Fallback to ScriptQuantity (global script-level limits) if not found in grouped
+    if (!limit) {
+      // We need the symbol to search ScriptQuantity, but we only have ID.
+      // However, usually we can search by exchange_name in ScriptQuantity
+      // but let's see if we can get the instrument first to get the symbol.
+      // Wait, let's keep it simple for now as per user request: 
+      // "Match the segment feild of the instrument to the exchange_name feild of GroupedQuanity 
+      // then match the instrument id... you will get the details"
+    }
+
+    if (!limit) {
+      return res.status(200).json({
+        success: true,
+        message: 'No specific limit found',
+        data: {
+          exchange_name: segment,
+          turnover: allowedExchange.turnover,
+          lot: allowedExchange.lot,
+          limit: null
+        }
+      });
+    }
+
+    res.status(200).json({
+      success: true,
+      data: {
+        exchange_name: segment,
+        turnover: allowedExchange.turnover,
+        lot: allowedExchange.lot,
+        limit: {
+          max_qty: limit.max_qty,
+          break_qty: limit.break_qty,
+          lot_size: limit.lot_size,
+          instrument_symbol: limit.instrument_symbol
+        }
+      }
+    });
+
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+/**
  * GET /api/trade/script-qty-all-lots
  * Admin/Master read-only view: returns ALL lot names grouped by exchange
  * with their instruments from GroupedQuantity + ScriptQuantity.
@@ -173,4 +278,4 @@ const getAllLots = async (req, res) => {
   }
 };
 
-module.exports = { getScriptQtyDetails, getAllLots };
+module.exports = { getScriptQtyDetails, getAllLots, getInstrumentLimit };
