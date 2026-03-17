@@ -6,6 +6,8 @@ const {
   getUserById,
   updateUser,
   deleteUser,
+  creditUserByAdmin,
+  debitUserByAdmin,
   // Grouped Quantity
   createGroupedQuantity,
   getAllGroupedQuantities,
@@ -43,6 +45,8 @@ router.get('/users', authenticateAdminOrMaster, getAllUsers);
 router.get('/users/:id', authenticateAdminOrMaster, getUserById);
 router.put('/users/:id', updateUser);
 router.delete('/users/:id', authenticateMaster, deleteUser);
+router.post('/users/:id/credit', authenticateAdmin, creditUserByAdmin);
+router.post('/users/:id/debit', authenticateAdmin, debitUserByAdmin);
 
 // Grouped Quantity CRUD operations
 router.post('/grouped-quantities', authenticateAdmin, createGroupedQuantity);

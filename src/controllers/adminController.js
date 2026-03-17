@@ -299,13 +299,96 @@ const deleteUser = async (req, res) => {
   }
 };
 
-module.exports = {
-  createUser,
-  getAllUsers,
-  getUserById,
-  updateUser,
-  deleteUser
+// ============================================
+// Credit / Debit User (Admin only)
+// ============================================
+
+const creditUserByAdmin = async (req, res) => {
+  const session = await mongoose.startSession();
+  try {
+    const { id } = req.params;
+    const { amount, note } = req.body;
+    if (!amount || amount <= 0) {
+      return res.status(400).json({ success: false, message: 'amount must be a positive number', data: null });
+    }
+
+    let result;
+    await session.withTransaction(async () => {
+      const user = await User.findById(id).session(session);
+      if (!user || user.deleted_at) throw new Error('User not found');
+
+      const balanceBefore = user.balance;
+      user.balance += amount;
+      if (user.credits < user.balance) user.credits = user.balance;
+      await user.save({ session });
+
+      const tx = new Transaction({
+        transactionId: `TXN_${Date.now()}_${Math.random().toString(36).substr(2, 6)}_AC`,
+        userId: user._id,
+        userModel: 'User',
+        type: 'CREDIT',
+        status: 'SUCCESS',
+        amount,
+        referenceId: req.admin ? req.admin.id : null,
+        referenceModel: 'Admin',
+        balanceBefore,
+        balanceAfter: user.balance,
+        metadata: { note: note || 'Admin credit', credited_by: req.admin?.username }
+      });
+      await tx.save({ session });
+      result = { new_balance: user.balance, amount_credited: amount };
+    });
+    session.endSession();
+    res.status(200).json({ success: true, message: 'Amount credited successfully', data: result });
+  } catch (error) {
+    session.endSession();
+    res.status(error.message === 'User not found' ? 404 : 500).json({ success: false, message: error.message, data: null });
+  }
 };
+
+const debitUserByAdmin = async (req, res) => {
+  const session = await mongoose.startSession();
+  try {
+    const { id } = req.params;
+    const { amount, note } = req.body;
+    if (!amount || amount <= 0) {
+      return res.status(400).json({ success: false, message: 'amount must be a positive number', data: null });
+    }
+
+    let result;
+    await session.withTransaction(async () => {
+      const user = await User.findById(id).session(session);
+      if (!user || user.deleted_at) throw new Error('User not found');
+
+      const balanceBefore = user.balance;
+      user.balance -= amount;
+      await user.save({ session });
+
+      const tx = new Transaction({
+        transactionId: `TXN_${Date.now()}_${Math.random().toString(36).substr(2, 6)}_AD`,
+        userId: user._id,
+        userModel: 'User',
+        type: 'DEBIT',
+        status: 'SUCCESS',
+        amount,
+        referenceId: req.admin ? req.admin.id : null,
+        referenceModel: 'Admin',
+        balanceBefore,
+        balanceAfter: user.balance,
+        metadata: { note: note || 'Admin debit', debited_by: req.admin?.username }
+      });
+      await tx.save({ session });
+      result = { new_balance: user.balance, amount_debited: amount };
+    });
+    session.endSession();
+    res.status(200).json({ success: true, message: 'Amount debited successfully', data: result });
+  } catch (error) {
+    session.endSession();
+    res.status(error.message === 'User not found' ? 404 : 500).json({ success: false, message: error.message, data: null });
+  }
+};
+
+
 
 // ============================================
 // Grouped Quantity CRUD Operations
@@ -1001,6 +1084,8 @@ module.exports = {
   getUserById,
   updateUser,
   deleteUser,
+  creditUserByAdmin,
+  debitUserByAdmin,
   // Grouped Quantity
   createGroupedQuantity,
   getAllGroupedQuantities,

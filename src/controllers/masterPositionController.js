@@ -221,14 +221,32 @@ const getInstrumentUserBreakdown = async (req, res) => {
   }
 };
 
+const _getLivePricesFromKite = async (instrumentTokens) => {
+  if (!instrumentTokens || instrumentTokens.length === 0) return new Map();
+  try {
+    const { getLatestQuotes } = require('../services/kiteService');
+    const quotes = await getLatestQuotes(instrumentTokens, 100);
+    const ltpMap = new Map();
+    quotes.forEach(q => {
+      ltpMap.set(q.instrument_token.toString(), q.last_price);
+      ltpMap.set(parseInt(q.instrument_token), q.last_price);
+    });
+    return ltpMap;
+  } catch (err) {
+    console.error('Error fetching live quotes for metrics fallback:', err.message);
+    return new Map();
+  }
+};
+
 /**
  * Get full position metrics for all child users of the logged-in master.
- * Computes the same 6 metrics as the user's orders page:
- *   - Position P&L (floating), Realised P&L, M2M P&L, Credit, Margin Used, Equity
- * Returns per-user across ALL their instruments.
+ * Computes the same 6 metrics as the user's orders page.
+ * Uses tradeMetricsService for consistent FIFO P&L calculation.
  */
 const getUserMetrics = async (req, res) => {
   try {
+    const tradeMetricsService = require('../services/tradeMetricsService');
+
     // Admin passes ?master_id=xxx to view a specific master's users
     // Or ?user_id=xxx to view a single user's metrics
     const masterId = req.master?.id ?? req.query.master_id;
@@ -236,162 +254,47 @@ const getUserMetrics = async (req, res) => {
 
     let childUsers;
     if (singleUserId) {
-      // Fetch single user by ID
       const user = await User.findOne({ _id: singleUserId, deleted_at: null })
         .select('_id name username credits balance');
       childUsers = user ? [user] : [];
     } else if (masterId) {
-      // Get all child users with credit/balance
       childUsers = await User.find({
         master_id: masterId,
         deleted_at: null
       }).select('_id name username credits balance');
     } else {
-      // Admin without filter: return empty (or could return all users)
-      return res.status(200).json({
-        success: true,
-        message: 'No master_id or user_id provided',
-        data: []
-      });
+      return res.status(200).json({ success: true, data: [] });
+    }
+
+    if (childUsers.length === 0) {
+      return res.status(200).json({ success: true, data: [] });
     }
 
     const childUserIds = childUsers.map(u => u._id);
 
-    if (childUserIds.length === 0) {
-      return res.status(200).json({
-        success: true,
-        message: 'No child users found',
-        data: []
-      });
-    }
-
-    // Get margin rules
-    const marginRules = await TradeMargin.find({ deleted_at: null });
-    const marginMap = {};
-    marginRules.forEach(m => {
-      marginMap[m.exchange_name] = {
-        amount_type: m.amount_type,
-        trade_margin: m.trade_margin
-      };
-    });
-
-    // Get all completed trades for all child users
-    const trades = await Trade.find({
+    // Find all active instrument_tokens for these users to fetch LTPs
+    const activeTokens = await Trade.distinct('instrument_token', {
       user_id: { $in: childUserIds },
       status: 'completed',
       deleted_at: null
-    }).select('user_id instrument_token tradingsymbol exchange transaction_type executed_quantity executed_price').lean();
+    });
 
-    // Group trades by user_id, then by instrument_token
-    const userTradeMap = {};
-    for (const t of trades) {
-      const uid = t.user_id.toString();
-      if (!userTradeMap[uid]) userTradeMap[uid] = {};
-      const iToken = t.instrument_token;
-      if (!userTradeMap[uid][iToken]) {
-        userTradeMap[uid][iToken] = {
-          exchange: t.exchange,
-          tradingsymbol: t.tradingsymbol,
-          totalBuyQty: 0,
-          totalSellQty: 0,
-          totalBuyValue: 0,
-          totalSellValue: 0
+    const ltpMap = await _getLivePricesFromKite(activeTokens.map(t => parseInt(t)));
+
+    // Compute metrics per user using the centralized service
+    const result = await Promise.all(childUsers.map(async (user) => {
+      try {
+        return await tradeMetricsService.getUserMetrics(user._id, ltpMap);
+      } catch (err) {
+        console.error(`Error computing metrics for user ${user._id}:`, err.message);
+        return {
+          user_id: user._id,
+          name: user.name,
+          username: user.username,
+          error: 'Failed to compute metrics'
         };
       }
-      const agg = userTradeMap[uid][iToken];
-      if (t.transaction_type === 'BUY') {
-        agg.totalBuyQty += t.executed_quantity;
-        agg.totalBuyValue += t.executed_quantity * t.executed_price;
-      } else if (t.transaction_type === 'SELL') {
-        agg.totalSellQty += t.executed_quantity;
-        agg.totalSellValue += t.executed_quantity * t.executed_price;
-      }
-    }
-
-    // Compute metrics per user
-    const result = childUsers.map(user => {
-      const uid = user._id.toString();
-      const instruments = userTradeMap[uid] || {};
-      const balance = user.balance || 0;
-
-      let totalRealised = 0;
-      let totalFloating = 0;
-      let totalMargin = 0;
-      const positions = [];
-
-      for (const [iToken, agg] of Object.entries(instruments)) {
-        const netQty = agg.totalBuyQty - agg.totalSellQty;
-        const avgBuyPrice = agg.totalBuyQty > 0 ? agg.totalBuyValue / agg.totalBuyQty : 0;
-        const avgSellPrice = agg.totalSellQty > 0 ? agg.totalSellValue / agg.totalSellQty : 0;
-
-        // Use avgBuyPrice as fallback LTP (no live price on backend)
-        const ltp = avgBuyPrice > 0 ? avgBuyPrice : avgSellPrice;
-
-        let realised = 0;
-        let floating = 0;
-
-        if (netQty > 0) {
-          realised = agg.totalSellValue - (agg.totalSellQty * avgBuyPrice);
-          floating = (ltp - avgBuyPrice) * netQty;
-        } else if (netQty < 0) {
-          realised = (agg.totalBuyQty * avgSellPrice) - agg.totalBuyValue;
-          floating = (avgSellPrice - ltp) * Math.abs(netQty);
-        } else {
-          realised = agg.totalSellValue - agg.totalBuyValue;
-          floating = 0;
-        }
-
-        totalRealised += realised;
-        totalFloating += floating;
-
-        // Margin calculation
-        if (netQty !== 0) {
-          const rule = marginMap[agg.exchange];
-          if (rule) {
-            if (rule.amount_type === 'percentage') {
-              const contractValue = Math.abs(netQty) * ltp;
-              totalMargin += (contractValue * rule.trade_margin) / 100;
-            } else {
-              totalMargin += Math.abs(netQty) * rule.trade_margin;
-            }
-          }
-        }
-
-        if (netQty !== 0) {
-          positions.push({
-            instrument_token: iToken,
-            tradingsymbol: agg.tradingsymbol,
-            exchange: agg.exchange,
-            net_qty: netQty,
-            avg_buy_price: Math.round(avgBuyPrice * 100) / 100,
-            avg_sell_price: Math.round(avgSellPrice * 100) / 100,
-            total_buy_qty: agg.totalBuyQty,
-            total_sell_qty: agg.totalSellQty,
-            total_buy_value: Math.round(agg.totalBuyValue * 100) / 100,
-            total_sell_value: Math.round(agg.totalSellValue * 100) / 100
-          });
-        }
-      }
-
-      const m2m = totalRealised + totalFloating;
-      const equity = balance + m2m;
-      const freeMargin = equity - totalMargin;
-
-      return {
-        user_id: uid,
-        name: user.name,
-        username: user.username,
-        credit: user.credits || 0,
-        balance: balance,
-        realised_pnl: Math.round(totalRealised * 100) / 100,
-        position_pnl: Math.round(totalFloating * 100) / 100,
-        m2m_pnl: Math.round(m2m * 100) / 100,
-        margin_used: Math.round(totalMargin * 100) / 100,
-        equity: Math.round(equity * 100) / 100,
-        free_margin: Math.round(freeMargin * 100) / 100,
-        positions
-      };
-    });
+    }));
 
     res.status(200).json({
       success: true,
@@ -409,105 +312,70 @@ const getUserMetrics = async (req, res) => {
 
 /**
  * Admin endpoint: returns all masters with their users' positions
- * so the admin can see per-master live P&L.
+ * and aggregated P&L metrics per master.
  */
 const getAdminMasterMetrics = async (req, res) => {
   try {
-    // Get all active masters
-    const masters = await Master.find({ deleted_at: null })
-      .select('_id name username');
+    const tradeMetricsService = require('../services/tradeMetricsService');
+    const masters = await Master.find({ deleted_at: null }).select('_id name username');
 
     if (masters.length === 0) {
       return res.status(200).json({ success: true, data: [] });
     }
 
     const masterIds = masters.map(m => m._id);
-
-    // Get all users grouped by master
     const allUsers = await User.find({
       master_id: { $in: masterIds },
       deleted_at: null
-    }).select('_id name username master_id');
+    }).select('_id master_id');
 
-    // Group users by master_id
     const usersByMaster = {};
-    for (const u of allUsers) {
+    allUsers.forEach(u => {
       const mid = u.master_id.toString();
       if (!usersByMaster[mid]) usersByMaster[mid] = [];
-      usersByMaster[mid].push(u);
-    }
+      usersByMaster[mid].push(u._id);
+    });
 
-    const allUserIds = allUsers.map(u => u._id);
-
-    // Get all completed trades for all users
-    const trades = await Trade.find({
-      user_id: { $in: allUserIds },
-      status: 'completed',
-      deleted_at: null
-    }).select('user_id instrument_token tradingsymbol exchange transaction_type executed_quantity executed_price').lean();
-
-    // Group trades by user_id then instrument_token
-    const userTradeMap = {};
-    for (const t of trades) {
-      const uid = t.user_id.toString();
-      if (!userTradeMap[uid]) userTradeMap[uid] = {};
-      const iToken = t.instrument_token;
-      if (!userTradeMap[uid][iToken]) {
-        userTradeMap[uid][iToken] = {
-          exchange: t.exchange,
-          tradingsymbol: t.tradingsymbol,
-          totalBuyQty: 0, totalSellQty: 0,
-          totalBuyValue: 0, totalSellValue: 0
-        };
-      }
-      const agg = userTradeMap[uid][iToken];
-      if (t.transaction_type === 'BUY') {
-        agg.totalBuyQty += t.executed_quantity;
-        agg.totalBuyValue += t.executed_quantity * t.executed_price;
-      } else if (t.transaction_type === 'SELL') {
-        agg.totalSellQty += t.executed_quantity;
-        agg.totalSellValue += t.executed_quantity * t.executed_price;
-      }
-    }
-
-    // Build per-master result
-    const result = masters.map(master => {
+    const result = await Promise.all(masters.map(async (master) => {
       const mid = master._id.toString();
-      const users = usersByMaster[mid] || [];
-      const positions = []; // all open positions across this master's users
+      const userIds = usersByMaster[mid] || [];
 
-      for (const user of users) {
-        const uid = user._id.toString();
-        const instruments = userTradeMap[uid] || {};
-        for (const [iToken, agg] of Object.entries(instruments)) {
-          const netQty = agg.totalBuyQty - agg.totalSellQty;
-          if (netQty !== 0) {
-            positions.push({
-              instrument_token: iToken,
-              tradingsymbol: agg.tradingsymbol,
-              exchange: agg.exchange,
-              total_buy_qty: agg.totalBuyQty,
-              total_sell_qty: agg.totalSellQty,
-              total_buy_value: Math.round(agg.totalBuyValue * 100) / 100,
-              total_sell_value: Math.round(agg.totalSellValue * 100) / 100,
-              net_qty: netQty,
-              avg_buy_price: agg.totalBuyQty > 0
-                ? Math.round((agg.totalBuyValue / agg.totalBuyQty) * 100) / 100 : 0,
-              avg_sell_price: agg.totalSellQty > 0
-                ? Math.round((agg.totalSellValue / agg.totalSellQty) * 100) / 100 : 0
-            });
-          }
+      // Find active tokens for this master's users
+      const activeTokens = await Trade.distinct('instrument_token', {
+        user_id: { $in: userIds },
+        status: 'completed',
+        deleted_at: null
+      });
+
+      const ltpMap = await _getLivePricesFromKite(activeTokens.map(t => parseInt(t)));
+
+      // Fetch metrics for all users under this master
+      const userMetrics = await Promise.all(userIds.map(async (uid) => {
+        try {
+          return await tradeMetricsService.getUserMetrics(uid, ltpMap);
+        } catch (e) {
+          return null;
         }
-      }
+      }));
 
-      return {
+      const validMetrics = userMetrics.filter(m => m !== null);
+
+      // Aggregate master-level metrics
+      const masterMetrics = {
         master_id: mid,
         name: master.name,
         username: master.username,
-        user_count: users.length,
-        positions
+        user_count: userIds.length,
+        realised_pnl: Math.round(validMetrics.reduce((sum, m) => sum + m.realised_pnl, 0) * 100) / 100,
+        position_pnl: Math.round(validMetrics.reduce((sum, m) => sum + m.position_pnl, 0) * 100) / 100,
+        m2m_pnl: Math.round(validMetrics.reduce((sum, m) => sum + m.m2m_pnl, 0) * 100) / 100,
+        margin_used: Math.round(validMetrics.reduce((sum, m) => sum + m.margin_used, 0) * 100) / 100,
+        equity: Math.round(validMetrics.reduce((sum, m) => sum + m.equity, 0) * 100) / 100,
+        positions: [].concat(...validMetrics.map(m => m.positions))
       };
-    });
+
+      return masterMetrics;
+    }));
 
     res.status(200).json({ success: true, data: result });
   } catch (error) {
@@ -515,9 +383,11 @@ const getAdminMasterMetrics = async (req, res) => {
   }
 };
 
-module.exports = {
+const moduleExports = {
   getAggregatedPositions,
   getInstrumentUserBreakdown,
   getUserMetrics,
   getAdminMasterMetrics
 };
+
+module.exports = moduleExports;

@@ -46,48 +46,45 @@ class TradeMetricsService {
         let totalPositionPnl = 0;
         let totalMarginUsed = 0;
 
+        // #6 FIX: Realised P&L – sum the per-trade pnl field recorded at execution time.
+        // Each trade's pnl is computed correctly at execution using the FIFO closing logic.
+        // The old approach (avg-price aggregation) was inaccurate for multi-price trades.
+        const realisedPnlAgg = await Trade.aggregate([
+            { $match: { user_id: user._id, status: 'completed', deleted_at: null } },
+            { $group: { _id: null, total: { $sum: '$pnl' } } }
+        ]);
+        totalRealisedPnl = realisedPnlAgg.length > 0 ? realisedPnlAgg[0].total : 0;
+
         for (const position of trades) {
             const { total_buy_qty, total_sell_qty, total_buy_value, total_sell_value } = position;
             const instrumentToken = position._id.instrument_token;
 
             const netQty = total_buy_qty - total_sell_qty;
-            const ltp = ltpMap.get(instrumentToken) || (total_buy_qty > 0 ? total_buy_value / total_buy_qty : 0); // fallback to avg buy or 0
+            const ltp = ltpMap.get(instrumentToken) || (total_buy_qty > 0 ? total_buy_value / total_buy_qty : 0);
 
-            let realisedPnl = 0;
             let floatingPnl = 0;
 
             const avgBuyPrice = total_buy_qty > 0 ? total_buy_value / total_buy_qty : 0;
             const avgSellPrice = total_sell_qty > 0 ? total_sell_value / total_sell_qty : 0;
 
-            if (netQty > 0) { // Net Long
-                realisedPnl = total_sell_value - (total_sell_qty * avgBuyPrice);
+            if (netQty > 0) {
                 floatingPnl = (ltp - avgBuyPrice) * netQty;
-            } else if (netQty < 0) { // Net Short
-                realisedPnl = (total_buy_qty * avgSellPrice) - total_buy_value;
+            } else if (netQty < 0) {
                 floatingPnl = (avgSellPrice - ltp) * Math.abs(netQty);
-            } else { // Flat
-                realisedPnl = total_sell_value - total_buy_value;
-                floatingPnl = 0;
             }
 
-            totalRealisedPnl += realisedPnl;
             totalPositionPnl += floatingPnl;
 
             // Calculate Margin Used for open positions
             if (netQty !== 0) {
-                // Find TradeMargin rules
-                // Usually, exchange and script_name are used. 
-                // For simplicity, let's look up TradeMargin by exchange
                 const tradeMargin = await TradeMargin.findOne({ exchange_name: position._id.exchange });
 
                 let positionMargin = 0;
                 if (tradeMargin) {
                     if (tradeMargin.amount_type === 'percentage') {
-                        // percentage of contract value
                         const contractValue = Math.abs(netQty) * ltp;
                         positionMargin = (contractValue * tradeMargin.trade_margin) / 100;
                     } else {
-                        // flat amount per share/lot
                         positionMargin = Math.abs(netQty) * tradeMargin.trade_margin;
                     }
                 }
@@ -95,20 +92,47 @@ class TradeMetricsService {
             }
         }
 
+
+
         const m2mPnl = totalRealisedPnl + totalPositionPnl;
         const equity = balance + m2mPnl;
         const freeMargin = equity - totalMarginUsed;
 
+        // Map aggregated positions for return
+        const enrichedPositions = trades
+            .filter(t => (t.total_buy_qty - t.total_sell_qty) !== 0)
+            .map(p => {
+                const netQty = p.total_buy_qty - p.total_sell_qty;
+                const avgBuyPrice = p.total_buy_qty > 0 ? p.total_buy_value / p.total_buy_qty : 0;
+                const avgSellPrice = p.total_sell_qty > 0 ? p.total_sell_value / p.total_sell_qty : 0;
+                return {
+                    instrument_token: p._id.instrument_token,
+                    tradingsymbol: p._id.tradingsymbol,
+                    exchange: p._id.exchange,
+                    net_qty: netQty,
+                    avg_buy_price: Math.round(avgBuyPrice * 100) / 100,
+                    avg_sell_price: Math.round(avgSellPrice * 100) / 100,
+                    total_buy_qty: p.total_buy_qty,
+                    total_sell_qty: p.total_sell_qty,
+                    total_buy_value: Math.round(p.total_buy_value * 100) / 100,
+                    total_sell_value: Math.round(p.total_sell_value * 100) / 100
+                };
+            });
+
         return {
+            user_id: userId,
+            name: user.name,
+            username: user.username,
             credit,
             balance,
-            realised_pnl: totalRealisedPnl,
-            position_pnl: totalPositionPnl,
-            m2m_pnl: m2mPnl,
-            equity,
-            margin_used: totalMarginUsed,
-            free_margin: freeMargin,
-            open_positions: trades.filter(t => (t.total_buy_qty - t.total_sell_qty) !== 0).length
+            realised_pnl: Math.round(totalRealisedPnl * 100) / 100,
+            position_pnl: Math.round(totalPositionPnl * 100) / 100,
+            m2m_pnl: Math.round(m2mPnl * 100) / 100,
+            equity: Math.round(equity * 100) / 100,
+            margin_used: Math.round(totalMarginUsed * 100) / 100,
+            free_margin: Math.round(freeMargin * 100) / 100,
+            open_positions_count: enrichedPositions.length,
+            positions: enrichedPositions
         };
     }
 

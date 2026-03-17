@@ -1,6 +1,8 @@
 const Trade = require('../models/Trade');
 const User = require('../models/User');
 const Master = require('../models/Master');
+const KiteInstrument = require('../models/KiteInstrument');
+const BrokerageSettings = require('../models/BrokerageSettings');
 const tradeMetricsService = require('../services/tradeMetricsService');
 const kiteService = require('../services/kiteService');
 const TradeMargin = require('../models/TradeMargin');
@@ -33,8 +35,10 @@ const _getLivePricesFromKite = async (instrumentTokens) => {
 const placeTrade = async (req, res) => {
     const session = await mongoose.startSession();
     try {
-        const userId = req.user?.id || req.master?.id || req.admin?.id || req.body.user_id;
-        if (!userId) {
+        // #8 FIX: When admin places trade for a user, use req.body.user_id as the target, not the admin's own ID.
+        const callerId = req.user?.id || req.master?.id || req.admin?.id;
+        const targetUserId = (req.body.user_id && req.admin) ? req.body.user_id : (req.body.user_id || callerId);
+        if (!targetUserId) {
             return res.status(401).json({ success: false, message: 'Unauthorized / User ID missing' });
         }
 
@@ -55,10 +59,25 @@ const placeTrade = async (req, res) => {
             return res.status(400).json({ success: false, message: 'Invalid quantity' });
         }
 
+        // #1 FIX: Circuit limit check for LIMIT orders (before DB transaction to fail fast)
+        if (order_type === 'LIMIT' && price) {
+            const kiteInst = await KiteInstrument.findOne({ instrument_token });
+            if (kiteInst) {
+                const upper = kiteInst.upper_circuit_limit;
+                const lower = kiteInst.lower_circuit_limit;
+                if (upper && upper > 0 && price > upper) {
+                    return res.status(400).json({ success: false, message: `Limit price ₹${price} exceeds upper circuit limit ₹${upper}` });
+                }
+                if (lower && lower > 0 && price < lower) {
+                    return res.status(400).json({ success: false, message: `Limit price ₹${price} is below lower circuit limit ₹${lower}` });
+                }
+            }
+        }
+
         let resultTrade;
 
         await session.withTransaction(async () => {
-            const user = await User.findById(userId).populate('master_id').session(session);
+            const user = await User.findById(targetUserId).populate('master_id').session(session);
             if (!user) {
                 throw new Error('User not found');
             }
@@ -367,15 +386,44 @@ const placeTrade = async (req, res) => {
                 const newMargin = Math.abs(newNetQty) * marginPerUnit;
                 const marginDelta = newMargin - prevMargin; // +ve = more margin needed
 
-                const balanceBefore = user.balance;
-                const balanceChange = realisedPnl - marginDelta;
-
-                // Block if insufficient balance for opening positions
-                if (marginDelta > 0 && (user.balance + balanceChange) < 0) {
-                    throw new Error(`Insufficient balance. Available: ₹${user.balance.toFixed(2)}, Required margin: ₹${marginDelta.toFixed(2)}`);
+                // #7 FIX: Block if free margin goes negative (balance - currentMargin - newMarginDelta < 0)
+                if (marginDelta > 0) {
+                    const freeMargin = user.balance - prevMargin;
+                    if (freeMargin < marginDelta) {
+                        throw new Error(`Insufficient free margin. Free: ₹${freeMargin.toFixed(2)}, Required: ₹${marginDelta.toFixed(2)}`);
+                    }
                 }
 
+                // #5 FIX: Calculate brokerage using BrokerageSettings
+                let brokerage = 0;
+                try {
+                    const brokerageRule = await BrokerageSettings.findOne({
+                        exchange_name: normalizedExchange,
+                        script_name: tradingsymbol,
+                        deleted_at: null
+                    });
+                    if (brokerageRule) {
+                        if (brokerageRule.type === 'TURNOVER WISE') {
+                            brokerage = (executedPrice * quantity) * (brokerageRule.brk_value / 100);
+                        } else if (brokerageRule.type === 'LOT WISE') {
+                            // Look up lot size from ScriptQuantity or GroupedQuantity
+                            const lotSizeDoc = await ScriptQuantity.findOne({ exchange_name: normalizedExchange, script_name: tradingsymbol, deleted_at: null });
+                            const lotSize = lotSizeDoc?.lot_size || 1;
+                            const lots = quantity / lotSize;
+                            brokerage = lots * brokerageRule.brk_value;
+                        }
+                    }
+                } catch (brErr) {
+                    console.warn('[Brokerage] Could not calculate brokerage:', brErr.message);
+                }
+
+                const balanceBefore = user.balance;
+                const balanceChange = realisedPnl - marginDelta - brokerage;
+
                 user.balance = user.balance + balanceChange;
+                newTrade.brokerage = brokerage;
+                newTrade.net_amount = realisedPnl - brokerage;
+                await newTrade.save({ session });
                 await user.save({ session });
 
                 // Log transaction
@@ -397,6 +445,7 @@ const placeTrade = async (req, res) => {
                         executedPrice,
                         order_type,
                         realisedPnl,
+                        brokerage,
                         marginDelta,
                         balanceChange,
                         positionClosed: realisedPnl !== 0
@@ -543,10 +592,27 @@ getPositions = async (req, res) => {
 
         const trades = await Trade.find({ user_id: targetUserId, deleted_at: null }).sort({ executed_at: -1 });
 
+        // Enrich trades with lot_size from KiteInstrument so Flutter can display lots vs qty
+        const KiteInstrument = require('../models/KiteInstrument');
+        const uniqueTokens = [...new Set(trades.map(t => t.instrument_token))];
+        const instruments = await KiteInstrument.find({ instrument_token: { $in: uniqueTokens } }, 'instrument_token lot_size segment');
+        const lotSizeMap = {};
+        instruments.forEach(inst => {
+            lotSizeMap[inst.instrument_token] = { lot_size: inst.lot_size || 1, segment: inst.segment || '' };
+        });
+
+        const enrichedTrades = trades.map(t => {
+            const plain = t.toJSON();
+            const info = lotSizeMap[t.instrument_token] || { lot_size: 1, segment: '' };
+            plain.lot_size = info.lot_size;
+            plain.segment = info.segment;
+            return plain;
+        });
+
         res.status(200).json({
             success: true,
             message: 'Positions fetched successfully',
-            data: trades
+            data: enrichedTrades
         });
     } catch (error) {
         res.status(500).json({
@@ -556,6 +622,7 @@ getPositions = async (req, res) => {
         });
     }
 }
+
 
 /**
  * Get exchange margin rules for frontend calculation
