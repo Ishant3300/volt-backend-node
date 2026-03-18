@@ -188,6 +188,16 @@ const getInstrumentLimit = async (req, res) => {
       });
     }
 
+    // CRITICAL FIX: MCX lot size multiplier
+    // Zerodha's API returns lot_size = 1 for all MCX instruments
+    // But MCX trading rule: 1 LOT = 100 QTY (business rule, not from Zerodha)
+    // Apply 100x multiplier for MCX-FUT and MCX-OPT
+    let actualLotSize = limit.lot_size || 1;
+    const isMCX = normalizedSegment === 'MCX-FUT' || normalizedSegment === 'MCX-OPT';
+    if (isMCX) {
+      actualLotSize = 100; // MCX business rule: 1 lot = 100 qty
+    }
+
     res.status(200).json({
       success: true,
       data: {
@@ -197,7 +207,7 @@ const getInstrumentLimit = async (req, res) => {
         limit: {
           max_qty: limit.max_qty,
           break_qty: limit.break_qty,
-          lot_size: limit.lot_size,
+          lot_size: actualLotSize, // 100 for MCX, otherwise from limit
           instrument_symbol: limit.instrument_symbol
         }
       }

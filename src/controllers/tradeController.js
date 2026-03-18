@@ -131,6 +131,7 @@ const placeTrade = async (req, res) => {
 
             // 1.5 Margin-based lot limit validation (only for BUY / opening positions)
             // Rule: Max tradeable lots = floor(Available Balance / Margin per lot), capped by assigned lot limit
+            // For MCX: 1 lot = 100 qty (lot_size from KiteInstrument or ScriptQuantity)
             if (transaction_type === 'BUY') {
                 const normalizedExchange = exchange.toUpperCase() === 'GLOBAL' ? 'INDICES' : exchange.toUpperCase();
                 // Get user's exchange assignment to find their group_name
@@ -140,6 +141,20 @@ const placeTrade = async (req, res) => {
                 // Find lot limit from GroupedQuantity (if user has a group) or ScriptQuantity (global)
                 let lotLimit = null;
                 let lotSize = 1;
+                let breakQty = 0; // Breakup quantity: max lots per single order
+
+                // First, try to get lot_size from KiteInstrument (most accurate)
+                // For MCX: Zerodha returns lot_size = 1, but actual trading lot_size = 100
+                const kiteInst = await KiteInstrument.findOne({ instrument_token });
+                if (kiteInst && kiteInst.lot_size) {
+                    lotSize = kiteInst.lot_size;
+                }
+                
+                // Apply MCX multiplier (business rule: 1 lot = 100 qty for MCX)
+                const isMCX = normalizedExchange === 'MCX-FUT' || normalizedExchange === 'MCX-OPT';
+                if (isMCX && lotSize === 1) {
+                    lotSize = 100; // MCX business rule
+                }
 
                 if (groupName) {
                     // Check GroupedQuantity for this specific instrument
@@ -151,7 +166,14 @@ const placeTrade = async (req, res) => {
                     }).session(session);
                     if (groupQty) {
                         lotLimit = groupQty.max_qty;
-                        lotSize = groupQty.lot_size || 1;
+                        breakQty = groupQty.break_qty || 0;
+                        // Override lot_size if GroupedQuantity has it (but apply MCX rule)
+                        if (groupQty.lot_size) {
+                            lotSize = groupQty.lot_size;
+                            if (isMCX && lotSize === 1) {
+                                lotSize = 100; // MCX business rule
+                            }
+                        }
                     }
                 }
 
@@ -164,12 +186,31 @@ const placeTrade = async (req, res) => {
                     }).session(session);
                     if (scriptQty) {
                         lotLimit = scriptQty.max_qty;
-                        lotSize = scriptQty.lot_size || 1;
+                        breakQty = scriptQty.brk_qty || 0;
+                        // Override lot_size if ScriptQuantity has it (but apply MCX rule)
+                        if (scriptQty.lot_size) {
+                            lotSize = scriptQty.lot_size;
+                            if (isMCX && lotSize === 1) {
+                                lotSize = 100; // MCX business rule
+                            }
+                        }
                     }
                 }
 
                 // If we have a lot limit, validate against available balance
                 if (lotLimit !== null && lotLimit > 0) {
+                    // Convert requested quantity to lots
+                    const requestedLots = Math.ceil(quantity / lotSize);
+                    
+                    // VALIDATION 1: Check break_qty (max lots per single order)
+                    if (breakQty > 0 && requestedLots > breakQty) {
+                        throw new Error(
+                            `Order size exceeds breakup limit. ` +
+                            `Max lots per order: ${breakQty}, Requested: ${requestedLots} lot(s). ` +
+                            `Please split your order into smaller quantities.`
+                        );
+                    }
+                    
                     // Get current position for this instrument
                     const posAgg = await Trade.aggregate([
                         {
@@ -199,6 +240,15 @@ const placeTrade = async (req, res) => {
                     // Calculate remaining lots allowed by lot limit
                     const remainingLotsByLimit = Math.max(0, lotLimit - currentLots);
 
+                    // VALIDATION 2: Check if user would exceed max_qty after this order
+                    if (requestedLots > remainingLotsByLimit) {
+                        throw new Error(
+                            `Order exceeds maximum position limit. ` +
+                            `Max allowed: ${lotLimit} lot(s), Current position: ${currentLots} lot(s), ` +
+                            `Remaining: ${remainingLotsByLimit} lot(s), Requested: ${requestedLots} lot(s).`
+                        );
+                    }
+
                     // Get price for margin calculation - fetch live price if not provided (MARKET orders)
                     let priceForMargin = price;
                     if (!priceForMargin || priceForMargin <= 0) {
@@ -220,9 +270,7 @@ const placeTrade = async (req, res) => {
                     const effectiveMaxLots = Math.min(remainingLotsByLimit, maxAffordableLots);
                     const effectiveMaxQty = effectiveMaxLots * lotSize;
 
-                    // Convert requested quantity to lots
-                    const requestedLots = Math.ceil(quantity / lotSize);
-
+                    // VALIDATION 3: Check if user has sufficient balance
                     if (requestedLots > effectiveMaxLots) {
                         const requiredMargin = requestedLots * marginPerLot;
                         if (maxAffordableLots === 0) {
@@ -237,12 +285,6 @@ const placeTrade = async (req, res) => {
                                 `Insufficient balance for ${requestedLots} lot(s). ` +
                                 `Available: ₹${availableBalance.toFixed(2)}, Required: ₹${requiredMargin.toFixed(2)}. ` +
                                 `Max affordable: ${maxAffordableLots} lot(s) (${effectiveMaxQty} qty).`
-                            );
-                        } else {
-                            // Lot limit is the limiting factor
-                            throw new Error(
-                                `Quantity exceeds lot limit. Max allowed: ${lotLimit} lot(s), ` +
-                                `Current position: ${currentLots} lot(s), Remaining: ${remainingLotsByLimit} lot(s).`
                             );
                         }
                     }
@@ -406,10 +448,17 @@ const placeTrade = async (req, res) => {
                         if (brokerageRule.type === 'TURNOVER WISE') {
                             brokerage = (executedPrice * quantity) * (brokerageRule.brk_value / 100);
                         } else if (brokerageRule.type === 'LOT WISE') {
-                            // Look up lot size from ScriptQuantity or GroupedQuantity
-                            const lotSizeDoc = await ScriptQuantity.findOne({ exchange_name: normalizedExchange, script_name: tradingsymbol, deleted_at: null });
-                            const lotSize = lotSizeDoc?.lot_size || 1;
-                            const lots = quantity / lotSize;
+                            // Look up lot size from ScriptQuantity, GroupedQuantity, or KiteInstrument
+                            // For MCX: lot_size = 100, so if quantity = 100, lots = 1
+                            let lotSizeForBrokerage = 1;
+                            const kiteInstForBrk = await KiteInstrument.findOne({ instrument_token });
+                            if (kiteInstForBrk && kiteInstForBrk.lot_size) {
+                                lotSizeForBrokerage = kiteInstForBrk.lot_size;
+                            } else {
+                                const lotSizeDoc = await ScriptQuantity.findOne({ exchange_name: normalizedExchange, script_name: tradingsymbol, deleted_at: null });
+                                lotSizeForBrokerage = lotSizeDoc?.lot_size || 1;
+                            }
+                            const lots = quantity / lotSizeForBrokerage;
                             brokerage = lots * brokerageRule.brk_value;
                         }
                     }
