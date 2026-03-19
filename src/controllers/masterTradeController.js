@@ -1,5 +1,25 @@
 const Trade = require('../models/Trade');
 const Master = require('../models/Master');
+const KiteInstrument = require('../models/KiteInstrument');
+
+// Enrich trades with correct lot_size from KiteInstrument
+const enrichTradesWithLotSize = async (trades) => {
+    const uniqueTokens = [...new Set(trades.map(t => t.instrument_token))];
+    const instruments = await KiteInstrument.find(
+        { instrument_token: { $in: uniqueTokens } },
+        'instrument_token lot_size segment'
+    );
+    const lotSizeMap = {};
+    instruments.forEach(inst => {
+        lotSizeMap[inst.instrument_token] = { lot_size: inst.lot_size || 1, segment: inst.segment || '' };
+    });
+    return trades.map(plain => {
+        const info = lotSizeMap[plain.instrument_token] || { lot_size: 1, segment: '' };
+        plain.lot_size = info.lot_size || 1;
+        if (!plain.segment) plain.segment = info.segment;
+        return plain;
+    });
+};
 
 // Get All Trades in Hierarchy
 const getAllTrades = async (req, res) => {
@@ -97,24 +117,27 @@ const getAllTrades = async (req, res) => {
       }
     ]);
 
+    const enrichedTrades = await enrichTradesWithLotSize(
+      trades.map(trade => {
+        const t = trade.toJSON();
+        if (t.user_id && typeof t.user_id === 'object') {
+          t.user_name = t.user_id.name || null;
+          t.user_username = t.user_id.username || null;
+          t.user_id = t.user_id.id || t.user_id._id || t.user_id;
+        }
+        if (t.master_id && typeof t.master_id === 'object') {
+          t.master_name = t.master_id.name || null;
+          t.master_id = t.master_id.id || t.master_id._id || t.master_id;
+        }
+        return t;
+      })
+    );
+
     res.status(200).json({
       success: true,
       message: 'Trades retrieved successfully',
       data: {
-        trades: trades.map(trade => {
-          const t = trade.toJSON();
-          // Flatten populated user_id and master_id into top-level fields
-          if (t.user_id && typeof t.user_id === 'object') {
-            t.user_name = t.user_id.name || null;
-            t.user_username = t.user_id.username || null;
-            t.user_id = t.user_id.id || t.user_id._id || t.user_id;
-          }
-          if (t.master_id && typeof t.master_id === 'object') {
-            t.master_name = t.master_id.name || null;
-            t.master_id = t.master_id.id || t.master_id._id || t.master_id;
-          }
-          return t;
-        }),
+        trades: enrichedTrades,
         total: count,
         page: parseInt(page),
         pages: Math.ceil(count / limit),

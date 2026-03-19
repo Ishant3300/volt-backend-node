@@ -1,5 +1,26 @@
 const User = require('../models/User');
 const Trade = require('../models/Trade');
+const KiteInstrument = require('../models/KiteInstrument');
+
+// Enrich trades with correct lot_size from KiteInstrument
+const enrichTradesWithLotSize = async (trades) => {
+    const uniqueTokens = [...new Set(trades.map(t => t.instrument_token))];
+    const instruments = await KiteInstrument.find(
+        { instrument_token: { $in: uniqueTokens } },
+        'instrument_token lot_size segment'
+    );
+    const lotSizeMap = {};
+    instruments.forEach(inst => {
+        lotSizeMap[inst.instrument_token] = { lot_size: inst.lot_size || 1, segment: inst.segment || '' };
+    });
+    return trades.map(t => {
+        const plain = t.toJSON ? t.toJSON() : { ...t };
+        const info = lotSizeMap[t.instrument_token] || { lot_size: 1, segment: '' };
+        plain.lot_size = info.lot_size || 1;
+        if (!plain.segment) plain.segment = info.segment;
+        return plain;
+    });
+};
 
 // Get User Profile
 const getUserProfile = async (req, res) => {
@@ -81,7 +102,7 @@ const getUserTrades = async (req, res) => {
             success: true,
             message: 'User trades retrieved successfully',
             data: {
-                trades: trades.map(t => t.toJSON()),
+                trades: await enrichTradesWithLotSize(trades),
                 total: count,
                 page: parseInt(page),
                 pages: Math.ceil(count / limit)

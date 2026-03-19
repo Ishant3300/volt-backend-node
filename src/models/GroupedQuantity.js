@@ -12,14 +12,19 @@ const groupedQuantitySchema = new mongoose.Schema({
     required: true,
     trim: true
   },
-  instrument_id: {
+  raw_name: {
     type: String,
     required: true,
     trim: true
   },
+  instrument_id: {
+    type: String,
+    default: '',
+    trim: true
+  },
   instrument_symbol: {
     type: String,
-    required: true,
+    default: '',
     trim: true
   },
   max_qty: {
@@ -72,6 +77,8 @@ groupedQuantitySchema.index({ deleted_at: 1 });
 groupedQuantitySchema.index({ exchange_name: 1 });
 groupedQuantitySchema.index({ lot_name: 1 });
 groupedQuantitySchema.index({ instrument_id: 1 });
+groupedQuantitySchema.index({ raw_name: 1 });
+groupedQuantitySchema.index({ exchange_name: 1, lot_name: 1, raw_name: 1 });
 
 const GroupedQuantity = mongoose.model('GroupedQuantity', groupedQuantitySchema);
 

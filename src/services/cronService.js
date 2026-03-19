@@ -1,4 +1,6 @@
 const cron = require('node-cron');
+const path = require('path');
+const { fork } = require('child_process');
 const User = require('../models/User');
 const Master = require('../models/Master');
 const orderExecutionService = require('./orderExecutionService');
@@ -15,6 +17,26 @@ class CronService {
      */
     init() {
         console.log('🕒 Initializing Cron Scheduler...');
+
+        // Fetch & sync instruments from Kite every day at 8:00 AM
+        // Runs fetchInstruments.js in a child process (it calls process.exit internally)
+        const fetchInstrumentsJob = cron.schedule('0 8 * * *', () => {
+            console.log('📡 [CRON] Starting daily instrument fetch...');
+            const scriptPath = path.join(__dirname, '../../scripts/fetchInstruments.js');
+            const child = fork(scriptPath, [], { silent: true });
+
+            child.stdout.on('data', data => process.stdout.write(`[fetchInstruments] ${data}`));
+            child.stderr.on('data', data => process.stderr.write(`[fetchInstruments] ${data}`));
+
+            child.on('exit', code => {
+                if (code === 0) {
+                    console.log('✅ [CRON] Instrument fetch completed successfully.');
+                } else {
+                    console.error(`❌ [CRON] Instrument fetch exited with code ${code}.`);
+                }
+            });
+        });
+        this.jobs.push(fetchInstrumentsJob);
 
         // Snapshot weekly P&L every Sunday at 23:55 (before midnight balance reset)
         const weeklySummarySnapshot = cron.schedule('55 23 * * 0', async () => {

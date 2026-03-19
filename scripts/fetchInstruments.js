@@ -12,6 +12,52 @@ const KiteInstrument = require('../src/models/KiteInstrument');
 // Allowed exchanges for derivatives (FUT, CE, PE)
 const ALLOWED_EXCHANGES = ['BFO', 'NFO', 'MCX'];
 
+// ══════════════════════════════════════════════════════════════════════════════
+// MCX LOT SIZES — from official MCX contract specifications table
+// MT values converted to KG (1 MT = 1000 KG)
+// Zerodha's CSV has lot_size=1 for all MCX instruments; we override here.
+// ══════════════════════════════════════════════════════════════════════════════
+const MCX_LOT_SIZES = {
+  'GOLD':        100,
+  'GOLDM':       10,
+  'GOLDPETAL':   1,
+  'SILVER':      30,
+  'SILVERM':     5,
+  'SILVERMIC':   1,
+  'COPPER':      2500,
+  'COPPERM':     250,
+  'CRUDE':       100,
+  'CRUDEOIL':    100,
+  'CRUDEOILM':   10,
+  'NATURALGAS':  1250,
+  'NATGAS':      1250,
+  'ALUMINIUM':   5000,
+  'ALUMINIUMM':  1000,
+  'ZINC':        5000,
+  'ZINCM':       1000,
+  'LEAD':        5000,
+  'LEADM':       1000,
+  'NICKEL':      1500,
+  'NICKELM':     100,
+  'COTTON':      25,
+  'MENTHAOIL':   360,
+  'CASTORSEED':  10000,
+  'CARDAMOM':    100,
+  'PEPPER':      1000,
+  'TURMERIC':    1000,
+  'JEERA':       3000,
+  'DHANIYA':     1000,
+};
+
+function getMcxLotSize(name) {
+  const upper = (name || '').toUpperCase().trim();
+  if (MCX_LOT_SIZES[upper] !== undefined) return MCX_LOT_SIZES[upper];
+  for (const [key, size] of Object.entries(MCX_LOT_SIZES)) {
+    if (upper.startsWith(key)) return size;
+  }
+  return null;
+}
+
 // Allowed instrument types for derivatives
 const ALLOWED_INSTRUMENT_TYPES = ['FUT', 'CE', 'PE'];
 
@@ -152,6 +198,14 @@ function parseAndFilterInstruments(csvText) {
     // Store raw name before mapping
     instrument.raw_name = instrument.name;
     
+    // Override lot_size for MCX instruments (Zerodha CSV has lot_size=1 for all MCX)
+    if (instrument.exchange === 'MCX') {
+      const correctLotSize = getMcxLotSize(instrument.name);
+      if (correctLotSize !== null) {
+        instrument.lot_size = correctLotSize;
+      }
+    }
+    
     // Generate display name
     instrument.display_name = generateDisplayName(instrument);
     
@@ -287,25 +341,74 @@ async function fetchInstruments() {
     fs.writeFileSync(filteredFilepath, [filteredHeaders, ...filteredRows].join('\n'), 'utf8');
     console.log(`💾 Saved filtered CSV: ${filteredFilename}`);
 
-    // Drop and recreate collection
-    console.log('\n🗑️  Clearing existing instruments...');
-    await KiteInstrument.collection.drop().catch(() => {
-      console.log('   Collection does not exist, creating new one');
-    });
+    // Upsert instruments — preserve existing _id for known tokens, insert new ones
+    // This ensures instrument_token stays the stable key and _id never changes.
+    console.log(`\n💾 Upserting ${uniqueInstruments.length} instruments (preserving existing IDs)...`);
 
-    // Bulk insert
-    console.log(`\n💾 Storing ${uniqueInstruments.length} instruments...`);
-    const result = await KiteInstrument.insertMany(uniqueInstruments, {
-      ordered: false
-    });
+    const BATCH_SIZE = 500;
+    let upserted = 0;
+    let modified = 0;
 
-    const insertedCount = Array.isArray(result) ? result.length : (result.insertedCount || 0);
+    for (let i = 0; i < uniqueInstruments.length; i += BATCH_SIZE) {
+      const batch = uniqueInstruments.slice(i, i + BATCH_SIZE);
+      const ops = batch.map(inst => {
+        const { instrument_token, lot_size, ...rest } = inst;
+        const setFields = { ...rest };
+
+        // For new inserts: always set instrument_token + lot_size via $setOnInsert
+        // For existing docs: only overwrite lot_size if incoming value > 1
+        //   (preserves patched MCX lot sizes when Zerodha sends 1)
+        if (lot_size > 1) {
+          // Real lot size — put in $set so it updates existing docs too
+          setFields.lot_size = lot_size;
+          return {
+            updateOne: {
+              filter: { instrument_token },
+              update: {
+                $set: setFields,
+                $setOnInsert: { instrument_token }
+              },
+              upsert: true
+            }
+          };
+        } else {
+          // Default lot_size=1 from Zerodha — only set on new inserts, don't overwrite existing
+          return {
+            updateOne: {
+              filter: { instrument_token },
+              update: {
+                $set: setFields,
+                $setOnInsert: { instrument_token, lot_size: 1 }
+              },
+              upsert: true
+            }
+          };
+        }
+      });
+
+      const res = await KiteInstrument.bulkWrite(ops, { ordered: false });
+      upserted += res.upsertedCount || 0;
+      modified += res.modifiedCount || 0;
+
+      if ((i / BATCH_SIZE) % 10 === 0) {
+        process.stdout.write(`   Progress: ${Math.min(i + BATCH_SIZE, uniqueInstruments.length)}/${uniqueInstruments.length}\r`);
+      }
+    }
+
+    // Mark instruments no longer in Kite's feed as inactive
+    const activeTokens = uniqueInstruments.map(i => i.instrument_token);
+    const deactivated = await KiteInstrument.updateMany(
+      { instrument_token: { $nin: activeTokens }, is_active: true },
+      { $set: { is_active: false } }
+    );
 
     // Print summary
-    console.log('\n═══════════════════════════════════════════════════════════════');
+    console.log('\n\n═══════════════════════════════════════════════════════════════');
     console.log('  ✅ SYNC COMPLETE');
     console.log('═══════════════════════════════════════════════════════════════');
-    console.log(`   Total instruments stored: ${insertedCount}`);
+    console.log(`   New instruments inserted: ${upserted}`);
+    console.log(`   Existing instruments updated: ${modified}`);
+    console.log(`   Instruments marked inactive: ${deactivated.modifiedCount}`);
     console.log(`   Raw CSV: ${rawFilepath}`);
     console.log(`   Filtered CSV: ${filteredFilepath}`);
     

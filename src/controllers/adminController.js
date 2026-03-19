@@ -397,11 +397,12 @@ const debitUserByAdmin = async (req, res) => {
 // Create Grouped Quantity
 const createGroupedQuantity = async (req, res) => {
   try {
-    const { exchange_name, lot_name, instrument_id, instrument_symbol, max_qty, break_qty, lot_size } = req.body;
+    const { exchange_name, lot_name, instrument_id, instrument_symbol, raw_name, max_qty, break_qty, lot_size } = req.body;
 
     console.log('📥 Creating grouped quantity:', {
       exchange_name,
       lot_name,
+      raw_name,
       instrument_id,
       instrument_symbol,
       max_qty,
@@ -409,18 +410,31 @@ const createGroupedQuantity = async (req, res) => {
       lot_size
     });
 
-    if (!exchange_name || !lot_name || !instrument_id || !instrument_symbol || max_qty === undefined || break_qty === undefined || lot_size === undefined) {
+    if (!exchange_name || !lot_name || max_qty === undefined || break_qty === undefined || lot_size === undefined) {
       console.log('❌ Validation failed - missing required fields');
       return res.status(400).json({
         success: false,
-        message: 'exchange_name, lot_name, instrument_id, instrument_symbol, max_qty, break_qty, and lot_size are required',
+        message: 'exchange_name, lot_name, max_qty, break_qty, and lot_size are required',
         data: null
       });
     }
 
+    // Use raw_name as the primary key for matching; fall back to instrument_symbol
+    const matchRawName = raw_name || instrument_symbol || '';
+
     const groupedQty = await GroupedQuantity.findOneAndUpdate(
-      { exchange_name, lot_name, instrument_symbol, deleted_at: null },
-      { exchange_name, lot_name, instrument_id, instrument_symbol, max_qty, break_qty, lot_size, deleted_at: null },
+      { exchange_name, lot_name, raw_name: matchRawName, deleted_at: null },
+      {
+        exchange_name,
+        lot_name,
+        raw_name: matchRawName,
+        instrument_id: instrument_id || '',
+        instrument_symbol: instrument_symbol || matchRawName,
+        max_qty,
+        break_qty,
+        lot_size,
+        deleted_at: null
+      },
       { upsert: true, new: true, setDefaultsOnInsert: true }
     );
 

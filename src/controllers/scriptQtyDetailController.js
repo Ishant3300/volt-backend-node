@@ -110,7 +110,7 @@ const getScriptQtyDetails = async (req, res) => {
  */
 const getInstrumentLimit = async (req, res) => {
   try {
-    const { segment, instrument_id } = req.query;
+    const { segment, instrument_id, symbol, raw_name } = req.query;
     const role = req.admin ? 'admin' : req.master ? 'master' : 'user';
     let targetUserId;
 
@@ -157,22 +157,80 @@ const getInstrumentLimit = async (req, res) => {
 
     // 1. Try GroupedQuantity first (if user has a lot assignment)
     if (allowedExchange.group_name) {
-      limit = await GroupedQuantity.findOne({
-        exchange_name: normalizedSegment,
-        lot_name: allowedExchange.group_name,
-        instrument_id: instrument_id,
-        deleted_at: null
-      }).lean();
+      // Primary: resolve by raw_name (instrument base name)
+      // First, get the raw_name for this instrument
+      let rawName = raw_name || null;
+      if (!rawName && (symbol || instrument_id)) {
+        const KiteInstrument = require('../models/KiteInstrument');
+        let kiteInst = null;
+        if (instrument_id) {
+          kiteInst = await KiteInstrument.findOne({ instrument_token: instrument_id }).lean();
+        }
+        if (!kiteInst && symbol) {
+          kiteInst = await KiteInstrument.findOne({ tradingsymbol: symbol }).lean();
+        }
+        if (kiteInst) {
+          rawName = kiteInst.raw_name || kiteInst.name;
+        }
+      }
+
+      // Try by raw_name first (new approach)
+      if (rawName) {
+        limit = await GroupedQuantity.findOne({
+          exchange_name: normalizedSegment,
+          lot_name: allowedExchange.group_name,
+          raw_name: rawName,
+          deleted_at: null
+        }).lean();
+      }
+
+      // Fallback: try by instrument_symbol (legacy)
+      if (!limit && symbol) {
+        limit = await GroupedQuantity.findOne({
+          exchange_name: normalizedSegment,
+          lot_name: allowedExchange.group_name,
+          instrument_symbol: symbol,
+          deleted_at: null
+        }).lean();
+      }
+
+      // Fallback: try by instrument_id (legacy)
+      if (!limit && instrument_id) {
+        limit = await GroupedQuantity.findOne({
+          exchange_name: normalizedSegment,
+          lot_name: allowedExchange.group_name,
+          instrument_id: instrument_id,
+          deleted_at: null
+        }).lean();
+      }
     }
 
     // 2. Fallback to ScriptQuantity (global script-level limits) if not found in grouped
     if (!limit) {
-      // We need the symbol to search ScriptQuantity, but we only have ID.
-      // However, usually we can search by exchange_name in ScriptQuantity
-      // but let's see if we can get the instrument first to get the symbol.
-      // Wait, let's keep it simple for now as per user request: 
-      // "Match the segment feild of the instrument to the exchange_name feild of GroupedQuanity 
-      // then match the instrument id... you will get the details"
+      const resolvedSymbol = symbol || (() => null)();
+      if (resolvedSymbol) {
+        const scriptLimit = await ScriptQuantity.findOne({
+          exchange_name: normalizedSegment,
+          script_name: resolvedSymbol,
+          deleted_at: null
+        }).lean();
+        if (scriptLimit) {
+          limit = { ...scriptLimit, break_qty: scriptLimit.brk_qty };
+        }
+      } else if (instrument_id) {
+        const KiteInstrument = require('../models/KiteInstrument');
+        const kiteInst = await KiteInstrument.findOne({ instrument_token: instrument_id }).lean();
+        if (kiteInst?.tradingsymbol) {
+          const scriptLimit = await ScriptQuantity.findOne({
+            exchange_name: normalizedSegment,
+            script_name: kiteInst.tradingsymbol,
+            deleted_at: null
+          }).lean();
+          if (scriptLimit) {
+            limit = { ...scriptLimit, break_qty: scriptLimit.brk_qty };
+          }
+        }
+      }
     }
 
     if (!limit) {
@@ -188,15 +246,8 @@ const getInstrumentLimit = async (req, res) => {
       });
     }
 
-    // CRITICAL FIX: MCX lot size multiplier
-    // Zerodha's API returns lot_size = 1 for all MCX instruments
-    // But MCX trading rule: 1 LOT = 100 QTY (business rule, not from Zerodha)
-    // Apply 100x multiplier for MCX-FUT and MCX-OPT
-    let actualLotSize = limit.lot_size || 1;
-    const isMCX = normalizedSegment === 'MCX-FUT' || normalizedSegment === 'MCX-OPT';
-    if (isMCX) {
-      actualLotSize = 100; // MCX business rule: 1 lot = 100 qty
-    }
+    // Use lot_size from the limit record as-is (DB now has correct values from patch_mcx_lot_sizes.js)
+    const actualLotSize = limit.lot_size || 1;
 
     res.status(200).json({
       success: true,
@@ -207,7 +258,7 @@ const getInstrumentLimit = async (req, res) => {
         limit: {
           max_qty: limit.max_qty,
           break_qty: limit.break_qty,
-          lot_size: actualLotSize, // 100 for MCX, otherwise from limit
+          lot_size: actualLotSize,
           instrument_symbol: limit.instrument_symbol
         }
       }
