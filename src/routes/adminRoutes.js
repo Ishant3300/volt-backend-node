@@ -60,31 +60,31 @@ router.put('/grouped-quantities/:id', authenticateAdmin, updateGroupedQuantity);
 router.delete('/grouped-quantities/:id', authenticateAdmin, deleteGroupedQuantity);
 
 // Script Quantity CRUD operations
-router.post('/script-quantities/bulk-create', authenticateAdmin, bulkCreateScriptQuantity);
+router.post('/script-quantities/bulk-create', authenticateAdminOrMaster, bulkCreateScriptQuantity);
 router.get('/script-quantities/exchange/:exchange_name', authenticateAdminOrMaster, getScriptQuantityByExchange);
-router.post('/script-quantities', authenticateAdmin, createScriptQuantity);
+router.post('/script-quantities', authenticateAdminOrMaster, createScriptQuantity);
 router.get('/script-quantities', authenticateAdminOrMaster, getAllScriptQuantities);
 router.get('/script-quantities/:id', authenticateAdminOrMaster, getScriptQuantityById);
-router.put('/script-quantities/:id', authenticateAdmin, updateScriptQuantity);
-router.delete('/script-quantities/:id', authenticateAdmin, deleteScriptQuantity);
+router.put('/script-quantities/:id', authenticateAdminOrMaster, updateScriptQuantity);
+router.delete('/script-quantities/:id', authenticateAdminOrMaster, deleteScriptQuantity);
 
 // Trade Margin CRUD operations
-router.post('/trade-margins/bulk-create', authenticateAdmin, bulkCreateTradeMargin);
+router.post('/trade-margins/bulk-create', authenticateAdminOrMaster, bulkCreateTradeMargin);
 router.get('/trade-margins/exchange/:exchange_name', authenticateAdminOrMaster, getTradeMarginByExchange);
-router.post('/trade-margins', authenticateAdmin, createTradeMargin);
+router.post('/trade-margins', authenticateAdminOrMaster, createTradeMargin);
 router.get('/trade-margins', authenticateAdminOrMaster, getAllTradeMargins);
 router.get('/trade-margins/:id', authenticateAdminOrMaster, getTradeMarginById);
-router.put('/trade-margins/:id', authenticateAdmin, updateTradeMargin);
-router.delete('/trade-margins/:id', authenticateAdmin, deleteTradeMargin);
+router.put('/trade-margins/:id', authenticateAdminOrMaster, updateTradeMargin);
+router.delete('/trade-margins/:id', authenticateAdminOrMaster, deleteTradeMargin);
 
 // Brokerage Settings CRUD operations
-router.post('/brokerage-settings/bulk-create', authenticateAdmin, bulkCreateBrokerage);
+router.post('/brokerage-settings/bulk-create', authenticateAdminOrMaster, bulkCreateBrokerage);
 router.get('/brokerage-settings/exchange/:exchange_name', authenticateAdminOrMaster, getBrokerageByExchange);
-router.post('/brokerage-settings', authenticateAdmin, createBrokerageSettings);
+router.post('/brokerage-settings', authenticateAdminOrMaster, createBrokerageSettings);
 router.get('/brokerage-settings', authenticateAdminOrMaster, getAllBrokerageSettings);
 router.get('/brokerage-settings/:id', authenticateAdminOrMaster, getBrokerageSettingsById);
-router.put('/brokerage-settings/:id', authenticateAdmin, updateBrokerageSettings);
-router.delete('/brokerage-settings/:id', authenticateAdmin, deleteBrokerageSettings);
+router.put('/brokerage-settings/:id', authenticateAdminOrMaster, updateBrokerageSettings);
+router.delete('/brokerage-settings/:id', authenticateAdminOrMaster, deleteBrokerageSettings);
 
 // Refresh close prices (admin-only, for testing / manual trigger)
 router.post('/refresh-close-prices', authenticateAdmin, async (req, res) => {
