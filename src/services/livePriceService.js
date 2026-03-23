@@ -8,6 +8,7 @@ const kiteService = require('./kiteService');
 const priceQueueService = require('./priceQueueService');
 const KiteInstrument = require('../models/KiteInstrument');
 const KiteMarketQuote = require('../models/KiteMarketQuote');
+const { LOG_LIVE_TICKS } = require('../config/logFlags');
 
 class LivePriceService {
   constructor() {
@@ -297,10 +298,12 @@ class LivePriceService {
           }
         });
 
-        console.log(`📈 Received ${ticks.length} tick(s):`);
-        ticks.forEach(t => {
-          console.log(`   Token: ${t.instrument_token} | LTP: ${t.last_price}`);
-        });
+        if (LOG_LIVE_TICKS) {
+          console.log(`📈 Received ${ticks.length} tick(s):`);
+          ticks.forEach(t => {
+            console.log(`   Token: ${t.instrument_token} | LTP: ${t.last_price}`);
+          });
+        }
 
         this._broadcastToClients({
           type: 'ticks',
@@ -468,7 +471,7 @@ class LivePriceService {
       });
     }
 
-    if (data.type === 'ticks') {
+    if (data.type === 'ticks' && LOG_LIVE_TICKS) {
       console.log(`   📤 Broadcasted to ${sentCount} client(s)`);
     }
   }

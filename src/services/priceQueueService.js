@@ -19,6 +19,7 @@ const redisService = require('./redisService');
 const orderBookService = require('./orderBookService');
 const { calculateMargin } = require('./marginService');
 const firebaseService = require('./firebaseService');
+const { LOG_PRICE_QUEUE } = require('../config/logFlags');
 
 const QUEUE_NAME = 'price-updates';
 
@@ -53,7 +54,7 @@ const publishPriceUpdate = async (instrumentToken, livePrice) => {
       attempts: 3,
       backoff: { type: 'exponential', delay: 1000 },
     });
-    console.log(`📤 [PriceQueue] Published: Token ${instrumentToken} @ ${livePrice} (Job: ${jobId})`);
+    if (LOG_PRICE_QUEUE) console.log(`📤 [PriceQueue] Published: Token ${instrumentToken} @ ${livePrice} (Job: ${jobId})`);
   } catch (err) {
     console.error(`❌ [PriceQueue] publishPriceUpdate error: ${err.message}`);
   }
@@ -68,7 +69,7 @@ const publishPriceUpdate = async (instrumentToken, livePrice) => {
 const _processJob = async (job) => {
   const { instrument_token, live_price } = job.data;
 
-  console.log(`🔄 [PriceQueue] Processing price update: Token ${instrument_token} @ ${live_price}`);
+  if (LOG_PRICE_QUEUE) console.log(`🔄 [PriceQueue] Processing price update: Token ${instrument_token} @ ${live_price}`);
 
   // 1. Find matching BUY orders (limitPrice >= livePrice)
   const matchingBuys = await orderBookService.getMatchingBuyOrders(instrument_token, live_price);
@@ -82,7 +83,7 @@ const _processJob = async (job) => {
   ];
 
   if (allMatches.length === 0) {
-    console.log(`   ℹ️  No matching orders for token ${instrument_token} at price ${live_price}`);
+    if (LOG_PRICE_QUEUE) console.log(`   ℹ️  No matching orders for token ${instrument_token} at price ${live_price}`);
     return;
   }
 

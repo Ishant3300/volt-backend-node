@@ -1,5 +1,6 @@
 const TradeMargin = require('../models/TradeMargin');
 const KiteInstrument = require('../models/KiteInstrument');
+const { LOG_MARGIN_CALC } = require('../config/logFlags');
 
 /**
  * Calculate the margin required for a trade.
@@ -52,18 +53,17 @@ const calculateMargin = async (exchange, quantity, price, opts = {}) => {
     });
   }
 
-  console.log(`💰 [Margin] exchange=${normalizedExchange}, rawName=${rawName || 'N/A'}, rule=${rule ? JSON.stringify({ amount_type: rule.amount_type, trade_margin: rule.trade_margin, script_name: rule.script_name }) : 'NOT FOUND'}`);
+  if (LOG_MARGIN_CALC) console.log(`💰 [Margin] exchange=${normalizedExchange}, rawName=${rawName || 'N/A'}, rule=${rule ? JSON.stringify({ amount_type: rule.amount_type, trade_margin: rule.trade_margin, script_name: rule.script_name }) : 'NOT FOUND'}`);
   if (!rule) return 0;
 
   if (rule.amount_type === 'percentage') {
     const margin = (Math.abs(quantity) * price * rule.trade_margin) / 100;
-    console.log(`💰 [Margin] percentage calc: qty=${quantity}, price=${price}, margin%=${rule.trade_margin}, result=${margin}`);
+    if (LOG_MARGIN_CALC) console.log(`💰 [Margin] percentage calc: qty=${quantity}, price=${price}, margin%=${rule.trade_margin}, result=${margin}`);
     return margin;
   }
   // For amount the trade_margin will be deducted as given
   const margin = rule.trade_margin;
-  console.log(rule.trade_margin)
-  console.log(`💰 [Margin] flat calc: qty=${quantity}, flat=${rule.trade_margin}, result=${margin}`);
+  if (LOG_MARGIN_CALC) console.log(`💰 [Margin] flat calc: qty=${quantity}, flat=${rule.trade_margin}, result=${margin}`);
   return margin;
 };
 
