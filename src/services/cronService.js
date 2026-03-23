@@ -6,6 +6,7 @@ const Master = require('../models/Master');
 const orderExecutionService = require('./orderExecutionService');
 const redisService = require('./redisService');
 const { snapshotWeeklySummary } = require('./weeklySummaryService');
+const livePriceService = require('./livePriceService');
 
 class CronService {
     constructor() {
@@ -75,6 +76,31 @@ class CronService {
         });
 
         this.jobs.push(limitOrderCheck);
+
+        // ── Post-market close price refresh ──────────────────────────────
+        // NSE/NFO/BFO/BSE: market closes at 3:30 PM IST → refresh at 4:05 PM
+        const nseCloseRefresh = cron.schedule('5 16 * * 1-5', async () => {
+            console.log('📊 [CRON] Refreshing NSE/NFO close prices (settlement)...');
+            try {
+                await livePriceService.refreshClosePrices();
+                console.log('✅ [CRON] NSE/NFO close price refresh completed.');
+            } catch (error) {
+                console.error('❌ [CRON] Error during NSE/NFO close price refresh:', error);
+            }
+        }, { timezone: 'Asia/Kolkata' });
+        this.jobs.push(nseCloseRefresh);
+
+        // MCX: market closes at 11:30 PM IST → refresh at 11:45 PM
+        const mcxCloseRefresh = cron.schedule('45 23 * * 1-5', async () => {
+            console.log('📊 [CRON] Refreshing MCX close prices (settlement)...');
+            try {
+                await livePriceService.refreshClosePrices();
+                console.log('✅ [CRON] MCX close price refresh completed.');
+            } catch (error) {
+                console.error('❌ [CRON] Error during MCX close price refresh:', error);
+            }
+        }, { timezone: 'Asia/Kolkata' });
+        this.jobs.push(mcxCloseRefresh);
 
         const engineMode = redisService.isAvailable()
             ? 'Redis + BullMQ (cron fallback standby)'

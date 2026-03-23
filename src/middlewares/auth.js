@@ -53,6 +53,15 @@ const authenticateUser = async (req, res, next) => {
       });
     }
 
+    // Check active_status toggle (admin can disable via control panel)
+    if (user.active_status === false) {
+      return res.status(403).json({
+        success: false,
+        message: 'You are not allowed to login',
+        data: null
+      });
+    }
+
     req.user = decoded;
     req.admin = null;
     next();
@@ -169,6 +178,15 @@ const authenticateAny = async (req, res, next) => {
         });
       }
 
+      // Check active_status toggle
+      if (user.active_status === false) {
+        return res.status(403).json({
+          success: false,
+          message: 'You are not allowed to login',
+          data: null
+        });
+      }
+
       req.user = decoded;
       req.admin = null;
       req.master = null;
@@ -218,6 +236,15 @@ const authenticateAny = async (req, res, next) => {
         return res.status(403).json({
           success: false,
           message: 'Account is not active',
+          data: null
+        });
+      }
+
+      // Check active_status toggle
+      if (master.active_status === false) {
+        return res.status(403).json({
+          success: false,
+          message: 'You are not allowed to login',
           data: null
         });
       }
@@ -332,6 +359,15 @@ const authenticateMaster = async (req, res, next) => {
       });
     }
 
+    // Check active_status toggle (admin can disable via control panel)
+    if (master.active_status === false) {
+      return res.status(403).json({
+        success: false,
+        message: 'You are not allowed to login',
+        data: null
+      });
+    }
+
     req.user = null;
     req.admin = null;
     req.master = decoded;
@@ -414,6 +450,15 @@ const authenticateAdminOrMaster = async (req, res, next) => {
         return res.status(403).json({
           success: false,
           message: 'Account is not active',
+          data: null
+        });
+      }
+
+      // Check active_status toggle (admin can disable via control panel)
+      if (master.active_status === false) {
+        return res.status(403).json({
+          success: false,
+          message: 'You are not allowed to login',
           data: null
         });
       }

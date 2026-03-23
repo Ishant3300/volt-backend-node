@@ -58,6 +58,15 @@ const userLogin = async (req, res) => {
       });
     }
 
+    // Check active_status toggle (admin can disable login via control panel)
+    if (user.active_status === false) {
+      return res.status(403).json({
+        success: false,
+        message: 'You are not allowed to login',
+        data: null
+      });
+    }
+
     const isPasswordValid = await bcrypt.compare(password, user.password);
 
     if (!isPasswordValid) {
@@ -248,6 +257,15 @@ const masterLogin = async (req, res) => {
       });
     }
 
+    // Check active_status toggle (admin can disable login via control panel)
+    if (master.active_status === false) {
+      return res.status(403).json({
+        success: false,
+        message: 'You are not allowed to login',
+        data: null
+      });
+    }
+
     const isPasswordValid = await bcrypt.compare(password, master.password);
 
     if (!isPasswordValid) {
@@ -357,6 +375,13 @@ const universalLogin = async (req, res) => {
             data: null
           });
         }
+        if (master.active_status === false) {
+          return res.status(403).json({
+            success: false,
+            message: 'You are not allowed to login',
+            data: null
+          });
+        }
         userAccount = master;
         roleType = 'master';
       }
@@ -372,6 +397,13 @@ const universalLogin = async (req, res) => {
           return res.status(403).json({
             success: false,
             message: 'Account is not active',
+            data: null
+          });
+        }
+        if (user.active_status === false) {
+          return res.status(403).json({
+            success: false,
+            message: 'You are not allowed to login',
             data: null
           });
         }

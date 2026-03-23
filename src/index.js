@@ -140,6 +140,10 @@ server.listen(PORT, async () => {
   livePriceService.init(server);
   console.log('📡 Live price WebSocket ready at ws://localhost:' + PORT + '/ws/live-prices');
 
+  // Initialize margin square off monitoring service
+  const marginSquareOffService = require('./services/marginSquareOffService');
+  marginSquareOffService.init(livePriceService);
+
   // Initialize background jobs
   cronService.init();
 

@@ -427,6 +427,15 @@ const updateMasterStatus = async (req, res) => {
 
     await master.save();
 
+    // ── Cascade active_status to all child users ──
+    if (active_status !== undefined) {
+      await User.updateMany(
+        { master_id: master._id, deleted_at: null },
+        { $set: { active_status: active_status } }
+      );
+      console.log(`🔄 [Cascade] Master ${master.username}: set active_status=${active_status} on all child users`);
+    }
+
     res.status(200).json({
       success: true,
       message: 'Master status updated successfully',
@@ -439,7 +448,7 @@ const updateMasterStatus = async (req, res) => {
       data: null
     });
   }
-};
+}
 
 // Update Master Permissions
 const updateMasterPermissions = async (req, res) => {
@@ -478,6 +487,21 @@ const updateMasterPermissions = async (req, res) => {
 
     await master.save();
 
+    // ── Cascade control toggles to all child users ──
+    // When master toggles are changed, propagate to all users under this master
+    const cascadeFields = {};
+    if (permissions.close_only !== undefined) cascadeFields.close_only = permissions.close_only;
+    if (permissions.bet !== undefined) cascadeFields.bet = permissions.bet;
+    if (permissions.margin_square !== undefined) cascadeFields.margin_square_off = permissions.margin_square;
+
+    if (Object.keys(cascadeFields).length > 0) {
+      await User.updateMany(
+        { master_id: master._id, deleted_at: null },
+        { $set: cascadeFields }
+      );
+      console.log(`🔄 [Cascade] Master ${master.username}: updated ${JSON.stringify(cascadeFields)} on all child users`);
+    }
+
     res.status(200).json({
       success: true,
       message: 'Permissions updated successfully',
@@ -494,7 +518,7 @@ const updateMasterPermissions = async (req, res) => {
       data: null
     });
   }
-};
+}
 
 // Delete Master (Soft Delete)
 const deleteMaster = async (req, res) => {

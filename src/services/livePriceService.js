@@ -6,6 +6,8 @@
 const WebSocket = require('ws');
 const kiteService = require('./kiteService');
 const priceQueueService = require('./priceQueueService');
+const KiteInstrument = require('../models/KiteInstrument');
+const KiteMarketQuote = require('../models/KiteMarketQuote');
 
 class LivePriceService {
   constructor() {
@@ -523,6 +525,109 @@ class LivePriceService {
     if (this.kiteTicker) this.kiteTicker.close();
     if (this.wss) this.wss.close();
   }
+
+  /**
+   * Fetch official settlement/close prices from Kite Historical API
+   * and broadcast them to all connected Flutter clients.
+   * Called via cron after market close.
+   */
+  async refreshClosePrices() {
+      try {
+        // Gather tokens from: 1) currently subscribed clients, 2) all watchlists in DB
+        const Watchlist = require('../models/Watchlist');
+        const watchlistTokens = await Watchlist.distinct('instrument_token', { deleted_at: null });
+
+        const allTokens = new Set([
+          ...Array.from(this.subscribedTokens).map(t => t.toString()),
+          ...watchlistTokens.map(t => t.toString()),
+        ]);
+
+        if (allTokens.size === 0) {
+          console.log('📊 [refreshClosePrices] No tokens found (subscribed or watchlist), skipping.');
+          return;
+        }
+
+        console.log(`📊 [refreshClosePrices] Refreshing close prices for ${allTokens.size} tokens (subscribed: ${this.subscribedTokens.size}, watchlist: ${watchlistTokens.length})...`);
+
+        // Date range: today and 3 days back (covers weekends)
+        const today = new Date();
+        const threeDaysAgo = new Date(today);
+        threeDaysAgo.setDate(today.getDate() - 3);
+        const fmt = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+        const fromDate = fmt(threeDaysAgo);
+        const toDate = fmt(today);
+
+        const ticks = [];
+        const dbBulkOps = [];
+
+        for (const tokenStr of allTokens) {
+          try {
+            const candles = await kiteService.getHistoricalData(tokenStr, 'day', fromDate, toDate);
+            if (candles.length === 0) continue;
+
+            const lastCandle = candles[candles.length - 1];
+            const closePrice = lastCandle.close;
+
+            // Update in-memory latest prices
+            this.latestPrices.set(tokenStr, closePrice);
+            this.latestPrices.set(parseInt(tokenStr), closePrice);
+
+            // Build tick for broadcast (same format as _processKiteTick)
+            ticks.push({
+              instrument_token: tokenStr,
+              last_price: closePrice,
+              open: lastCandle.open,
+              high: lastCandle.high,
+              low: lastCandle.low,
+            });
+
+            // Queue DB update
+            dbBulkOps.push({
+              updateOne: {
+                filter: { instrument_token: tokenStr },
+                update: { $set: { instrument_token: tokenStr, last_price: closePrice, timestamp: new Date() } },
+                upsert: true
+              }
+            });
+          } catch (err) {
+            console.log(`   ⚠️  Failed for token ${tokenStr}: ${err.message}`);
+          }
+        }
+
+        // Broadcast corrected prices to Flutter clients
+        if (ticks.length > 0) {
+          console.log(`📊 [refreshClosePrices] Broadcasting ${ticks.length} corrected close prices`);
+          ticks.forEach(t => console.log(`   📊 Token: ${t.instrument_token} (type: ${typeof t.instrument_token}) → close: ${t.last_price}`));
+          console.log(`   📊 Connected WS clients: ${this.wss ? this.wss.clients.size : 0}`);
+          this._broadcastToClients({ type: 'ticks', data: ticks });
+        }
+
+        // Update KiteMarketQuote DB
+        if (dbBulkOps.length > 0) {
+          await KiteMarketQuote.bulkWrite(dbBulkOps, { ordered: false });
+          console.log(`📊 [refreshClosePrices] Updated ${dbBulkOps.length} quotes in KiteMarketQuote`);
+        }
+
+        // Also update KiteInstrument.last_price so app reload shows correct price
+        if (ticks.length > 0) {
+          const instrumentOps = ticks.map(t => ({
+            updateOne: {
+              filter: { instrument_token: t.instrument_token },
+              update: { $set: { last_price: t.last_price } }
+            }
+          }));
+          await KiteInstrument.bulkWrite(instrumentOps, { ordered: false });
+          console.log(`📊 [refreshClosePrices] Updated ${instrumentOps.length} KiteInstrument last_price values`);
+        }
+
+        console.log('✅ [refreshClosePrices] Done.');
+        return { tokensFound: allTokens.size, ticksBroadcast: ticks.length, dbUpdated: dbBulkOps.length, clientsConnected: this.wss ? this.wss.clients.size : 0 };
+      } catch (error) {
+        console.error('❌ [refreshClosePrices] Error:', error.message);
+        return { error: error.message };
+      }
+    }
+
 }
 
 module.exports = new LivePriceService();

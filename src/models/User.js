@@ -108,7 +108,7 @@ const userSchema = new mongoose.Schema({
   },
   bet: {
     type: Boolean,
-    default: false
+    default: true
   },
   fresh_stoploss: {
     type: Boolean,

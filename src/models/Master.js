@@ -126,7 +126,7 @@ const masterSchema = new mongoose.Schema({
     deleted_trade: { type: Boolean, default: false },
     trade_account: { type: Boolean, default: false },
     close_only: { type: Boolean, default: false },
-    bet: { type: Boolean, default: false },
+    bet: { type: Boolean, default: true },
     margin_square: { type: Boolean, default: false },
     fresh_stoploss: { type: Boolean, default: false }
   },

@@ -87,6 +87,37 @@ const placeTrade = async (req, res) => {
                 throw new Error('User not found');
             }
 
+            // ── BET check: if bet is OFF, user cannot trade at all (BUY or SELL) ──
+            // Admin placing on behalf of user bypasses this check
+            if (!req.admin && user.bet === false) {
+                throw new Error('Trading is currently disabled for your account.');
+            }
+
+            // ── Close Only check: if close_only is ON, user can only close existing positions (not open new ones) ──
+            // Admin placing on behalf of user bypasses this check
+            if (!req.admin && user.close_only === true) {
+                // Determine if this trade is closing an existing position
+                const posAggForCloseOnly = await Trade.aggregate([
+                    { $match: { user_id: user._id, instrument_token, status: 'completed', deleted_at: null } },
+                    { $group: {
+                        _id: null,
+                        total_buy_qty: { $sum: { $cond: [{ $eq: ['$transaction_type', 'BUY'] }, '$executed_quantity', 0] } },
+                        total_sell_qty: { $sum: { $cond: [{ $eq: ['$transaction_type', 'SELL'] }, '$executed_quantity', 0] } }
+                    }}
+                ]).session(session);
+
+                const currentNetQty = posAggForCloseOnly.length > 0
+                    ? posAggForCloseOnly[0].total_buy_qty - posAggForCloseOnly[0].total_sell_qty
+                    : 0;
+
+                const isClosing = (transaction_type === 'SELL' && currentNetQty > 0) ||
+                                  (transaction_type === 'BUY' && currentNetQty < 0);
+
+                if (!isClosing) {
+                    throw new Error('Your account is in close-only mode. You can only close existing positions.');
+                }
+            }
+
             // 0. Options sell restriction: prevent naked short selling
             // Users can only SELL options they already own (to close a position)
             if (transaction_type === 'SELL') {
@@ -137,6 +168,7 @@ const placeTrade = async (req, res) => {
             // 1.5 Limit validation — break_qty applies to BUY & SELL; max_qty + balance only for BUY
             // turnover:true  → max_qty/break_qty are in raw QUANTITY, compare directly
             // lot:true       → max_qty/break_qty are in LOTS, convert quantity→lots first
+            let instrumentRawName = null; // resolved inside block, used later for margin calc
             {
                 // Use segment if provided (e.g. NFO-FUT) — more specific than exchange (NFO).
                 // This is critical: exchanges_allowed stores NFO-FUT not NFO.
@@ -155,15 +187,31 @@ const placeTrade = async (req, res) => {
 
                 const kiteInst = await KiteInstrument.findOne({ instrument_token });
                 if (kiteInst?.lot_size) lotSize = kiteInst.lot_size;
+                instrumentRawName = kiteInst?.raw_name || kiteInst?.name || null;
 
                 if (groupName) {
-                    let groupQty = await GroupedQuantity.findOne({
-                        exchange_name: normalizedExchange,
-                        lot_name: groupName,
-                        instrument_symbol: tradingsymbol,
-                        deleted_at: null
-                    }).session(session);
+                    // Primary: lookup by raw_name
+                    let groupQty = null;
+                    if (instrumentRawName) {
+                        groupQty = await GroupedQuantity.findOne({
+                            exchange_name: normalizedExchange,
+                            lot_name: groupName,
+                            raw_name: instrumentRawName,
+                            deleted_at: null
+                        }).session(session);
+                    }
 
+                    // Fallback: instrument_symbol (legacy)
+                    if (!groupQty) {
+                        groupQty = await GroupedQuantity.findOne({
+                            exchange_name: normalizedExchange,
+                            lot_name: groupName,
+                            instrument_symbol: tradingsymbol,
+                            deleted_at: null
+                        }).session(session);
+                    }
+
+                    // Fallback: instrument_id (legacy)
                     if (!groupQty) {
                         groupQty = await GroupedQuantity.findOne({
                             exchange_name: normalizedExchange,
@@ -183,11 +231,22 @@ const placeTrade = async (req, res) => {
                 }
 
                 if (limitValue === null) {
-                    const scriptQty = await ScriptQuantity.findOne({
-                        exchange_name: normalizedExchange,
-                        script_name: tradingsymbol,
-                        deleted_at: null
-                    }).session(session);
+                    // Try by raw_name first, then tradingsymbol
+                    let scriptQty = null;
+                    if (instrumentRawName) {
+                        scriptQty = await ScriptQuantity.findOne({
+                            exchange_name: normalizedExchange,
+                            script_name: instrumentRawName,
+                            deleted_at: null
+                        }).session(session);
+                    }
+                    if (!scriptQty) {
+                        scriptQty = await ScriptQuantity.findOne({
+                            exchange_name: normalizedExchange,
+                            script_name: tradingsymbol,
+                            deleted_at: null
+                        }).session(session);
+                    }
                     if (scriptQty) {
                         limitValue = scriptQty.max_qty;
                         breakValue = scriptQty.brk_qty || 0;
@@ -236,7 +295,7 @@ const placeTrade = async (req, res) => {
                             throw new Error('Could not determine price for margin calculation');
                         }
 
-                        const marginPerUnit = await calculateMargin(normalizedExchange, 1, priceForMargin);
+                        const marginPerUnit = await calculateMargin(normalizedExchange, 1, priceForMargin, { rawName: instrumentRawName, instrumentToken: instrument_token, tradingsymbol });
                         const availableBalance = user.balance || 0;
                         const maxAffordableQty = marginPerUnit > 0 ? Math.floor(availableBalance / marginPerUnit) : remainingQty;
                         const effectiveMaxQty = Math.min(remainingQty, maxAffordableQty);
@@ -295,7 +354,7 @@ const placeTrade = async (req, res) => {
                             throw new Error('Could not determine price for margin calculation');
                         }
 
-                        const marginPerLot = await calculateMargin(normalizedExchange, lotSize, priceForMargin);
+                        const marginPerLot = await calculateMargin(normalizedExchange, lotSize, priceForMargin, { rawName: instrumentRawName, instrumentToken: instrument_token, tradingsymbol });
                         const availableBalance = user.balance || 0;
                         const maxAffordableLots = marginPerLot > 0 ? Math.floor(availableBalance / marginPerLot) : remainingLots;
                         const effectiveMaxLots = Math.min(remainingLots, maxAffordableLots);
@@ -481,9 +540,9 @@ const placeTrade = async (req, res) => {
                 const isBuy = transaction_type === 'BUY';
                 const newNetQty = prevNetQtyForMargin + (isBuy ? quantity : -quantity);
 
-                const normalizedExchange = exchange.toUpperCase() === 'GLOBAL' ? 'INDICES' : exchange.toUpperCase();
-                // Margin per unit at execution price
-                const marginPerUnit = await calculateMargin(normalizedExchange, 1, executedPrice);
+                const normalizedExchange = ((segment || exchange || '').toUpperCase()) === 'GLOBAL' ? 'INDICES' : (segment || exchange || '').toUpperCase();
+                // Margin per unit at execution price (per-instrument lookup via raw_name)
+                const marginPerUnit = await calculateMargin(normalizedExchange, 1, executedPrice, { rawName: instrumentRawName, instrumentToken: instrument_token, tradingsymbol });
 
                 const prevMargin = Math.abs(prevNetQtyForMargin) * marginPerUnit;
                 const newMargin = Math.abs(newNetQty) * marginPerUnit;
@@ -500,11 +559,22 @@ const placeTrade = async (req, res) => {
                 // #5 FIX: Calculate brokerage using BrokerageSettings
                 let brokerage = 0;
                 try {
-                    const brokerageRule = await BrokerageSettings.findOne({
-                        exchange_name: normalizedExchange,
-                        script_name: tradingsymbol,
-                        deleted_at: null
-                    });
+                    // Try by raw_name first, then fallback to tradingsymbol
+                    let brokerageRule = null;
+                    if (instrumentRawName) {
+                        brokerageRule = await BrokerageSettings.findOne({
+                            exchange_name: normalizedExchange,
+                            script_name: instrumentRawName,
+                            deleted_at: null
+                        });
+                    }
+                    if (!brokerageRule) {
+                        brokerageRule = await BrokerageSettings.findOne({
+                            exchange_name: normalizedExchange,
+                            script_name: tradingsymbol,
+                            deleted_at: null
+                        });
+                    }
                     if (brokerageRule) {
                         if (brokerageRule.type === 'TURNOVER WISE') {
                             brokerage = (executedPrice * quantity) * (brokerageRule.brk_value / 100);
@@ -638,8 +708,11 @@ const placeTrade = async (req, res) => {
         let statusCode = 500;
         if (error.message === 'User not found') statusCode = 404;
         else if (error.message.includes('Option selling is not allowed') || error.message.includes('would create a short position')) statusCode = 403;
-        else if (error.message.includes('Insufficient balance')) statusCode = 400;
+        else if (error.message.includes('Trading is currently disabled')) statusCode = 403;
+        else if (error.message.includes('close-only mode')) statusCode = 403;
+        else if (error.message.includes('Insufficient balance') || error.message.includes('Insufficient margin') || error.message.includes('Insufficient free margin')) statusCode = 400;
         else if (error.message.includes('Could not fetch') || error.message.includes('Invalid')) statusCode = 400;
+        else if (error.message.includes('exceeds')) statusCode = 400;
 
         res.status(statusCode).json({
             success: false,

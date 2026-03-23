@@ -86,4 +86,15 @@ router.get('/brokerage-settings/:id', authenticateAdminOrMaster, getBrokerageSet
 router.put('/brokerage-settings/:id', authenticateAdmin, updateBrokerageSettings);
 router.delete('/brokerage-settings/:id', authenticateAdmin, deleteBrokerageSettings);
 
+// Refresh close prices (admin-only, for testing / manual trigger)
+router.post('/refresh-close-prices', authenticateAdmin, async (req, res) => {
+  try {
+    const livePriceService = require('../services/livePriceService');
+    const result = await livePriceService.refreshClosePrices();
+    res.json({ success: true, message: 'Close prices refreshed', ...result });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
 module.exports = router;
