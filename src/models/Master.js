@@ -171,6 +171,31 @@ const masterSchema = new mongoose.Schema({
     enabled: { type: Boolean, default: false },
     max_masters: { type: Number, default: 0 },
     max_users: { type: Number, default: 0 }
+  },
+  // ── Live Trading Metrics (aggregated from all users under this master) ──
+  realised_pnl: {
+    type: Number,
+    default: 0
+  },
+  position_pnl: {
+    type: Number,
+    default: 0
+  },
+  m2m_pnl: {
+    type: Number,
+    default: 0
+  },
+  margin_used: {
+    type: Number,
+    default: 0
+  },
+  equity: {
+    type: Number,
+    default: 0
+  },
+  free_margin: {
+    type: Number,
+    default: 0
   }
 }, {
   timestamps: true

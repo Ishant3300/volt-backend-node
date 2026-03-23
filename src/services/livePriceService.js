@@ -8,7 +8,8 @@ const kiteService = require('./kiteService');
 const priceQueueService = require('./priceQueueService');
 const KiteInstrument = require('../models/KiteInstrument');
 const KiteMarketQuote = require('../models/KiteMarketQuote');
-const { LOG_LIVE_TICKS } = require('../config/logFlags');
+const { LOG_LIVE_TICKS, LOG_WS_BROADCAST } = require('../config/logFlags');
+const metricsEngine = require('./metricsEngine');
 
 class LivePriceService {
   constructor() {
@@ -309,6 +310,13 @@ class LivePriceService {
           type: 'ticks',
           data: ticks,
         });
+
+        // Recalculate & push trading metrics for affected users
+        metricsEngine.onTickBatch(
+          ticks,
+          this.latestPrices,
+          this.broadcastToUser.bind(this)
+        );
       }
     } catch (error) {
       console.log('❌ Error processing Kite tick:', error.message);
@@ -494,7 +502,7 @@ class LivePriceService {
     this.wss.clients.forEach((client) => {
       if (client.userId) authenticatedClients.push(client.userId);
     });
-    console.log(`🔔 [WS] broadcastToUser → target userId: "${userId}" | event: ${data.type} | authenticated clients: [${authenticatedClients.join(', ')}]`);
+    if (LOG_WS_BROADCAST) console.log(`🔔 [WS] broadcastToUser → target userId: "${userId}" | event: ${data.type} | authenticated clients: [${authenticatedClients.join(', ')}]`);
 
     this.wss.clients.forEach((client) => {
       if (client.readyState === WebSocket.OPEN && client.userId === userId) {
@@ -504,7 +512,7 @@ class LivePriceService {
     });
 
     if (sentCount > 0) {
-      console.log(`📤 [WS] Sent '${data.type}' to user ${userId} (${sentCount} connection(s))`);
+      if (LOG_WS_BROADCAST) console.log(`📤 [WS] Sent '${data.type}' to user ${userId} (${sentCount} connection(s))`);
     }
   }
 

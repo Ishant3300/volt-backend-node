@@ -17,14 +17,30 @@ const { LOG_MARGIN_CALC } = require('../config/logFlags');
  * @returns {Promise<number>} margin amount
  */
 const calculateMargin = async (exchange, quantity, price, opts = {}) => {
-  const normalizedExchange = exchange.toUpperCase() === 'GLOBAL' ? 'INDICES' : exchange.toUpperCase();
+  let normalizedExchange = exchange.toUpperCase() === 'GLOBAL' ? 'INDICES' : exchange.toUpperCase();
 
-  // Resolve raw_name for per-instrument lookup
+  // Resolve raw_name, segment, and lot_size from KiteInstrument
   let rawName = opts.rawName || null;
-  if (!rawName && opts.instrumentToken) {
+  let lotSize = opts.lotSize || 1;
+  let segment = null;
+  if (opts.instrumentToken) {
     const kiteInst = await KiteInstrument.findOne({ instrument_token: opts.instrumentToken }).lean();
-    if (kiteInst) rawName = kiteInst.raw_name || kiteInst.name;
+    if (kiteInst) {
+      if (!rawName) rawName = kiteInst.raw_name || kiteInst.name;
+      // Use instrument's segment (e.g. 'MCX-FUT') instead of base exchange ('MCX')
+      // because TradeMargin records store exchange_name as segment names.
+      if (kiteInst.segment) {
+        segment = kiteInst.segment.toUpperCase();
+        normalizedExchange = segment;
+      }
+      if (kiteInst.lot_size > 1) lotSize = kiteInst.lot_size;
+    }
   }
+
+  // Lot-based segments: MCX-FUT, MCX-OPT, NFO-OPT
+  // For these, TradeMargin.trade_margin is a flat amount PER LOT.
+  // margin = numberOfLots * trade_margin
+  const isLotBased = segment === 'MCX-FUT' || segment === 'MCX-OPT' || segment === 'NFO-OPT';
 
   // 1. Try per-instrument rule (exchange + script_name)
   let rule = null;
@@ -53,16 +69,27 @@ const calculateMargin = async (exchange, quantity, price, opts = {}) => {
     });
   }
 
-  if (LOG_MARGIN_CALC) console.log(`💰 [Margin] exchange=${normalizedExchange}, rawName=${rawName || 'N/A'}, rule=${rule ? JSON.stringify({ amount_type: rule.amount_type, trade_margin: rule.trade_margin, script_name: rule.script_name }) : 'NOT FOUND'}`);
+  if (LOG_MARGIN_CALC) console.log(`💰 [Margin] exchange=${normalizedExchange}, rawName=${rawName || 'N/A'}, isLotBased=${isLotBased}, lotSize=${lotSize}, rule=${rule ? JSON.stringify({ amount_type: rule.amount_type, trade_margin: rule.trade_margin, script_name: rule.script_name }) : 'NOT FOUND'}`);
   if (!rule) return 0;
 
+  if (isLotBased && rule.amount_type === 'amount') {
+    // Lot-based: trade_margin is flat amount per LOT
+    // numberOfLots = quantity / lotSize, margin = lots * trade_margin
+    const lots = lotSize > 1 ? Math.abs(quantity) / lotSize : Math.abs(quantity);
+    const margin = lots * rule.trade_margin;
+    if (LOG_MARGIN_CALC) console.log(`💰 [Margin] lot-based calc: qty=${quantity}, lotSize=${lotSize}, lots=${lots}, perLot=${rule.trade_margin}, result=${margin}`);
+    return margin;
+  }
+
   if (rule.amount_type === 'percentage') {
-    const margin = (Math.abs(quantity) * price * rule.trade_margin) / 100;
+    // Percentage-based: margin = quantity * price * (trade_margin / 100)
+    const margin = Math.abs(quantity) * price * (rule.trade_margin / 100);
     if (LOG_MARGIN_CALC) console.log(`💰 [Margin] percentage calc: qty=${quantity}, price=${price}, margin%=${rule.trade_margin}, result=${margin}`);
     return margin;
   }
-  // For amount the trade_margin will be deducted as given
-  const margin = rule.trade_margin;
+
+  // Flat amount fallback (non-lot-based segments with amount type)
+  const margin = Math.abs(quantity) * rule.trade_margin;
   if (LOG_MARGIN_CALC) console.log(`💰 [Margin] flat calc: qty=${quantity}, flat=${rule.trade_margin}, result=${margin}`);
   return margin;
 };

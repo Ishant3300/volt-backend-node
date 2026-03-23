@@ -1,7 +1,7 @@
 const Trade = require('../models/Trade');
 const User = require('../models/User');
 const Master = require('../models/Master');
-const TradeMargin = require('../models/TradeMargin');
+const { calculateMargin } = require('./marginService');
 
 /**
  * Service to dynamically calculate the 7 required account metrics for a user or master.
@@ -42,18 +42,16 @@ class TradeMetricsService {
             }
         ]);
 
-        let totalRealisedPnl = 0;
         let totalPositionPnl = 0;
         let totalMarginUsed = 0;
 
-        // #6 FIX: Realised P&L – sum the per-trade pnl field recorded at execution time.
-        // Each trade's pnl is computed correctly at execution using the FIFO closing logic.
-        // The old approach (avg-price aggregation) was inaccurate for multi-price trades.
+        // Realised P&L = sum of (pnl − brokerage) across all completed trades.
+        // Captures booked profit/loss minus brokerage charges.
         const realisedPnlAgg = await Trade.aggregate([
             { $match: { user_id: user._id, status: 'completed', deleted_at: null } },
-            { $group: { _id: null, total: { $sum: '$pnl' } } }
+            { $group: { _id: null, total: { $sum: { $subtract: ['$pnl', '$brokerage'] } } } }
         ]);
-        totalRealisedPnl = realisedPnlAgg.length > 0 ? realisedPnlAgg[0].total : 0;
+        let totalRealisedPnl = realisedPnlAgg.length > 0 ? realisedPnlAgg[0].total : 0;
 
         for (const position of trades) {
             const { total_buy_qty, total_sell_qty, total_buy_value, total_sell_value } = position;
@@ -76,18 +74,13 @@ class TradeMetricsService {
             totalPositionPnl += floatingPnl;
 
             // Calculate Margin Used for open positions
+            // Uses marginService.calculateMargin for proper exchange→segment resolution
+            // Pass full quantity so lot-based segments can compute lots correctly
             if (netQty !== 0) {
-                const tradeMargin = await TradeMargin.findOne({ exchange_name: position._id.exchange });
-
-                let positionMargin = 0;
-                if (tradeMargin) {
-                    if (tradeMargin.amount_type === 'percentage') {
-                        const contractValue = Math.abs(netQty) * ltp;
-                        positionMargin = (contractValue * tradeMargin.trade_margin) / 100;
-                    } else {
-                        positionMargin = Math.abs(netQty) * tradeMargin.trade_margin;
-                    }
-                }
+                const positionMargin = await calculateMargin(position._id.exchange, Math.abs(netQty), ltp, {
+                    instrumentToken: instrumentToken,
+                    tradingsymbol: position._id.tradingsymbol,
+                });
                 totalMarginUsed += positionMargin;
             }
         }
@@ -95,7 +88,8 @@ class TradeMetricsService {
 
 
         const m2mPnl = totalRealisedPnl + totalPositionPnl;
-        const equity = balance + m2mPnl;
+        // Equity = Credit + M2M P&L
+        const equity = credit + m2mPnl;
         const freeMargin = equity - totalMarginUsed;
 
         // Map aggregated positions for return

@@ -5,5 +5,6 @@
 module.exports = {
   LOG_LIVE_TICKS: false,       // "📈 Received X tick(s)", per-token LTP lines, broadcast count
   LOG_PRICE_QUEUE: false,      // "📤 [PriceQueue] Published", "🔄 Processing", "ℹ️ No matching orders"
-  LOG_MARGIN_CALC: false,      // "💰 [Margin]" lines in marginService
+  LOG_MARGIN_CALC: false,       // "💰 [Margin]" lines in marginService
+  LOG_WS_BROADCAST: false,      // "🔔 [WS] broadcastToUser", "📤 [WS] Sent" lines in livePriceService
 };

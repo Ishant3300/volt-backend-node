@@ -13,6 +13,7 @@ const Transaction = require('../models/Transaction');
 const orderBookService = require('../services/orderBookService');
 const { calculateMargin } = require('../services/marginService');
 const firebaseService = require('../services/firebaseService');
+const metricsEngine = require('../services/metricsEngine');
 
 const _getLivePricesFromKite = async (instrumentTokens) => {
     if (!instrumentTokens || instrumentTokens.length === 0) return new Map();
@@ -636,6 +637,16 @@ const placeTrade = async (req, res) => {
         });
 
         session.endSession();
+
+        // Invalidate metrics cache & push updated metrics via WebSocket
+        if (resultTrade.status === 'completed') {
+            const livePriceService = require('../services/livePriceService');
+            metricsEngine.invalidateUser(
+                resultTrade.user_id,
+                livePriceService.latestPrices,
+                livePriceService.broadcastToUser.bind(livePriceService)
+            ).catch(err => console.error('[MetricsEngine] Post-trade invalidation error:', err.message));
+        }
 
         // Register pending LIMIT orders in Redis order book (outside the DB transaction)
         if (resultTrade.status === 'pending' && resultTrade.order_type === 'LIMIT') {

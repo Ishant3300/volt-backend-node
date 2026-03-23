@@ -19,6 +19,7 @@ const redisService = require('./redisService');
 const orderBookService = require('./orderBookService');
 const { calculateMargin } = require('./marginService');
 const firebaseService = require('./firebaseService');
+const metricsEngine = require('./metricsEngine');
 const { LOG_PRICE_QUEUE } = require('../config/logFlags');
 
 const QUEUE_NAME = 'price-updates';
@@ -171,7 +172,54 @@ const _processJob = async (job) => {
       trade.executed_price = trade.price;       // Execute at the limit price
       trade.executed_quantity = trade.quantity;
       trade.pnl = realisedPnl;
-      trade.net_amount = realisedPnl;
+
+      // Calculate brokerage using BrokerageSettings
+      let brokerage = 0;
+      try {
+        const BrokerageSettings = require('../models/BrokerageSettings');
+        const KiteInstrument = require('../models/KiteInstrument');
+        const ScriptQuantity = require('../models/ScriptQuantity');
+
+        // Resolve raw_name for per-instrument brokerage lookup
+        const kiteInst = await KiteInstrument.findOne({ instrument_token: trade.instrument_token });
+        const instrumentRawName = kiteInst?.raw_name || kiteInst?.name || null;
+
+        let brokerageRule = null;
+        if (instrumentRawName) {
+          brokerageRule = await BrokerageSettings.findOne({
+            exchange_name: trade.exchange,
+            script_name: instrumentRawName,
+            deleted_at: null
+          });
+        }
+        if (!brokerageRule) {
+          brokerageRule = await BrokerageSettings.findOne({
+            exchange_name: trade.exchange,
+            script_name: trade.tradingsymbol,
+            deleted_at: null
+          });
+        }
+        if (brokerageRule) {
+          if (brokerageRule.type === 'TURNOVER WISE') {
+            brokerage = (trade.price * trade.quantity) * (brokerageRule.brk_value / 100);
+          } else if (brokerageRule.type === 'LOT WISE') {
+            let lotSizeForBrk = 1;
+            if (kiteInst && kiteInst.lot_size) {
+              lotSizeForBrk = kiteInst.lot_size;
+            } else {
+              const lotDoc = await ScriptQuantity.findOne({ exchange_name: trade.exchange, script_name: trade.tradingsymbol, deleted_at: null });
+              lotSizeForBrk = lotDoc?.lot_size || 1;
+            }
+            const lots = trade.quantity / lotSizeForBrk;
+            brokerage = lots * brokerageRule.brk_value;
+          }
+        }
+      } catch (brErr) {
+        console.warn('[PriceQueue][Brokerage] Could not calculate brokerage:', brErr.message);
+      }
+
+      trade.brokerage = brokerage;
+      trade.net_amount = realisedPnl - brokerage;
       await trade.save();
 
       // Calculate margin impact and update balance
@@ -185,7 +233,7 @@ const _processJob = async (job) => {
       const prevMargin = Math.abs(prevNetQtyForMargin) * marginPerUnit;
       const newMargin = Math.abs(newNetQty) * marginPerUnit;
       const marginDelta = newMargin - prevMargin;
-      const balanceChange = realisedPnl - marginDelta;
+      const balanceChange = realisedPnl - marginDelta - brokerage;
 
       const user = await User.findById(trade.user_id);
       if (user) {
@@ -225,6 +273,7 @@ const _processJob = async (job) => {
               executedPrice: trade.price,
               livePrice: live_price,
               realisedPnl,
+              brokerage,
               marginDelta,
               balanceChange,
               positionClosed: realisedPnl !== 0,
@@ -256,6 +305,13 @@ const _processJob = async (job) => {
         pnl: realisedPnl,
         status: 'completed',
       });
+
+      // Invalidate metrics cache & push updated metrics via WebSocket
+      metricsEngine.invalidateUser(
+        trade.user_id,
+        livePriceService.latestPrices,
+        livePriceService.broadcastToUser.bind(livePriceService)
+      ).catch(err => console.error('[MetricsEngine] Limit order invalidation error:', err.message));
 
       // FCM push notification for pending order execution
       firebaseService.sendNotification(trade.user_id.toString(), 'pending_order', {

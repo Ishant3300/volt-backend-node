@@ -163,6 +163,31 @@ const userSchema = new mongoose.Schema({
   fcm_tokens: {
     type: [String],
     default: []
+  },
+  // ── Live Trading Metrics (updated on every tick & trade execution) ──
+  realised_pnl: {
+    type: Number,
+    default: 0
+  },
+  position_pnl: {
+    type: Number,
+    default: 0
+  },
+  m2m_pnl: {
+    type: Number,
+    default: 0
+  },
+  margin_used: {
+    type: Number,
+    default: 0
+  },
+  equity: {
+    type: Number,
+    default: 0
+  },
+  free_margin: {
+    type: Number,
+    default: 0
   }
 }, {
   timestamps: true
