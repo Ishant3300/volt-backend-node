@@ -549,12 +549,12 @@ const placeTrade = async (req, res) => {
                 const marginDelta = newMargin - prevMargin; // +ve = more margin needed
 
                 // #7 FIX: Block if free margin goes negative (balance - currentMargin - newMarginDelta < 0)
-                if (marginDelta > 0) {
-                    const freeMargin = user.balance - prevMargin;
-                    if (freeMargin < marginDelta) {
-                        throw new Error(`Insufficient free margin. Free: ₹${freeMargin.toFixed(2)}, Required: ₹${marginDelta.toFixed(2)}`);
-                    }
-                }
+                // if (marginDelta > 0) {
+                //     const freeMargin = user.balance - prevMargin;
+                //     if (freeMargin < marginDelta) {
+                //         throw new Error(`Insufficient free margin. Free: ₹${freeMargin.toFixed(2)}, Required: ₹${marginDelta.toFixed(2)}`);
+                //     }
+                // }
 
                 // #5 FIX: Calculate brokerage using BrokerageSettings
                 let brokerage = 0;
@@ -596,7 +596,7 @@ const placeTrade = async (req, res) => {
                 }
 
                 const balanceBefore = user.balance;
-                const balanceChange = realisedPnl - marginDelta - brokerage;
+                const balanceChange = realisedPnl - marginPerUnit - brokerage;
 
                 user.balance = user.balance + balanceChange;
                 newTrade.brokerage = brokerage;

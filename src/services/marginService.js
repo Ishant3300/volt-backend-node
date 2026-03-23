@@ -60,8 +60,9 @@ const calculateMargin = async (exchange, quantity, price, opts = {}) => {
     console.log(`💰 [Margin] percentage calc: qty=${quantity}, price=${price}, margin%=${rule.trade_margin}, result=${margin}`);
     return margin;
   }
-  // flat amount per unit
-  const margin = Math.abs(quantity) * rule.trade_margin;
+  // For amount the trade_margin will be deducted as given
+  const margin = rule.trade_margin;
+  console.log(rule.trade_margin)
   console.log(`💰 [Margin] flat calc: qty=${quantity}, flat=${rule.trade_margin}, result=${margin}`);
   return margin;
 };
