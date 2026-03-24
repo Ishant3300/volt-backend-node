@@ -9,7 +9,6 @@ const priceQueueService = require('./priceQueueService');
 const KiteInstrument = require('../models/KiteInstrument');
 const KiteMarketQuote = require('../models/KiteMarketQuote');
 const { LOG_LIVE_TICKS, LOG_WS_BROADCAST } = require('../config/logFlags');
-const metricsEngine = require('./metricsEngine');
 
 class LivePriceService {
   constructor() {
@@ -310,13 +309,6 @@ class LivePriceService {
           type: 'ticks',
           data: ticks,
         });
-
-        // Recalculate & push trading metrics for affected users
-        metricsEngine.onTickBatch(
-          ticks,
-          this.latestPrices,
-          this.broadcastToUser.bind(this)
-        );
       }
     } catch (error) {
       console.log('❌ Error processing Kite tick:', error.message);

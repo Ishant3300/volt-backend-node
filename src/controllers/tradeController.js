@@ -3,7 +3,6 @@ const User = require('../models/User');
 const Master = require('../models/Master');
 const KiteInstrument = require('../models/KiteInstrument');
 const BrokerageSettings = require('../models/BrokerageSettings');
-const tradeMetricsService = require('../services/tradeMetricsService');
 const kiteService = require('../services/kiteService');
 const TradeMargin = require('../models/TradeMargin');
 const ScriptQuantity = require('../models/ScriptQuantity');
@@ -13,7 +12,6 @@ const Transaction = require('../models/Transaction');
 const orderBookService = require('../services/orderBookService');
 const { calculateMargin } = require('../services/marginService');
 const firebaseService = require('../services/firebaseService');
-const metricsEngine = require('../services/metricsEngine');
 
 const _getLivePricesFromKite = async (instrumentTokens) => {
     if (!instrumentTokens || instrumentTokens.length === 0) return new Map();
@@ -638,14 +636,20 @@ const placeTrade = async (req, res) => {
 
         session.endSession();
 
-        // Invalidate metrics cache & push updated metrics via WebSocket
+        // Notify Flutter client so the orders tab refreshes trades
         if (resultTrade.status === 'completed') {
             const livePriceService = require('../services/livePriceService');
-            metricsEngine.invalidateUser(
-                resultTrade.user_id,
-                livePriceService.latestPrices,
-                livePriceService.broadcastToUser.bind(livePriceService)
-            ).catch(err => console.error('[MetricsEngine] Post-trade invalidation error:', err.message));
+            livePriceService.broadcastToUser(resultTrade.user_id.toString(), {
+                type: 'trade_executed',
+                trade_id: resultTrade._id.toString(),
+                instrument_token: resultTrade.instrument_token,
+                tradingsymbol: resultTrade.tradingsymbol,
+                transaction_type: resultTrade.transaction_type,
+                quantity: resultTrade.executed_quantity,
+                price: resultTrade.executed_price,
+                pnl: resultTrade.pnl,
+                brokerage: resultTrade.brokerage,
+            });
         }
 
         // Register pending LIMIT orders in Redis order book (outside the DB transaction)
@@ -734,7 +738,9 @@ const placeTrade = async (req, res) => {
 };
 
 /**
- * Get the current user's account metrics
+ * Get the current user's base account metrics (credit, equity, free_margin).
+ * These are the DB-stored snapshot values. The client computes realised_pnl,
+ * position_pnl, m2m_pnl, margin_used locally from trades + live ticks.
  */
 const getAccountMetrics = async (req, res) => {
     try {
@@ -743,19 +749,28 @@ const getAccountMetrics = async (req, res) => {
             return res.status(401).json({ success: false, message: 'Unauthorized' });
         }
 
-        // Usually, frontend has a WebSocket for live LTPs. Here we might fetch latest for all open positions.
-        // So we first find all active instrument_tokens for this user.
-        const trades = await Trade.find({ user_id: userId, status: 'completed' });
-        const activeTokens = [...new Set(trades.map(t => t.instrument_token))];
-
-        const ltpMap = await _getLivePricesFromKite(activeTokens.map(t => parseInt(t)));
-
-        const metrics = await tradeMetricsService.getUserMetrics(userId, ltpMap);
+        const user = await User.findById(userId, 'credits balance equity free_margin realised_pnl position_pnl m2m_pnl margin_used name username').lean();
+        if (!user) {
+            return res.status(404).json({ success: false, message: 'User not found' });
+        }
 
         res.status(200).json({
             success: true,
             message: 'Metrics fetched successfully',
-            data: metrics
+            data: {
+                user_id: userId,
+                name: user.name,
+                username: user.username,
+                credit: user.credits || 0,
+                balance: user.balance || 0,
+                equity: user.equity || user.credits || 0,
+                free_margin: user.free_margin || user.credits || 0,
+                // Also return last-saved computed metrics so client can seed from them
+                realised_pnl: Math.round((user.realised_pnl || 0) * 100) / 100,
+                position_pnl: Math.round((user.position_pnl || 0) * 100) / 100,
+                m2m_pnl: Math.round((user.m2m_pnl || 0) * 100) / 100,
+                margin_used: Math.round((user.margin_used || 0) * 100) / 100,
+            }
         });
     } catch (error) {
         res.status(500).json({
@@ -763,6 +778,40 @@ const getAccountMetrics = async (req, res) => {
             message: error.message,
             data: null
         });
+    }
+};
+
+/**
+ * Save client-computed metrics to DB.
+ * Called by Flutter periodically (and on app background/close) to cache
+ * the latest computed values. Also used by the 12:01 AM flush.
+ *
+ * Body: { realised_pnl, position_pnl, m2m_pnl, margin_used, equity, free_margin }
+ */
+const saveClientMetrics = async (req, res) => {
+    try {
+        const userId = req.user?.id || req.master?.id;
+        if (!userId) {
+            return res.status(401).json({ success: false, message: 'Unauthorized' });
+        }
+
+        const { realised_pnl, position_pnl, m2m_pnl, margin_used, equity, free_margin } = req.body;
+
+        await User.updateOne(
+            { _id: userId },
+            { $set: {
+                realised_pnl: Math.round((realised_pnl || 0) * 100) / 100,
+                position_pnl: Math.round((position_pnl || 0) * 100) / 100,
+                m2m_pnl: Math.round((m2m_pnl || 0) * 100) / 100,
+                margin_used: Math.round((margin_used || 0) * 100) / 100,
+                equity: Math.round((equity || 0) * 100) / 100,
+                free_margin: Math.round((free_margin || 0) * 100) / 100,
+            }}
+        );
+
+        res.status(200).json({ success: true, message: 'Metrics saved' });
+    } catch (error) {
+        res.status(500).json({ success: false, message: error.message });
     }
 };
 
@@ -787,17 +836,18 @@ getPositions = async (req, res) => {
         // Enrich trades with lot_size from KiteInstrument so Flutter can display lots vs qty
         const KiteInstrument = require('../models/KiteInstrument');
         const uniqueTokens = [...new Set(trades.map(t => t.instrument_token))];
-        const instruments = await KiteInstrument.find({ instrument_token: { $in: uniqueTokens } }, 'instrument_token lot_size segment');
+        const instruments = await KiteInstrument.find({ instrument_token: { $in: uniqueTokens } }, 'instrument_token lot_size segment raw_name name');
         const lotSizeMap = {};
         instruments.forEach(inst => {
-            lotSizeMap[inst.instrument_token] = { lot_size: inst.lot_size || 1, segment: inst.segment || '' };
+            lotSizeMap[inst.instrument_token] = { lot_size: inst.lot_size || 1, segment: inst.segment || '', raw_name: inst.raw_name || inst.name || '' };
         });
 
         const enrichedTrades = trades.map(t => {
             const plain = t.toJSON();
-            const info = lotSizeMap[t.instrument_token] || { lot_size: 1, segment: '' };
+            const info = lotSizeMap[t.instrument_token] || { lot_size: 1, segment: '', raw_name: '' };
             plain.lot_size = info.lot_size || 1;
             plain.segment = info.segment;
+            plain.raw_name = info.raw_name;
             return plain;
         });
 
@@ -937,11 +987,33 @@ const deleteTrade = async (req, res) => {
     }
 };
 
+/**
+ * Get brokerage rules for frontend brokerage calculation
+ */
+const getBrokerageRules = async (req, res) => {
+    try {
+        const rules = await BrokerageSettings.find({ deleted_at: null });
+        res.status(200).json({
+            success: true,
+            message: 'Brokerage rules fetched successfully',
+            data: rules
+        });
+    } catch (error) {
+        res.status(500).json({
+            success: false,
+            message: error.message,
+            data: null
+        });
+    }
+};
+
 module.exports = {
     placeTrade,
     cancelTrade,
     deleteTrade,
     getAccountMetrics,
+    saveClientMetrics,
     getPositions,
-    getMargins
+    getMargins,
+    getBrokerageRules
 };

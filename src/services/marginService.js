@@ -73,11 +73,9 @@ const calculateMargin = async (exchange, quantity, price, opts = {}) => {
   if (!rule) return 0;
 
   if (isLotBased && rule.amount_type === 'amount') {
-    // Lot-based: trade_margin is flat amount per LOT
-    // numberOfLots = quantity / lotSize, margin = lots * trade_margin
-    const lots = lotSize > 1 ? Math.abs(quantity) / lotSize : Math.abs(quantity);
-    const margin = lots * rule.trade_margin;
-    if (LOG_MARGIN_CALC) console.log(`💰 [Margin] lot-based calc: qty=${quantity}, lotSize=${lotSize}, lots=${lots}, perLot=${rule.trade_margin}, result=${margin}`);
+    // Lot-based: trade_margin is a flat amount — just use it directly (NOT multiplied by lots or qty)
+    const margin = rule.trade_margin;
+    if (LOG_MARGIN_CALC) console.log(`💰 [Margin] lot-based calc: qty=${quantity}, lotSize=${lotSize}, flatMargin=${rule.trade_margin}, result=${margin}`);
     return margin;
   }
 

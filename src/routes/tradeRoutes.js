@@ -23,11 +23,17 @@ router.delete('/:tradeId', tradeController.deleteTrade);
 // Get current user metrics
 router.get('/metrics', tradeController.getAccountMetrics);
 
+// Save client-computed metrics to DB (called by Flutter periodically)
+router.post('/metrics', tradeController.saveClientMetrics);
+
 // Get positions for frontend metrics calculation
 router.get('/positions', tradeController.getPositions);
 
 // Get margin rules for frontend metrics calculation
 router.get('/margins', tradeController.getMargins);
+
+// Get brokerage rules for frontend brokerage calculation
+router.get('/brokerage-rules', tradeController.getBrokerageRules);
 
 // Trade report for PDF generation
 router.get('/report', getTradeReport);

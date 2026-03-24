@@ -140,12 +140,9 @@ server.listen(PORT, async () => {
   livePriceService.init(server);
   console.log('📡 Live price WebSocket ready at ws://localhost:' + PORT + '/ws/live-prices');
 
-  // Initialize metrics engine (build position caches for all users)
+  // Schedule lightweight midnight audit for metrics (12:01 AM)
   const metricsEngine = require('./services/metricsEngine');
-  metricsEngine.initialize();
-
-  // Schedule midnight DB flush for metrics (saves to DB once daily at 12:00 AM)
-  metricsEngine.scheduleMidnightFlush(() => livePriceService.latestPrices);
+  metricsEngine.scheduleMidnightAudit();
 
   // Initialize margin square off monitoring service
   const marginSquareOffService = require('./services/marginSquareOffService');
