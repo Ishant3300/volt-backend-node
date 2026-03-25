@@ -34,7 +34,7 @@ const {
   deleteBrokerageSettings
 } = require('../controllers/adminController');
 const { getLotNamesByExchange, getUniqueRawNamesBySegment, bulkCreateGroup, getGroupInstruments, bulkCreateBrokerage, getBrokerageByExchange, bulkCreateTradeMargin, getTradeMarginByExchange, bulkCreateScriptQuantity, getScriptQuantityByExchange } = require('../controllers/groupedQuantityController');
-const { authenticateAdmin, authenticateAdminOrMaster, authenticateMaster } = require('../middlewares/auth');
+const { authenticateAdmin, authenticateAdminOrMaster, authenticateMaster, authenticateAny } = require('../middlewares/auth');
 
 // All routes require admin authentication
 
@@ -96,5 +96,11 @@ router.post('/refresh-close-prices', authenticateAdmin, async (req, res) => {
     res.status(500).json({ success: false, message: error.message });
   }
 });
+
+// ==================== ANNOUNCEMENT ROUTES ====================
+const { setAnnouncement, clearAnnouncement, getActiveAnnouncement } = require('../controllers/announcementController');
+router.post('/announcements', authenticateAdmin, setAnnouncement);
+router.delete('/announcements', authenticateAdmin, clearAnnouncement);
+router.get('/announcements/active', authenticateAny, getActiveAnnouncement);
 
 module.exports = router;

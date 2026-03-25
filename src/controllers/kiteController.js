@@ -182,6 +182,22 @@ const fetchInstruments = async (req, res) => {
  */
 const getInstrumentsInfo = async (req, res) => {
   try {
+    // If tokens query param is provided, return only those instruments
+    const tokensParam = req.query.tokens;
+    if (tokensParam) {
+      const tokens = tokensParam.split(',').filter(t => t.trim());
+      const KiteInstrument = require('../models/KiteInstrument');
+      const instruments = await KiteInstrument.find(
+        { instrument_token: { $in: tokens } },
+        'instrument_token lot_size segment name raw_name'
+      ).lean();
+      return res.status(200).json({
+        success: true,
+        message: 'Instruments info retrieved',
+        data: instruments
+      });
+    }
+
     const info = await kiteService.getInstrumentsInfo();
     
     res.status(200).json({

@@ -92,17 +92,34 @@ class TradeMetricsService {
         const equity = credit + m2mPnl;
         const freeMargin = equity - totalMarginUsed;
 
-        // Map aggregated positions for return
+        // Map aggregated positions for return — enrich with segment + lot_size from KiteInstrument
+        const KiteInstrument = require('../models/KiteInstrument');
+        const uniqueTokens = [...new Set(trades.map(t => t._id.instrument_token))];
+        const instruments = await KiteInstrument.find(
+            { instrument_token: { $in: uniqueTokens } },
+            'instrument_token lot_size segment'
+        ).lean();
+        const instrMap = {};
+        instruments.forEach(inst => {
+            instrMap[inst.instrument_token] = {
+                lot_size: inst.lot_size || 1,
+                segment: inst.segment || ''
+            };
+        });
+
         const enrichedPositions = trades
             .filter(t => (t.total_buy_qty - t.total_sell_qty) !== 0)
             .map(p => {
                 const netQty = p.total_buy_qty - p.total_sell_qty;
                 const avgBuyPrice = p.total_buy_qty > 0 ? p.total_buy_value / p.total_buy_qty : 0;
                 const avgSellPrice = p.total_sell_qty > 0 ? p.total_sell_value / p.total_sell_qty : 0;
+                const info = instrMap[p._id.instrument_token] || { lot_size: 1, segment: '' };
                 return {
                     instrument_token: p._id.instrument_token,
                     tradingsymbol: p._id.tradingsymbol,
                     exchange: p._id.exchange,
+                    segment: info.segment,
+                    lot_size: info.lot_size,
                     net_qty: netQty,
                     avg_buy_price: Math.round(avgBuyPrice * 100) / 100,
                     avg_sell_price: Math.round(avgSellPrice * 100) / 100,

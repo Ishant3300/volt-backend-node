@@ -73,7 +73,7 @@ const getAggregatedPositions = async (req, res) => {
     ]);
 
     // Filter to only instruments with open positions (netQty != 0)
-    const result = positions
+    const openPositions = positions
       .map(p => {
         const netQty = p.total_buy_qty - p.total_sell_qty;
         return {
@@ -89,6 +89,26 @@ const getAggregatedPositions = async (req, res) => {
         };
       })
       .filter(p => p.net_qty !== 0);
+
+    // Enrich with segment + lot_size from KiteInstrument
+    const KiteInstrument = require('../models/KiteInstrument');
+    const uniqueTokens = [...new Set(openPositions.map(p => p.instrument_token))];
+    const instruments = await KiteInstrument.find(
+      { instrument_token: { $in: uniqueTokens } },
+      'instrument_token lot_size segment'
+    ).lean();
+    const instrMap = {};
+    instruments.forEach(inst => {
+      instrMap[inst.instrument_token] = {
+        lot_size: inst.lot_size || 1,
+        segment: inst.segment || ''
+      };
+    });
+
+    const result = openPositions.map(p => {
+      const info = instrMap[p.instrument_token] || { lot_size: 1, segment: '' };
+      return { ...p, segment: info.segment, lot_size: info.lot_size };
+    });
 
     res.status(200).json({
       success: true,
