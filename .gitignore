@@ -37,6 +37,7 @@ build/
 out/
 
 # IDE and Editor files
+.kiro/
 .vscode/
 .idea/
 *.swp
