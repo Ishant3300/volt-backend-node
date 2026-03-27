@@ -2,6 +2,8 @@ const Trade = require('../models/Trade');
 const User = require('../models/User');
 const Master = require('../models/Master');
 const { calculateMargin } = require('./marginService');
+const BrokerageSettings = require('../models/BrokerageSettings');
+const KiteInstrument = require('../models/KiteInstrument');
 
 /**
  * Service to dynamically calculate the 7 required account metrics for a user or master.
@@ -20,7 +22,7 @@ class TradeMetricsService {
         const credit = user.credits || 0;
         const balance = user.balance || 0;
 
-        // Aggregate trades
+        // Aggregate trades per instrument
         const trades = await Trade.aggregate([
             { $match: { user_id: user._id, status: 'completed', deleted_at: null } },
             {
@@ -45,13 +47,48 @@ class TradeMetricsService {
         let totalPositionPnl = 0;
         let totalMarginUsed = 0;
 
-        // Realised P&L = sum of (pnl − brokerage) across all completed trades.
-        // Captures booked profit/loss minus brokerage charges.
-        const realisedPnlAgg = await Trade.aggregate([
-            { $match: { user_id: user._id, status: 'completed', deleted_at: null } },
-            { $group: { _id: null, total: { $sum: { $subtract: ['$pnl', '$brokerage'] } } } }
-        ]);
-        let totalRealisedPnl = realisedPnlAgg.length > 0 ? realisedPnlAgg[0].total : 0;
+        // Recalculate brokerage from BrokerageSettings (stored trade.brokerage is unreliable)
+        const brkRules = await BrokerageSettings.find({ deleted_at: null }).lean();
+
+        const rawTrades = await Trade.find({
+            user_id: user._id, status: 'completed', deleted_at: null
+        }).select('instrument_token transaction_type executed_quantity executed_price pnl').lean();
+
+        const allTokens = [...new Set(rawTrades.map(t => t.instrument_token))];
+        const kiteInstruments = await KiteInstrument.find(
+            { instrument_token: { $in: allTokens } },
+            'instrument_token lot_size segment raw_name'
+        ).lean();
+        const kiteMap = {};
+        kiteInstruments.forEach(ki => { kiteMap[ki.instrument_token] = ki; });
+
+        let totalFifoPnl = 0;
+        let totalBrokerage = 0;
+        for (const t of rawTrades) {
+            totalFifoPnl += (t.pnl || 0);
+
+            const ki = kiteMap[t.instrument_token];
+            const seg = ki?.segment || '';
+            const rawName = ki?.raw_name || '';
+            const lotSize = ki?.lot_size || 1;
+
+            let brkRule = null;
+            if (rawName && seg) brkRule = brkRules.find(r => r.script_name?.toUpperCase() === rawName.toUpperCase() && r.exchange_name === seg.toUpperCase());
+            if (!brkRule && rawName) brkRule = brkRules.find(r => r.script_name?.toUpperCase() === rawName.toUpperCase());
+            if (!brkRule && seg) brkRule = brkRules.find(r => r.exchange_name === seg.toUpperCase() && !r.script_name);
+            if (!brkRule) brkRule = brkRules.find(r => r.exchange_name === (seg.split('-')[0] || '').toUpperCase() && !r.script_name);
+
+            if (brkRule) {
+                if (brkRule.type === 'TURNOVER WISE') {
+                    totalBrokerage += t.executed_price * t.executed_quantity * (brkRule.brk_value / 10000);
+                } else if (brkRule.type === 'LOT WISE') {
+                    totalBrokerage += (lotSize > 1 ? t.executed_quantity / lotSize : t.executed_quantity) * brkRule.brk_value;
+                }
+            }
+        }
+
+        // Realised P&L = sum(trade.pnl) - recalculated brokerage
+        let totalRealisedPnl = totalFifoPnl - totalBrokerage;
 
         for (const position of trades) {
             const { total_buy_qty, total_sell_qty, total_buy_value, total_sell_value } = position;
@@ -85,22 +122,14 @@ class TradeMetricsService {
             }
         }
 
-
-
         const m2mPnl = totalRealisedPnl + totalPositionPnl;
         // Equity = Credit + M2M P&L
         const equity = credit + m2mPnl;
         const freeMargin = equity - totalMarginUsed;
 
-        // Map aggregated positions for return — enrich with segment + lot_size from KiteInstrument
-        const KiteInstrument = require('../models/KiteInstrument');
-        const uniqueTokens = [...new Set(trades.map(t => t._id.instrument_token))];
-        const instruments = await KiteInstrument.find(
-            { instrument_token: { $in: uniqueTokens } },
-            'instrument_token lot_size segment'
-        ).lean();
+        // Map aggregated positions for return — reuse kiteMap from brokerage calculation
         const instrMap = {};
-        instruments.forEach(inst => {
+        kiteInstruments.forEach(inst => {
             instrMap[inst.instrument_token] = {
                 lot_size: inst.lot_size || 1,
                 segment: inst.segment || ''

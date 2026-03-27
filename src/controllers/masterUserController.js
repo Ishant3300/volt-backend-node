@@ -313,11 +313,10 @@ const updateUserDetails = async (req, res) => {
       fresh_stoploss
     } = req.body;
 
-    const user = await User.findOne({
-      _id: id,
-      master_id: req.master.id,
-      deleted_at: null
-    });
+    const query = { _id: id, deleted_at: null };
+    if (req.master) query.master_id = req.master.id;
+
+    const user = await User.findOne(query);
 
     if (!user) {
       return res.status(404).json({

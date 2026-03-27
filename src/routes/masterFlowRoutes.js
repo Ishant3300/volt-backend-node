@@ -50,6 +50,7 @@ const {
 
 const { getPnlSummary } = require('../controllers/pnlSummaryController');
 const { getWeeklyAdminReport } = require('../controllers/weeklyAdminController');
+const { getSettlementReport } = require('../controllers/settlementController');
 
 // All routes require admin or master authentication
 router.use(authenticateAdminOrMaster);
@@ -161,6 +162,61 @@ router.get('/pnl-summary', getPnlSummary);
 
 // Weekly admin report: Master sees per-user, Admin sees per-master
 router.get('/weekly-admin-report', getWeeklyAdminReport);
+
+// Settlement report: per-user P&L + brokerage for a given date
+router.get('/settlement-report', getSettlementReport);
+
+// ============================================
+// Sharing Details Route
+// ============================================
+router.get('/sharing-details', async (req, res) => {
+  try {
+    const { master_id } = req.query;
+    const role = req.admin ? 'admin' : 'master';
+    const callerId = req.admin ? req.admin.id : req.master.id;
+
+    // Determine which master's children to fetch
+    const targetMasterId = (role === 'admin' && master_id) ? master_id : callerId;
+
+    // Fetch the master itself
+    const master = await Master.findOne({ _id: targetMasterId, deleted_at: null })
+      .select('name username pnl_sharing brokerage_sharing')
+      .lean();
+
+    // Fetch child masters under this master
+    const childMasters = await Master.find({ master_id: targetMasterId, deleted_at: null })
+      .select('name username pnl_sharing brokerage_sharing')
+      .sort({ createdAt: -1 })
+      .lean();
+
+    // Fetch users under this master
+    const users = await User.find({ master_id: targetMasterId, deleted_at: null })
+      .select('name username pnl_sharing brokerage_sharing')
+      .sort({ createdAt: -1 })
+      .lean();
+
+    const formatEntry = (doc, role) => ({
+      id: doc._id,
+      name: doc.name,
+      username: doc.username,
+      role,
+      pnl_sharing: doc.pnl_sharing || 0,
+      brokerage_sharing: doc.brokerage_sharing || 0,
+    });
+
+    const data = {
+      master: master ? formatEntry(master, 'MASTER') : null,
+      children: [
+        ...childMasters.map(m => formatEntry(m, 'MASTER')),
+        ...users.map(u => formatEntry(u, 'USER')),
+      ],
+    };
+
+    res.status(200).json({ success: true, data });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
 
 // ============================================
 // Login History Route

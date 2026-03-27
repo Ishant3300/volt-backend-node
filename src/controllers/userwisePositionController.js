@@ -1,6 +1,9 @@
 const Trade = require('../models/Trade');
 const User = require('../models/User');
 const Master = require('../models/Master');
+const { getLatestQuotes } = require('../services/kiteService');
+const KiteInstrument = require('../models/KiteInstrument');
+const { calculateMargin } = require('../services/marginService');
 
 /**
  * GET /api/trade/userwise-positions
@@ -96,16 +99,57 @@ const getUserwisePositions = async (req, res) => {
 
     // Build result — only open positions (net_qty != 0)
     const result = [];
-    for (const p of positions) {
-      const netQty = p.total_buy_qty - p.total_sell_qty;
-      if (netQty === 0) continue;
+    const openPositions = positions.filter(p => (p.total_buy_qty - p.total_sell_qty) !== 0);
 
+    // Fetch LTP for open positions
+    const openTokens = [...new Set(openPositions.map(p => parseInt(p._id.instrument_token)))];
+    let ltpMap = new Map();
+    if (openTokens.length > 0) {
+      try {
+        const quotes = await getLatestQuotes(openTokens, 100);
+        quotes.forEach(q => { ltpMap.set(q.instrument_token.toString(), q.last_price); });
+      } catch (_) {}
+    }
+
+    // Fetch segment + lot_size from KiteInstrument
+    const instrTokens = [...new Set(openPositions.map(p => p._id.instrument_token))];
+    const instruments = await KiteInstrument.find(
+      { instrument_token: { $in: instrTokens } },
+      'instrument_token lot_size segment'
+    ).lean();
+    const instrMap = {};
+    instruments.forEach(inst => {
+      instrMap[inst.instrument_token] = { lot_size: inst.lot_size || 1, segment: inst.segment || '' };
+    });
+
+    for (const p of openPositions) {
+      const netQty = p.total_buy_qty - p.total_sell_qty;
       const uid = p._id.user_id.toString();
       const info = userMap[uid];
       if (!info) continue;
 
       const avgBuy = p.total_buy_qty > 0 ? p.total_buy_value / p.total_buy_qty : 0;
       const avgSell = p.total_sell_qty > 0 ? p.total_sell_value / p.total_sell_qty : 0;
+      const avgRate = netQty > 0 ? avgBuy : avgSell;
+      const ltp = ltpMap.get(p._id.instrument_token) || avgRate;
+      const instInfo = instrMap[p._id.instrument_token] || { lot_size: 1, segment: '' };
+
+      let floatingPnl = 0;
+      if (netQty > 0) floatingPnl = (ltp - avgBuy) * netQty;
+      else floatingPnl = (avgSell - ltp) * Math.abs(netQty);
+
+      // Use marginService for proper margin calculation (same as orders page)
+      let marginUsed = 0;
+      try {
+        marginUsed = await calculateMargin(p.exchange, Math.abs(netQty), ltp, {
+          instrumentToken: p._id.instrument_token,
+          tradingsymbol: p.tradingsymbol,
+        });
+      } catch (_) {
+        marginUsed = avgRate * Math.abs(netQty);
+      }
+
+      const pctPnl = marginUsed > 0 ? (floatingPnl / marginUsed) * 100 : 0;
 
       result.push({
         user_id: uid,
@@ -114,14 +158,15 @@ const getUserwisePositions = async (req, res) => {
         instrument_token: p._id.instrument_token,
         tradingsymbol: p.tradingsymbol,
         exchange: p.exchange,
+        segment: instInfo.segment,
+        lot_size: instInfo.lot_size,
         net_qty: netQty,
         side: netQty > 0 ? 'BUY' : 'SELL',
-        avg_buy_price: Math.round(avgBuy * 100) / 100,
-        avg_sell_price: Math.round(avgSell * 100) / 100,
-        total_buy_qty: p.total_buy_qty,
-        total_sell_qty: p.total_sell_qty,
-        total_buy_value: Math.round(p.total_buy_value * 100) / 100,
-        total_sell_value: Math.round(p.total_sell_value * 100) / 100
+        avg_rate: Math.round(avgRate * 100) / 100,
+        ltp: Math.round(ltp * 100) / 100,
+        floating_pnl: Math.round(floatingPnl * 100) / 100,
+        pct_pnl: Math.round(pctPnl * 100) / 100,
+        margin_used: Math.round(marginUsed * 100) / 100,
       });
     }
 

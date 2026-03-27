@@ -58,17 +58,25 @@ const getAccountSummary = async (req, res) => {
     }
 
     const trades = await Trade.find(matchStage)
-      .select('user_id instrument_token tradingsymbol exchange transaction_type executed_quantity executed_price')
+      .select('user_id instrument_token tradingsymbol exchange transaction_type executed_quantity executed_price pnl brokerage')
       .lean();
 
-    // Load brokerage settings for brokerage mode
-    let brkMap = {};
-    if (mode === 'brokerage') {
-      const brkSettings = await BrokerageSettings.find({ deleted_at: null }).lean();
-      brkMap = _buildBrkMap(brkSettings);
-    }
+    // Group by instrument — use pre-computed pnl from trade engine, recalculate brokerage
+    const BrokerageSettings = require('../models/BrokerageSettings');
+    const KiteInstrument = require('../models/KiteInstrument');
+    const brkRules = await BrokerageSettings.find({ deleted_at: null }).lean();
 
-    // Group by instrument
+    // Build instrument info map for lot_size + segment
+    const allTokens = [...new Set(trades.map(t => t.instrument_token))];
+    const kiteInstruments = await KiteInstrument.find(
+      { instrument_token: { $in: allTokens } },
+      'instrument_token lot_size segment raw_name'
+    ).lean();
+    const kiteMap = {};
+    kiteInstruments.forEach(ki => {
+      kiteMap[ki.instrument_token] = ki;
+    });
+
     const instMap = {};
     for (const t of trades) {
       const key = t.instrument_token;
@@ -78,6 +86,7 @@ const getAccountSummary = async (req, res) => {
           tradingsymbol: t.tradingsymbol,
           exchange: t.exchange,
           buyQty: 0, sellQty: 0, buyVal: 0, sellVal: 0,
+          totalPnl: 0, totalBrokerage: 0,
         };
       }
       const a = instMap[key];
@@ -88,32 +97,75 @@ const getAccountSummary = async (req, res) => {
         a.sellQty += t.executed_quantity;
         a.sellVal += t.executed_quantity * t.executed_price;
       }
+      a.totalPnl += (t.pnl || 0);
+
+      // Recalculate brokerage per trade using same logic as Flutter client
+      const ki = kiteMap[t.instrument_token];
+      const seg = ki?.segment || t.exchange;
+      const rawName = ki?.raw_name || '';
+      const lotSize = ki?.lot_size || 1;
+
+      let brkRule = null;
+      if (rawName) {
+        brkRule = brkRules.find(r => r.script_name?.toUpperCase() === rawName.toUpperCase() && r.exchange_name === seg.toUpperCase());
+      }
+      if (!brkRule && rawName) {
+        brkRule = brkRules.find(r => r.script_name?.toUpperCase() === rawName.toUpperCase());
+      }
+      if (!brkRule) {
+        brkRule = brkRules.find(r => r.exchange_name === seg.toUpperCase());
+      }
+      if (!brkRule) {
+        brkRule = brkRules.find(r => r.exchange_name === t.exchange.toUpperCase());
+      }
+
+      let tradeBrk = 0;
+      if (brkRule) {
+        if (brkRule.type === 'TURNOVER WISE') {
+          tradeBrk = t.executed_price * t.executed_quantity * (brkRule.brk_value / 10000);
+        } else if (brkRule.type === 'LOT WISE') {
+          const lots = lotSize > 1 ? t.executed_quantity / lotSize : t.executed_quantity;
+          tradeBrk = lots * brkRule.brk_value;
+        }
+      }
+      a.totalBrokerage += tradeBrk;
     }
 
     // Compute per-instrument results
     const instruments = [];
     let totalPnl = 0, totalBrokerage = 0;
 
+    // Fetch LTP for open positions to compute floating P&L
+    const openTokens = Object.values(instMap)
+      .filter(a => (a.buyQty - a.sellQty) !== 0)
+      .map(a => parseInt(a.instrument_token));
+    let ltpMap = new Map();
+    if (openTokens.length > 0) {
+      try {
+        const { getLatestQuotes } = require('../services/kiteService');
+        const quotes = await getLatestQuotes(openTokens, 100);
+        quotes.forEach(q => {
+          ltpMap.set(q.instrument_token.toString(), q.last_price);
+        });
+      } catch (_) {}
+    }
+
     for (const a of Object.values(instMap)) {
       const avgBuy = a.buyQty > 0 ? a.buyVal / a.buyQty : 0;
       const avgSell = a.sellQty > 0 ? a.sellVal / a.sellQty : 0;
       const netQty = a.buyQty - a.sellQty;
-      let pnl = 0;
 
-      if (netQty === 0) {
-        pnl = a.sellVal - a.buyVal;
-      } else if (netQty > 0) {
-        pnl = a.sellVal - (a.sellQty * avgBuy);
-      } else {
-        pnl = (a.buyQty * avgSell) - a.buyVal;
+      // Realised P&L from trade engine + floating P&L from live prices
+      let pnl = a.totalPnl;
+      if (netQty !== 0) {
+        const ltp = ltpMap.get(a.instrument_token) || (netQty > 0 ? avgBuy : avgSell);
+        if (netQty > 0) {
+          pnl += (ltp - avgBuy) * netQty;
+        } else {
+          pnl += (avgSell - ltp) * Math.abs(netQty);
+        }
       }
-
-      let brokerage = 0;
-      const matchedQty = Math.min(a.buyQty, a.sellQty);
-      if (matchedQty > 0) {
-        const category = _getBrkCategory(a.exchange, a.tradingsymbol);
-        brokerage = _getBrkForTrade(category, a.tradingsymbol, avgBuy, avgSell, matchedQty, brkMap);
-      }
+      const brokerage = a.totalBrokerage;
 
       totalPnl += pnl;
       totalBrokerage += brokerage;
