@@ -238,19 +238,19 @@ const _processJob = async (job) => {
       const user = await User.findById(trade.user_id);
       if (user) {
         // Reject if insufficient balance for opening positions
-        if (marginDelta > 0 && (user.balance + balanceChange) < 0) {
+        if (marginDelta > 0 && (user.equity + balanceChange) < 0) {
           trade.status = 'rejected';
           trade.pnl = 0;
           trade.net_amount = 0;
           await trade.save();
-          console.log(`⚠️ [PriceQueue] Rejected ${trade.tradingsymbol} - insufficient balance (need ₹${marginDelta.toFixed(2)}, have ₹${user.balance.toFixed(2)})`);
+          console.log(`⚠️ [PriceQueue] Rejected ${trade.tradingsymbol} - insufficient balance (need ₹${marginDelta.toFixed(2)}, have ₹${user.equity.toFixed(2)})`);
           if (match.side === 'BUY') executedBuys.push(match.id);
           else executedSells.push(match.id);
           continue;
         }
 
-        const balanceBefore = user.balance;
-        user.balance += balanceChange;
+        const balanceBefore = user.equity;
+        user.equity += balanceChange;
         await user.save();
 
         // Log transaction
@@ -266,7 +266,7 @@ const _processJob = async (job) => {
             referenceId: trade._id,
             referenceModel: 'Trade',
             balanceBefore,
-            balanceAfter: user.balance,
+            balanceAfter: user.equity,
             metadata: {
               tradingsymbol: trade.tradingsymbol,
               quantity: trade.quantity,

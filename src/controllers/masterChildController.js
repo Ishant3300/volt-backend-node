@@ -68,8 +68,8 @@ const createChildMaster = async (req, res) => {
 
         if (!parentMaster) throw new Error('Parent master not found');
         if (!parentMaster.add_master) throw new Error('No permission to create child masters');
-        if (parentMaster.balance < credits) {
-          throw new Error(`Insufficient balance. Available: ${parentMaster.balance}, Required: ${credits}`);
+        if (parentMaster.equity < credits) {
+          throw new Error(`Insufficient balance. Available: ${parentMaster.equity}, Required: ${credits}`);
         }
 
         // Account limit enforcement
@@ -121,7 +121,7 @@ const createChildMaster = async (req, res) => {
         username,
         password: hashedPassword,
         credits,
-        balance: credits,
+        equity: credits,
         note,
         pnl_sharing,
         brokerage_sharing,
@@ -144,14 +144,14 @@ const createChildMaster = async (req, res) => {
       let prevMasterBalance = 0;
 
       if (parentMaster) {
-        prevMasterBalance = parentMaster.balance;
-        parentMaster.balance -= credits;
+        prevMasterBalance = parentMaster.equity;
+        parentMaster.equity -= credits;
         parentMaster.pnl_sharing -= pnl_sharing;
         parentMaster.brokerage_sharing -= brokerage_sharing;
         await parentMaster.save({ session });
 
         console.log('✅ Parent master updated:');
-        console.log(`   Balance: ${prevMasterBalance} -> ${parentMaster.balance}`);
+        console.log(`   Balance: ${prevMasterBalance} -> ${parentMaster.equity}`);
         console.log(`   P&L Sharing: ${parentMaster.pnl_sharing + pnl_sharing}% -> ${parentMaster.pnl_sharing}%`);
 
         const masterTx = new Transaction({
@@ -164,7 +164,7 @@ const createChildMaster = async (req, res) => {
           referenceId: childMaster._id,
           referenceModel: 'Master',
           balanceBefore: prevMasterBalance,
-          balanceAfter: parentMaster.balance,
+          balanceAfter: parentMaster.equity,
           metadata: { note: note || 'Deducted balance for new child master creation' }
         });
         await masterTx.save({ session });
@@ -187,7 +187,7 @@ const createChildMaster = async (req, res) => {
 
       resultData = { child_master: childMaster.toJSON() };
       if (parentMaster) {
-        resultData.parent_master_remaining_balance = parentMaster.balance;
+        resultData.parent_master_remaining_balance = parentMaster.equity;
         resultData.parent_master_remaining_pnl_sharing = parentMaster.pnl_sharing;
         resultData.parent_master_remaining_brokerage_sharing = parentMaster.brokerage_sharing;
       }
@@ -460,11 +460,11 @@ const creditChildMaster = async (req, res) => {
     }
 
     const previousCredits = childMaster.credits;
-    const previousBalance = childMaster.balance;
+    const previousBalance = childMaster.equity;
 
     // Balance increases; credits only rises if balance exceeds it
-    childMaster.balance += amount;
-    childMaster.credits = Math.max(childMaster.credits, childMaster.balance);
+    childMaster.equity += amount;
+    childMaster.credits = Math.max(childMaster.credits, childMaster.equity);
     await childMaster.save();
 
     // Create transaction record
@@ -528,7 +528,7 @@ const debitChildMaster = async (req, res) => {
       });
     }
 
-    if (childMaster.balance < amount) {
+    if (childMaster.equity < amount) {
       return res.status(400).json({
         success: false,
         message: 'Insufficient balance',
@@ -537,10 +537,10 @@ const debitChildMaster = async (req, res) => {
     }
 
     const previousCredits = childMaster.credits;
-    const previousBalance = childMaster.balance;
+    const previousBalance = childMaster.equity;
 
     // Deduct from balance only; credits stay unchanged
-    childMaster.balance -= amount;
+    childMaster.equity -= amount;
     await childMaster.save();
 
     // Create transaction record

@@ -29,6 +29,48 @@ const _getLivePricesFromKite = async (instrumentTokens) => {
 };
 
 /**
+ * Compute floating P&L for a user's open positions using live LTP.
+ * Returns the total unrealised P&L across all open instruments.
+ */
+const _computeUserFloatingPnl = async (userId, session) => {
+    try {
+        const trades = await Trade.aggregate([
+            { $match: { user_id: userId, status: 'completed', deleted_at: null } },
+            { $group: {
+                _id: '$instrument_token',
+                total_buy_qty: { $sum: { $cond: [{ $eq: ['$transaction_type', 'BUY'] }, '$executed_quantity', 0] } },
+                total_sell_qty: { $sum: { $cond: [{ $eq: ['$transaction_type', 'SELL'] }, '$executed_quantity', 0] } },
+                total_buy_value: { $sum: { $cond: [{ $eq: ['$transaction_type', 'BUY'] }, { $multiply: ['$executed_quantity', '$executed_price'] }, 0] } },
+                total_sell_value: { $sum: { $cond: [{ $eq: ['$transaction_type', 'SELL'] }, { $multiply: ['$executed_quantity', '$executed_price'] }, 0] } },
+            }}
+        ]).session(session);
+
+        // Filter to open positions only
+        const openPositions = trades.filter(t => (t.total_buy_qty - t.total_sell_qty) !== 0);
+        if (openPositions.length === 0) return 0;
+
+        // Fetch live prices for open position tokens
+        const tokens = openPositions.map(p => parseInt(p._id));
+        const ltpMap = await _getLivePricesFromKite(tokens);
+
+        let totalFloating = 0;
+        for (const pos of openPositions) {
+            const netQty = pos.total_buy_qty - pos.total_sell_qty;
+            const avgBuy = pos.total_buy_qty > 0 ? pos.total_buy_value / pos.total_buy_qty : 0;
+            const avgSell = pos.total_sell_qty > 0 ? pos.total_sell_value / pos.total_sell_qty : 0;
+            const ltp = ltpMap.get(parseInt(pos._id)) || ltpMap.get(pos._id.toString()) || (netQty > 0 ? avgBuy : avgSell);
+
+            if (netQty > 0) totalFloating += (ltp - avgBuy) * netQty;
+            else if (netQty < 0) totalFloating += (avgSell - ltp) * Math.abs(netQty);
+        }
+        return Math.round(totalFloating * 100) / 100;
+    } catch (err) {
+        console.error('Error computing floating P&L:', err.message);
+        return 0; // Fallback: assume 0 floating if computation fails
+    }
+};
+
+/**
  * Place a new trade order
  */
 const placeTrade = async (req, res) => {
@@ -85,6 +127,10 @@ const placeTrade = async (req, res) => {
             if (!user) {
                 throw new Error('User not found');
             }
+
+            // Compute live equity = DB equity + floating P&L from open positions
+            const floatingPnl = await _computeUserFloatingPnl(user._id, session);
+            const liveEquity = (user.equity || 0) + floatingPnl;
 
             // ── BET check: if bet is OFF, user cannot trade at all (BUY or SELL) ──
             // Admin placing on behalf of user bypasses this check
@@ -295,7 +341,7 @@ const placeTrade = async (req, res) => {
                         }
 
                         const marginPerUnit = await calculateMargin(normalizedExchange, 1, priceForMargin, { rawName: instrumentRawName, instrumentToken: instrument_token, tradingsymbol });
-                        const availableBalance = user.balance || 0;
+                        const availableBalance = liveEquity;
                         const maxAffordableQty = marginPerUnit > 0 ? Math.floor(availableBalance / marginPerUnit) : remainingQty;
                         const effectiveMaxQty = Math.min(remainingQty, maxAffordableQty);
 
@@ -354,7 +400,7 @@ const placeTrade = async (req, res) => {
                         }
 
                         const marginPerLot = await calculateMargin(normalizedExchange, lotSize, priceForMargin, { rawName: instrumentRawName, instrumentToken: instrument_token, tradingsymbol });
-                        const availableBalance = user.balance || 0;
+                        const availableBalance = liveEquity;
                         const maxAffordableLots = marginPerLot > 0 ? Math.floor(availableBalance / marginPerLot) : remainingLots;
                         const effectiveMaxLots = Math.min(remainingLots, maxAffordableLots);
 
@@ -540,16 +586,19 @@ const placeTrade = async (req, res) => {
                 const newNetQty = prevNetQtyForMargin + (isBuy ? quantity : -quantity);
 
                 const normalizedExchange = ((segment || exchange || '').toUpperCase()) === 'GLOBAL' ? 'INDICES' : (segment || exchange || '').toUpperCase();
-                // Margin per unit at execution price (per-instrument lookup via raw_name)
-                const marginPerUnit = await calculateMargin(normalizedExchange, 1, executedPrice, { rawName: instrumentRawName, instrumentToken: instrument_token, tradingsymbol });
-
-                const prevMargin = Math.abs(prevNetQtyForMargin) * marginPerUnit;
-                const newMargin = Math.abs(newNetQty) * marginPerUnit;
+                // Calculate total margin for previous and new net positions directly
+                // calculateMargin handles lot-based (per-lot) vs percentage internally
+                const prevMargin = Math.abs(prevNetQtyForMargin) > 0
+                    ? await calculateMargin(normalizedExchange, Math.abs(prevNetQtyForMargin), executedPrice, { rawName: instrumentRawName, instrumentToken: instrument_token, tradingsymbol })
+                    : 0;
+                const newMargin = Math.abs(newNetQty) > 0
+                    ? await calculateMargin(normalizedExchange, Math.abs(newNetQty), executedPrice, { rawName: instrumentRawName, instrumentToken: instrument_token, tradingsymbol })
+                    : 0;
                 const marginDelta = newMargin - prevMargin; // +ve = more margin needed
 
                 // #7 FIX: Block if free margin goes negative (balance - currentMargin - newMarginDelta < 0)
                 // if (marginDelta > 0) {
-                //     const freeMargin = user.balance - prevMargin;
+                //     const freeMargin = user.equity - prevMargin;
                 //     if (freeMargin < marginDelta) {
                 //         throw new Error(`Insufficient free margin. Free: ₹${freeMargin.toFixed(2)}, Required: ₹${marginDelta.toFixed(2)}`);
                 //     }
@@ -594,10 +643,10 @@ const placeTrade = async (req, res) => {
                     console.warn('[Brokerage] Could not calculate brokerage:', brErr.message);
                 }
 
-                const balanceBefore = user.balance;
-                const balanceChange = realisedPnl - marginPerUnit - brokerage;
+                const balanceBefore = user.equity;
+                const balanceChange = realisedPnl - marginDelta - brokerage;
 
-                user.balance = user.balance + balanceChange;
+                user.equity = user.equity + balanceChange;
                 newTrade.brokerage = brokerage;
                 newTrade.net_amount = realisedPnl - brokerage;
                 await newTrade.save({ session });
@@ -615,7 +664,7 @@ const placeTrade = async (req, res) => {
                     referenceId: newTrade._id,
                     referenceModel: 'Trade',
                     balanceBefore,
-                    balanceAfter: user.balance,
+                    balanceAfter: user.equity,
                     metadata: {
                         tradingsymbol,
                         quantity,
@@ -762,8 +811,7 @@ const getAccountMetrics = async (req, res) => {
                 name: user.name,
                 username: user.username,
                 credit: user.credits || 0,
-                balance: user.balance || 0,
-                equity: user.equity || user.credits || 0,
+                equity: user.equity || 0,
                 free_margin: user.free_margin || user.credits || 0,
                 // Also return last-saved computed metrics so client can seed from them
                 realised_pnl: Math.round((user.realised_pnl || 0) * 100) / 100,

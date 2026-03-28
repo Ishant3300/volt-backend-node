@@ -120,7 +120,7 @@ const _checkUserEquity = async (user) => {
   }
 
   const m2m = realisedPnl + floatingPnl;
-  const equity = user.balance + m2m;
+  const equity = user.equity + m2m;
 
   // If equity is negative, auto square off all positions
   if (equity < 0 && openPositions.length > 0) {
@@ -173,8 +173,8 @@ const _squareOffAllPositions = async (user, openPositions) => {
         await newTrade.save({ session });
 
         // Update user balance with P&L
-        const balanceBefore = freshUser.balance;
-        freshUser.balance += pnl;
+        const balanceBefore = freshUser.equity;
+        freshUser.equity += pnl;
 
         // Log transaction
         const tx = new Transaction({
@@ -187,7 +187,7 @@ const _squareOffAllPositions = async (user, openPositions) => {
           referenceId: newTrade._id,
           referenceModel: 'Trade',
           balanceBefore,
-          balanceAfter: freshUser.balance,
+          balanceAfter: freshUser.equity,
           metadata: {
             tradingsymbol: pos.tradingsymbol,
             quantity: closeQty,

@@ -113,8 +113,8 @@ const createUser = async (req, res) => {
       }
 
       // Check if parent master has sufficient balance
-      if (parentMaster.balance < credits) {
-        throw new Error(`Insufficient balance. Available: ${parentMaster.balance}, Required: ${credits}`);
+      if (parentMaster.equity < credits) {
+        throw new Error(`Insufficient balance. Available: ${parentMaster.equity}, Required: ${credits}`);
       }
 
       // Check if username already exists
@@ -137,7 +137,7 @@ const createUser = async (req, res) => {
         username,
         password: hashedPassword,
         credits,
-        balance: credits,
+        equity: credits,
         note,
         pnl_sharing,
         brokerage_sharing,
@@ -151,8 +151,8 @@ const createUser = async (req, res) => {
       });
       await user.save({ session });
 
-      const prevMasterBalance = parentMaster.balance;
-      parentMaster.balance -= credits;
+      const prevMasterBalance = parentMaster.equity;
+      parentMaster.equity -= credits;
       await parentMaster.save({ session });
 
       // Create transaction record for Master (Debit)
@@ -166,7 +166,7 @@ const createUser = async (req, res) => {
         referenceId: user._id,
         referenceModel: 'User',
         balanceBefore: prevMasterBalance,
-        balanceAfter: parentMaster.balance,
+        balanceAfter: parentMaster.equity,
         metadata: { note: note || 'Deducted balance for new user creation' }
       });
       await masterTx.save({ session });
@@ -189,7 +189,7 @@ const createUser = async (req, res) => {
 
       resultData = {
         user: user.toJSON(),
-        parent_master_remaining_balance: parentMaster.balance
+        parent_master_remaining_balance: parentMaster.equity
       };
     });
 
@@ -465,21 +465,21 @@ const creditUser = async (req, res) => {
       if (!master) throw new Error('Master not found');
 
       // Check if master has sufficient working balance
-      if (master.balance < amount) {
-        throw new Error(`Insufficient balance. Available: ${master.balance}, Required: ${amount}`);
+      if (master.equity < amount) {
+        throw new Error(`Insufficient balance. Available: ${master.equity}, Required: ${amount}`);
       }
 
       const previousUserCredits = user.credits;
-      const previousUserBalance = user.balance;
+      const previousUserBalance = user.equity;
       const previousMasterCredits = master.credits;
-      const previousMasterBalance = master.balance;
+      const previousMasterBalance = master.equity;
 
       // Master pays from balance
-      master.balance -= amount;
+      master.equity -= amount;
 
       // User receives in balance; credits only rises if balance exceeds it
-      user.balance += amount;
-      user.credits = Math.max(user.credits, user.balance);
+      user.equity += amount;
+      user.credits = Math.max(user.credits, user.equity);
 
       await master.save({ session });
       await user.save({ session });
@@ -495,7 +495,7 @@ const creditUser = async (req, res) => {
         referenceId: user._id,
         referenceModel: 'User',
         balanceBefore: previousMasterBalance,
-        balanceAfter: master.balance,
+        balanceAfter: master.equity,
         metadata: { note: note || 'Credit to user' }
       });
       await masterTx.save({ session });
@@ -511,7 +511,7 @@ const creditUser = async (req, res) => {
         referenceId: master._id,
         referenceModel: 'Master',
         balanceBefore: previousUserBalance,
-        balanceAfter: user.balance,
+        balanceAfter: user.equity,
         metadata: { note: note || 'Credit from master' }
       });
       await userTx.save({ session });
@@ -541,14 +541,14 @@ const creditUser = async (req, res) => {
           username: user.username,
           previous_credits: previousUserCredits,
           current_credits: user.credits,
-          current_balance: user.balance
+          current_balance: user.equity
         },
         master: {
           id: master._id,
           username: master.username,
           previous_credits: previousMasterCredits,
           current_credits: master.credits,
-          current_balance: master.balance
+          current_balance: master.equity
         },
         amount_credited: amount,
         updated_at: user.updatedAt
@@ -604,7 +604,7 @@ const debitUser = async (req, res) => {
       if (!user) throw new Error('User not found');
 
       // User pays from their balance, not credits
-      if (user.balance < amount) {
+      if (user.equity < amount) {
         throw new Error('Insufficient balance on user account');
       }
 
@@ -613,15 +613,15 @@ const debitUser = async (req, res) => {
       if (!master) throw new Error('Master not found');
 
       const previousUserCredits = user.credits;
-      const previousUserBalance = user.balance;
+      const previousUserBalance = user.equity;
       const previousMasterCredits = master.credits;
-      const previousMasterBalance = master.balance;
+      const previousMasterBalance = master.equity;
 
       // Deduct from user's balance only; credits stay unchanged
-      user.balance -= amount;
+      user.equity -= amount;
 
       // Add back to master's working balance (master's credits remain unaffected)
-      master.balance += amount;
+      master.equity += amount;
 
       await user.save({ session });
       await master.save({ session });
@@ -637,7 +637,7 @@ const debitUser = async (req, res) => {
         referenceId: user._id,
         referenceModel: 'User',
         balanceBefore: previousMasterBalance,
-        balanceAfter: master.balance,
+        balanceAfter: master.equity,
         metadata: { note: note || 'Debit from user' }
       });
       await masterTx.save({ session });
@@ -653,7 +653,7 @@ const debitUser = async (req, res) => {
         referenceId: master._id,
         referenceModel: 'Master',
         balanceBefore: previousUserBalance,
-        balanceAfter: user.balance, // Note: user balance unchanged
+        balanceAfter: user.equity, // Note: user balance unchanged
         metadata: { note: note || 'Debit to master' }
       });
       await userTx.save({ session });
@@ -683,14 +683,14 @@ const debitUser = async (req, res) => {
           username: user.username,
           previous_credits: previousUserCredits,
           current_credits: user.credits,
-          current_balance: user.balance
+          current_balance: user.equity
         },
         master: {
           id: master._id,
           username: master.username,
           previous_credits: previousMasterCredits,
           current_credits: master.credits,
-          current_balance: master.balance
+          current_balance: master.equity
         },
         amount_debited: amount,
         updated_at: user.updatedAt

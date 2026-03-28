@@ -21,7 +21,7 @@ const masterSchema = new mongoose.Schema({
     required: true,
     default: 0
   },
-  balance: {
+  equity: {
     type: Number,
     required: true,
     default: 0

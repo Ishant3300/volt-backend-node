@@ -60,7 +60,7 @@ const createUser = async (req, res) => {
         master_id,
         credits: initialCredit,
         current_credit: current_credit || 0,
-        balance: balance !== undefined ? balance : initialCredit,
+        equity: balance !== undefined ? balance : initialCredit,
         exchanges_support: exchanges_support || [],
         status: status || 'active'
       });
@@ -77,7 +77,7 @@ const createUser = async (req, res) => {
           referenceId: req.admin ? req.admin.id : null,
           referenceModel: 'Admin',
           balanceBefore: 0,
-          balanceAfter: user.balance,
+          balanceAfter: user.equity,
           metadata: { note: 'Admin created user with initial credit' }
         });
         await tx.save({ session });
@@ -247,7 +247,7 @@ const updateUser = async (req, res) => {
 
     if (credit !== undefined) user.credits = credit;
     if (current_credit !== undefined) user.current_credit = current_credit;
-    if (balance !== undefined) user.balance = balance;
+    if (balance !== undefined) user.equity = balance;
     if (exchanges_support) user.exchanges_support = exchanges_support;
     if (status) user.status = status;
 
@@ -317,9 +317,9 @@ const creditUserByAdmin = async (req, res) => {
       const user = await User.findById(id).session(session);
       if (!user || user.deleted_at) throw new Error('User not found');
 
-      const balanceBefore = user.balance;
-      user.balance += amount;
-      if (user.credits < user.balance) user.credits = user.balance;
+      const balanceBefore = user.equity;
+      user.equity += amount;
+      if (user.credits < user.equity) user.credits = user.equity;
       await user.save({ session });
 
       const tx = new Transaction({
@@ -332,11 +332,11 @@ const creditUserByAdmin = async (req, res) => {
         referenceId: req.admin ? req.admin.id : null,
         referenceModel: 'Admin',
         balanceBefore,
-        balanceAfter: user.balance,
+        balanceAfter: user.equity,
         metadata: { note: note || 'Admin credit', credited_by: req.admin?.username }
       });
       await tx.save({ session });
-      result = { new_balance: user.balance, amount_credited: amount };
+      result = { new_balance: user.equity, amount_credited: amount };
     });
     session.endSession();
     res.status(200).json({ success: true, message: 'Amount credited successfully', data: result });
@@ -360,8 +360,8 @@ const debitUserByAdmin = async (req, res) => {
       const user = await User.findById(id).session(session);
       if (!user || user.deleted_at) throw new Error('User not found');
 
-      const balanceBefore = user.balance;
-      user.balance -= amount;
+      const balanceBefore = user.equity;
+      user.equity -= amount;
       await user.save({ session });
 
       const tx = new Transaction({
@@ -374,11 +374,11 @@ const debitUserByAdmin = async (req, res) => {
         referenceId: req.admin ? req.admin.id : null,
         referenceModel: 'Admin',
         balanceBefore,
-        balanceAfter: user.balance,
+        balanceAfter: user.equity,
         metadata: { note: note || 'Admin debit', debited_by: req.admin?.username }
       });
       await tx.save({ session });
-      result = { new_balance: user.balance, amount_debited: amount };
+      result = { new_balance: user.equity, amount_debited: amount };
     });
     session.endSession();
     res.status(200).json({ success: true, message: 'Amount debited successfully', data: result });

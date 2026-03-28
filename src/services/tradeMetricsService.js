@@ -20,7 +20,7 @@ class TradeMetricsService {
         if (!user) throw new Error('User not found');
 
         const credit = user.credits || 0;
-        const balance = user.balance || 0;
+        const balance = user.equity || 0;
 
         // Aggregate trades per instrument
         const trades = await Trade.aggregate([

@@ -161,18 +161,18 @@ const processPendingOrders = async () => {
                         const user = await User.findById(freshTrade.user_id).session(session);
                         if (user) {
                             // Skip trade if insufficient balance for opening positions
-                            if (marginDelta > 0 && (user.balance + balanceChange) < 0) {
+                            if (marginDelta > 0 && (user.equity + balanceChange) < 0) {
                                 // Revert trade status
                                 freshTrade.status = 'rejected';
                                 freshTrade.pnl = 0;
                                 freshTrade.net_amount = 0;
                                 await freshTrade.save({ session });
-                                console.log(`⚠️ [OrderExecution] Rejected ${freshTrade.tradingsymbol} - insufficient balance (need ₹${marginDelta.toFixed(2)}, have ₹${user.balance.toFixed(2)})`);
+                                console.log(`⚠️ [OrderExecution] Rejected ${freshTrade.tradingsymbol} - insufficient balance (need ₹${marginDelta.toFixed(2)}, have ₹${user.equity.toFixed(2)})`);
                                 return;
                             }
 
-                            const balanceBefore = user.balance;
-                            user.balance += balanceChange;
+                            const balanceBefore = user.equity;
+                            user.equity += balanceChange;
                             await user.save({ session });
 
                             // Log transaction
@@ -188,7 +188,7 @@ const processPendingOrders = async () => {
                                     referenceId: freshTrade._id,
                                     referenceModel: 'Trade',
                                     balanceBefore,
-                                    balanceAfter: user.balance,
+                                    balanceAfter: user.equity,
                                     metadata: {
                                         tradingsymbol: freshTrade.tradingsymbol,
                                         quantity: freshTrade.quantity,

@@ -91,7 +91,7 @@ const createMaster = async (req, res) => {
         username,
         password: hashedPassword,
         credits,
-        balance: credits,
+        equity: credits,
         note,
         pnl_sharing,
         brokerage_sharing,
@@ -585,11 +585,11 @@ const creditMaster = async (req, res) => {
       }
 
       const previousCredits = master.credits;
-      const previousBalance = master.balance;
+      const previousBalance = master.equity;
 
       // Balance increases; credits only rises if balance exceeds it
-      master.balance += amount;
-      master.credits = Math.max(master.credits, master.balance);
+      master.equity += amount;
+      master.credits = Math.max(master.credits, master.equity);
 
       await master.save({ session });
 
@@ -604,7 +604,7 @@ const creditMaster = async (req, res) => {
         referenceId: req.admin.id,
         referenceModel: 'Admin',
         balanceBefore: previousBalance,
-        balanceAfter: master.balance,
+        balanceAfter: master.equity,
         metadata: {
           note: note || '',
           previousCredits,
@@ -630,7 +630,7 @@ const creditMaster = async (req, res) => {
         previous_credits: previousCredits,
         amount_credited: amount,
         current_credits: master.credits,
-        current_balance: master.balance,
+        current_balance: master.equity,
         transaction_id: transaction._id,
         updated_at: master.updatedAt
       };
@@ -685,15 +685,15 @@ const debitMaster = async (req, res) => {
         throw new Error('Master not found');
       }
 
-      if (master.balance < amount) {
+      if (master.equity < amount) {
         throw new Error('Insufficient balance');
       }
 
       const previousCredits = master.credits;
-      const previousBalance = master.balance;
+      const previousBalance = master.equity;
 
       // Deduct from balance only; credits stay unchanged
-      master.balance -= amount;
+      master.equity -= amount;
 
       await master.save({ session });
 
@@ -708,7 +708,7 @@ const debitMaster = async (req, res) => {
         referenceId: req.admin.id,
         referenceModel: 'Admin',
         balanceBefore: previousBalance,
-        balanceAfter: master.balance,
+        balanceAfter: master.equity,
         metadata: {
           note: note || '',
           previousCredits,
@@ -734,7 +734,7 @@ const debitMaster = async (req, res) => {
         previous_credits: previousCredits,
         amount_debited: amount,
         current_credits: master.credits,
-        current_balance: master.balance,
+        current_balance: master.equity,
         transaction_id: transaction._id,
         updated_at: master.updatedAt
       };

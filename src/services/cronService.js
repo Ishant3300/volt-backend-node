@@ -115,13 +115,13 @@ class CronService {
     async resetWeeklyBalances() {
         // 1. Reset Master Balances
         const masterUpdateResult = await Master.updateMany({}, [
-            { $set: { balance: '$credits' } }
+            { $set: { equity: '$credits' } }
         ]);
         console.log(`📊 [CRON] Reset balances for ${masterUpdateResult.modifiedCount} Masters.`);
 
         // 2. Reset User Balances
         const userUpdateResult = await User.updateMany({}, [
-            { $set: { balance: '$credits' } }
+            { $set: { equity: '$credits' } }
         ]);
         console.log(`📊 [CRON] Reset balances for ${userUpdateResult.modifiedCount} Users.`);
     }
