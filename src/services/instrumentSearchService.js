@@ -34,7 +34,7 @@ const CATEGORIES = {
   'MCX-FUT': { label: 'MCX Futures', match: i => i.exchange === 'MCX' && i.instrument_type === 'FUT' },
   'NFO-OPT': { label: 'NFO Options', match: i => i.segment === 'NFO-OPT' && (i.instrument_type === 'CE' || i.instrument_type === 'PE') },
   'MCX-OPT': { label: 'MCX Options', match: i => i.exchange === 'MCX' && (i.instrument_type === 'CE' || i.instrument_type === 'PE') },
-  'GLOBAL': { label: 'Global Indices', match: i => i.segment === 'INDICES' },
+  'GLOBAL': { label: 'Global Indices', match: i => i.segment === 'INDICES' || i.exchange === 'SGX' },
 };
 
 // ── Lean projection — only fields the UI needs ─────────────

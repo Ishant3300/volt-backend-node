@@ -128,9 +128,20 @@ const placeTrade = async (req, res) => {
                 throw new Error('User not found');
             }
 
-            // Compute live equity = DB equity + floating P&L from open positions
+            // Compute live equity for margin check:
+            // Use credits + sum(trade.pnl) + floatingPnl
+            // Note: trade.pnl is FIFO P&L without brokerage. We skip brokerage here
+            // because stored trade.brokerage values are unreliable (100x bug for turnover).
+            // Flutter recalculates brokerage client-side from BrokerageSettings.
             const floatingPnl = await _computeUserFloatingPnl(user._id, session);
-            const liveEquity = (user.equity || 0) + floatingPnl;
+            
+            const tradeAgg = await Trade.aggregate([
+                { $match: { user_id: user._id, status: 'completed', deleted_at: null } },
+                { $group: { _id: null, totalPnl: { $sum: '$pnl' } } }
+            ]).session(session);
+            const totalPnl = tradeAgg.length > 0 ? tradeAgg[0].totalPnl : 0;
+            
+            const liveEquity = (user.credits || 0) + totalPnl + floatingPnl;
 
             // ── BET check: if bet is OFF, user cannot trade at all (BUY or SELL) ──
             // Admin placing on behalf of user bypasses this check
@@ -451,7 +462,7 @@ const placeTrade = async (req, res) => {
             const tradeStatus = shouldExecuteNow ? 'completed' : 'pending';
 
             // 3. Calculate realised P&L if this trade closes (or partially closes) a position
-            let realisedPnl = 0;
+            let tradeRealisedPnl = 0;
             let existingAgg = [];
             if (shouldExecuteNow) {
                 // Fetch all previous completed trades for this instrument in chronological order (FIFO)
@@ -538,7 +549,7 @@ const placeTrade = async (req, res) => {
                     while (remaining > 0 && tempQueue.length > 0) {
                         const front = tempQueue[0];
                         const matched = Math.min(front.qty, remaining);
-                        realisedPnl += (executedPrice - front.price) * matched;
+                        tradeRealisedPnl += (executedPrice - front.price) * matched;
                         front.qty -= matched;
                         remaining -= matched;
                         if (front.qty === 0) tempQueue.shift();
@@ -548,7 +559,7 @@ const placeTrade = async (req, res) => {
                     const agg = existingAgg.length > 0 ? existingAgg[0] : null;
                     const avgSellPrice = agg && agg.total_sell_qty > 0 ? agg.total_sell_value / agg.total_sell_qty : 0;
                     const closingQty = Math.min(quantity, Math.abs(netQtyFromPrev));
-                    realisedPnl = (avgSellPrice - executedPrice) * closingQty;
+                    tradeRealisedPnl = (avgSellPrice - executedPrice) * closingQty;
                 }
             }
 
@@ -567,10 +578,10 @@ const placeTrade = async (req, res) => {
                 executed_at: shouldExecuteNow ? new Date() : null,
                 executed_price: shouldExecuteNow ? executedPrice : null,
                 executed_quantity: shouldExecuteNow ? quantity : 0,
-                pnl: realisedPnl,
+                pnl: tradeRealisedPnl,
                 brokerage: 0,
                 taxes: 0,
-                net_amount: realisedPnl
+                net_amount: tradeRealisedPnl
             });
 
             await newTrade.save({ session });
@@ -644,11 +655,11 @@ const placeTrade = async (req, res) => {
                 }
 
                 const balanceBefore = user.equity;
-                const balanceChange = realisedPnl - marginDelta - brokerage;
+                const balanceChange = tradeRealisedPnl - marginDelta - brokerage;
 
                 user.equity = user.equity + balanceChange;
                 newTrade.brokerage = brokerage;
-                newTrade.net_amount = realisedPnl - brokerage;
+                newTrade.net_amount = tradeRealisedPnl - brokerage;
                 await newTrade.save({ session });
                 await user.save({ session });
 
@@ -670,11 +681,11 @@ const placeTrade = async (req, res) => {
                         quantity,
                         executedPrice,
                         order_type,
-                        realisedPnl,
+                        realisedPnl: tradeRealisedPnl,
                         brokerage,
                         marginDelta,
                         balanceChange,
-                        positionClosed: realisedPnl !== 0
+                        positionClosed: tradeRealisedPnl !== 0
                     }
                 });
                 await tx.save({ session });

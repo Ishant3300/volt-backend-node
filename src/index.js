@@ -140,6 +140,10 @@ server.listen(PORT, async () => {
   livePriceService.init(server);
   console.log('📡 Live price WebSocket ready at ws://localhost:' + PORT + '/ws/live-prices');
 
+  // Initialize synthetic instruments (e.g. BHUJ NIFTY)
+  const syntheticInstrumentService = require('./services/syntheticInstrumentService');
+  await syntheticInstrumentService.init(livePriceService);
+
   // Schedule lightweight midnight audit for metrics (12:01 AM)
   const metricsEngine = require('./services/metricsEngine');
   metricsEngine.scheduleMidnightAudit();

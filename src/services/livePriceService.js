@@ -6,6 +6,7 @@
 const WebSocket = require('ws');
 const kiteService = require('./kiteService');
 const priceQueueService = require('./priceQueueService');
+const syntheticInstrumentService = require('./syntheticInstrumentService');
 const KiteInstrument = require('../models/KiteInstrument');
 const KiteMarketQuote = require('../models/KiteMarketQuote');
 const { LOG_LIVE_TICKS, LOG_WS_BROADCAST } = require('../config/logFlags');
@@ -228,6 +229,10 @@ class LivePriceService {
       return;
     }
 
+    // Include synthetic instrument source tokens so they always get ticks
+    const syntheticSourceTokens = syntheticInstrumentService.getSourceTokens();
+    syntheticSourceTokens.forEach(t => this.subscribedTokens.add(t));
+
     const tokens = Array.from(this.subscribedTokens);
     if (tokens.length === 0) {
       console.log('📊 No tokens to subscribe');
@@ -295,6 +300,9 @@ class LivePriceService {
 
             // Publish price update to BullMQ for order matching
             priceQueueService.publishPriceUpdate(t.instrument_token.toString(), t.last_price);
+
+            // Update synthetic instruments that depend on this source
+            syntheticInstrumentService.onTick(t.instrument_token, t.last_price);
           }
         });
 

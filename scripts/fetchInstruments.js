@@ -396,9 +396,10 @@ async function fetchInstruments() {
     }
 
     // Mark instruments no longer in Kite's feed as inactive
+    // Exclude synthetic instrument tokens (9999xxx range) — they're not from Kite
     const activeTokens = uniqueInstruments.map(i => i.instrument_token);
     const deactivated = await KiteInstrument.updateMany(
-      { instrument_token: { $nin: activeTokens }, is_active: true },
+      { instrument_token: { $nin: activeTokens, $not: /^9999/ }, is_active: true },
       { $set: { is_active: false } }
     );
 
