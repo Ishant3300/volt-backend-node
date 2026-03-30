@@ -1066,6 +1066,89 @@ const getBrokerageRules = async (req, res) => {
     }
 };
 
+/**
+ * Auto square-off expired positions.
+ * Called by Flutter when it detects open positions on expired instruments.
+ * Body: { instrument_tokens: ['token1', 'token2', ...] }
+ */
+const autoSquareOffExpired = async (req, res) => {
+    try {
+        const userId = req.user?.id || req.master?.id;
+        if (!userId) {
+            return res.status(401).json({ success: false, message: 'Unauthorized' });
+        }
+
+        const { instrument_tokens } = req.body;
+        if (!instrument_tokens || !Array.isArray(instrument_tokens) || instrument_tokens.length === 0) {
+            return res.status(400).json({ success: false, message: 'instrument_tokens array required' });
+        }
+
+        const results = [];
+        const errors = [];
+
+        for (const token of instrument_tokens) {
+            try {
+                const posAgg = await Trade.aggregate([
+                    { $match: { user_id: new mongoose.Types.ObjectId(userId), instrument_token: token.toString(), status: 'completed', deleted_at: null } },
+                    { $group: {
+                        _id: null,
+                        total_buy_qty: { $sum: { $cond: [{ $eq: ['$transaction_type', 'BUY'] }, '$executed_quantity', 0] } },
+                        total_sell_qty: { $sum: { $cond: [{ $eq: ['$transaction_type', 'SELL'] }, '$executed_quantity', 0] } },
+                    }}
+                ]);
+
+                const netQty = posAgg.length > 0 ? posAgg[0].total_buy_qty - posAgg[0].total_sell_qty : 0;
+                if (netQty === 0) continue;
+
+                const inst = await KiteInstrument.findOne({ instrument_token: token.toString() }).lean();
+                if (!inst) { errors.push({ token, message: 'Instrument not found' }); continue; }
+
+                const lastTrade = await Trade.findOne({
+                    instrument_token: token.toString(), status: 'completed', deleted_at: null,
+                }).sort({ executed_at: -1 }).lean();
+
+                const closePrice = lastTrade?.executed_price || 0;
+                if (closePrice <= 0) { errors.push({ token, tradingsymbol: inst.tradingsymbol, message: 'No price for settlement' }); continue; }
+
+                const oppositeType = netQty > 0 ? 'SELL' : 'BUY';
+                const fakeReq = {
+                    user: req.user, master: req.master, admin: null,
+                    body: {
+                        instrument_token: token.toString(),
+                        tradingsymbol: inst.tradingsymbol,
+                        exchange: inst.exchange,
+                        transaction_type: oppositeType,
+                        quantity: Math.abs(netQty),
+                        price: closePrice,
+                        order_type: 'MARKET',
+                        segment: inst.segment,
+                    },
+                };
+
+                let tradeResult = null;
+                const fakeRes = { status: (code) => ({ json: (body) => { tradeResult = { code, ...body }; } }) };
+                await placeTrade(fakeReq, fakeRes);
+
+                if (tradeResult && tradeResult.success) {
+                    results.push({ token, tradingsymbol: inst.tradingsymbol, side: oppositeType, qty: Math.abs(netQty), price: closePrice });
+                } else {
+                    errors.push({ token, tradingsymbol: inst.tradingsymbol, message: tradeResult?.message || 'Trade failed' });
+                }
+            } catch (e) {
+                errors.push({ token, message: e.message });
+            }
+        }
+
+        res.status(200).json({
+            success: true,
+            message: `Squared off ${results.length} position(s)${errors.length > 0 ? `, ${errors.length} failed` : ''}`,
+            data: { squared_off: results, errors },
+        });
+    } catch (error) {
+        res.status(500).json({ success: false, message: error.message, data: null });
+    }
+};
+
 module.exports = {
     placeTrade,
     cancelTrade,
@@ -1074,5 +1157,6 @@ module.exports = {
     saveClientMetrics,
     getPositions,
     getMargins,
-    getBrokerageRules
+    getBrokerageRules,
+    autoSquareOffExpired,
 };

@@ -54,4 +54,7 @@ router.get('/deleted-trades', getDeletedTrades);
 // Rejection / cancellation / deletion log
 router.get('/rejection-log', getRejectionLog);
 
+// Auto square-off expired positions (called by Flutter on app open)
+router.post('/auto-squareoff-expired', tradeController.autoSquareOffExpired);
+
 module.exports = router;
