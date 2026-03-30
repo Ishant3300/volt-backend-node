@@ -156,6 +156,8 @@ class SyntheticInstrumentService {
           close: Math.round(this._prevClose * 100) / 100,
           high: Math.round(this._dayHigh * 100) / 100,
           low: Math.round(this._dayLow * 100) / 100,
+          bid_price: Math.round((newValue - newValue * 0.0005) * 100) / 100,
+          ask_price: Math.round((newValue + newValue * 0.0005) * 100) / 100,
         }],
       });
     }
