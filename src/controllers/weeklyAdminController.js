@@ -27,8 +27,8 @@ const getWeeklyAdminReport = async (req, res) => {
           parent_username: master?.username || '',
           realised_pnl: r2(p.realised), m2m_pnl: r2(totalPnl),
           brokerage: r2(p.brokerage), admin_brk: r2(adminBrk),
-          total_pnl: r2(totalPnl), admin_profit: r2(adminProfit),
-          total_admin: r2(adminBrk + adminProfit),
+          total_pnl: r2(p.realised + totalPnl), admin_profit: r2(adminProfit),
+          total_admin: r2(adminProfit),
         };
       });
       return res.json({ success: true, data, totals: _sumTotals(data) });
@@ -61,8 +61,8 @@ const getWeeklyAdminReport = async (req, res) => {
         id: mid, name: m.name, username: m.username, parent_username: 'ADMIN', user_count: uids.length,
         realised_pnl: r2(realised), m2m_pnl: r2(totalPnl),
         brokerage: r2(brokerage), admin_brk: r2(adminBrk),
-        total_pnl: r2(totalPnl), admin_profit: r2(adminProfit),
-        total_admin: r2(adminBrk + adminProfit),
+        total_pnl: r2(realised + totalPnl), admin_profit: r2(adminProfit),
+        total_admin: r2(adminProfit),
       };
     });
     res.json({ success: true, data, totals: _sumTotals(data) });

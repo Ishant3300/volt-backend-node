@@ -146,13 +146,13 @@ const createChildMaster = async (req, res) => {
       if (parentMaster) {
         prevMasterBalance = parentMaster.equity;
         parentMaster.equity -= credits;
-        parentMaster.pnl_sharing -= pnl_sharing;
-        parentMaster.brokerage_sharing -= brokerage_sharing;
+        // Note: pnl_sharing and brokerage_sharing are percentages, not pools.
+        // They represent the parent's share ratio and should NOT be deducted
+        // when creating sub-masters. Each sub-master gets their own share %.
         await parentMaster.save({ session });
 
         console.log('✅ Parent master updated:');
         console.log(`   Balance: ${prevMasterBalance} -> ${parentMaster.equity}`);
-        console.log(`   P&L Sharing: ${parentMaster.pnl_sharing + pnl_sharing}% -> ${parentMaster.pnl_sharing}%`);
 
         const masterTx = new Transaction({
           transactionId: `TXN_${Date.now()}_${Math.random().toString(36).substr(2, 6)}_M`,

@@ -5,7 +5,7 @@
  *   Uses NIFTY 50 index price directly (it IS the weighted avg of 50 stocks)
  *
  * SYNTHETIC mode (after hours + Saturday):
- *   total_change = 0.5×gift_change + 0.3×us_change + 0.2×fx_change
+ *   total_change = us_change (100% US indices, average of nasdaq and dow)
  *   index = last_real_index × (1 + total_change)
  *
  * Broadcasts as KiteInstrument token 9999999 via WebSocket.
@@ -20,16 +20,12 @@ const BHUJ_NIFTY_TOKEN = '9999999';
 // Edit these to change what drives Bhuj Nifty
 const SOURCES = {
   nifty50: 'NIFTY 50',    // Real mode: use this index directly
-  gift:    'SG 30',       // SGX Nifty / GIFT Nifty
-  nasdaq:  'US 100',      // Nasdaq 100
-  dow:     'US 30',       // Dow Jones 30
-  usdinr:  'USDINR',      // USD/INR
+  nasdaq:  'US 100',      // Nasdaq 100 (exchange: GLOBAL)
+  dow:     'US 30',       // Dow Jones 30 (exchange: GLOBAL)
 };
 
-// Synthetic mode weights
-const SYNTH_WEIGHT_GIFT = 0.5;
-const SYNTH_WEIGHT_US   = 0.3;
-const SYNTH_WEIGHT_FX   = 0.2;
+// Synthetic mode weights (no GIFT Nifty or USDINR available in Kite feed)
+const SYNTH_WEIGHT_US = 1.0;  // 100% US indices for now
 
 class SyntheticInstrumentService {
   constructor() {
@@ -68,6 +64,36 @@ class SyntheticInstrumentService {
     this._initialized = true;
     const found = Object.values(this._sourceTokens).filter(Boolean).length;
     console.log(`📊 [BhujNifty] Ready: ${found}/${Object.keys(SOURCES).length} sources resolved`);
+
+    // Seed lastRealIndex from NIFTY 50's last_price in DB (survives server restart)
+    if (this._sourceTokens.nifty50) {
+      const niftyInst = await KiteInstrument.findOne({ instrument_token: this._sourceTokens.nifty50 }).lean();
+      if (niftyInst && niftyInst.last_price > 0) {
+        this._lastRealIndex = niftyInst.last_price;
+        this._currentValue = niftyInst.last_price;
+        console.log(`📊 [BhujNifty] Seeded lastRealIndex from DB: ${niftyInst.last_price}`);
+      }
+    }
+    // Seed global baselines from DB last_price
+    for (const key of ['nasdaq', 'dow']) {
+      const token = this._sourceTokens[key];
+      if (token) {
+        const inst = await KiteInstrument.findOne({ instrument_token: token }).lean();
+        if (inst && inst.last_price > 0) {
+          this._globalBaseline[key] = inst.last_price;
+          this._prices.set(token, inst.last_price);
+        }
+      }
+    }
+
+    // Broadcast initial value immediately so price shows on app open
+    if (this._lastRealIndex > 0) {
+      this._compute();
+      // Also set up periodic broadcast every 30s for when no source ticks arrive
+      setInterval(() => {
+        if (this._lastRealIndex > 0) this._compute();
+      }, 30000);
+    }
   }
 
   getSourceTokens() {
@@ -175,7 +201,7 @@ class SyntheticInstrumentService {
   }
 
   _snapshotGlobalBaseline() {
-    for (const key of ['gift', 'nasdaq', 'dow', 'usdinr']) {
+    for (const key of ['nasdaq', 'dow']) {
       const token = this._sourceTokens[key];
       if (token) {
         const price = this._prices.get(token);
@@ -204,10 +230,8 @@ class SyntheticInstrumentService {
       return (current - baseline) / baseline;
     };
 
-    const giftChange = getChange('gift');
     const nasdaqChange = getChange('nasdaq');
     const dowChange = getChange('dow');
-    const fxChange = getChange('usdinr');
 
     let usChange = null;
     if (nasdaqChange !== null && dowChange !== null) usChange = (nasdaqChange + dowChange) / 2;
@@ -217,9 +241,7 @@ class SyntheticInstrumentService {
     let totalChange = 0;
     let totalWeight = 0;
 
-    if (giftChange !== null) { totalChange += SYNTH_WEIGHT_GIFT * giftChange; totalWeight += SYNTH_WEIGHT_GIFT; }
     if (usChange !== null) { totalChange += SYNTH_WEIGHT_US * usChange; totalWeight += SYNTH_WEIGHT_US; }
-    if (fxChange !== null) { totalChange += SYNTH_WEIGHT_FX * (-fxChange); totalWeight += SYNTH_WEIGHT_FX; }
 
     if (totalWeight > 0 && totalWeight < 1) totalChange = totalChange / totalWeight;
     if (totalWeight === 0) return this._lastRealIndex;

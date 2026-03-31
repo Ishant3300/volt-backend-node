@@ -1,6 +1,6 @@
 const express = require('express');
 const router = express.Router();
-const { authenticateAdmin, authenticateAdminOrMaster } = require('../middlewares/auth');
+const { authenticateAdmin, authenticateAdminOrMaster, authenticateAny } = require('../middlewares/auth');
 
 const {
   getAllServers,
@@ -10,8 +10,8 @@ const {
   deleteServer
 } = require('../controllers/serverController');
 
-// Get all servers (Admin and Master can view)
-router.get('/', authenticateAdminOrMaster, getAllServers);
+// Get all servers (public — used by login page before auth)
+router.get('/', getAllServers);
 
 // Get server by ID (Admin and Master can view)
 router.get('/:id', authenticateAdminOrMaster, getServerById);

@@ -267,11 +267,11 @@ const updateMaster = async (req, res) => {
       last_due_bill
     } = req.body;
 
-    const master = await Master.findOne({
-      _id: id,
-      admin_id: req.admin.id,
-      deleted_at: null
-    });
+    const query = { _id: id, deleted_at: null };
+    if (req.admin) query.admin_id = req.admin.id;
+    else if (req.master) query.master_id = req.master.id;
+
+    const master = await Master.findOne(query);
 
     if (!master) {
       return res.status(404).json({
@@ -396,11 +396,11 @@ const updateMasterStatus = async (req, res) => {
       pnl_share_percentage
     } = req.body;
 
-    const master = await Master.findOne({
-      _id: id,
-      admin_id: req.admin.id,
-      deleted_at: null
-    });
+    const query = { _id: id, deleted_at: null };
+    if (req.admin) query.admin_id = req.admin.id;
+    else if (req.master) query.master_id = req.master.id;
+
+    const master = await Master.findOne(query);
 
     if (!master) {
       return res.status(404).json({
@@ -464,11 +464,11 @@ const updateMasterPermissions = async (req, res) => {
       });
     }
 
-    const master = await Master.findOne({
-      _id: id,
-      admin_id: req.admin.id,
-      deleted_at: null
-    });
+    const permQuery = { _id: id, deleted_at: null };
+    if (req.admin) permQuery.admin_id = req.admin.id;
+    else if (req.master) permQuery.master_id = req.master.id;
+
+    const master = await Master.findOne(permQuery);
 
     if (!master) {
       return res.status(404).json({
@@ -920,11 +920,11 @@ const updateMasterDetails = async (req, res) => {
       trade_limit
     } = req.body;
 
-    const master = await Master.findOne({
-      _id: id,
-      admin_id: req.admin.id,
-      deleted_at: null
-    });
+    const detailQuery = { _id: id, deleted_at: null };
+    if (req.admin) detailQuery.admin_id = req.admin.id;
+    else if (req.master) detailQuery.master_id = req.master.id;
+
+    const master = await Master.findOne(detailQuery);
 
     if (!master) {
       return res.status(404).json({
