@@ -67,13 +67,13 @@ router.post('/instruments/fetch', fetchInstruments);
 router.get('/instruments/info', getInstrumentsInfo);
 
 // Search instruments (legacy)
-router.get('/instruments/search', searchInstruments);
+// router.get('/instruments/search', searchInstruments);
 
 // Smart search instruments (new - with fuzzy matching and grouping)
-router.get('/instruments/smart-search', smartSearchInstruments);
+// router.get('/instruments/smart-search', smartSearchInstruments);
 
 // Get search categories
-router.get('/instruments/categories', getSearchCategories);
+// router.get('/instruments/categories', getSearchCategories);
 
 // ==================== MARKET QUOTE ROUTES ====================
 
