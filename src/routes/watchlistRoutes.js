@@ -10,8 +10,8 @@ const {
 // All routes require user or admin authentication
 router.use(authenticateAny);
 
-// router.get('/', getWatchlist);
-// router.post('/', addToWatchlist);
+router.get('/', getWatchlist);
+router.post('/', addToWatchlist);
 router.delete('/:id', removeFromWatchlist);
 
 module.exports = router;
