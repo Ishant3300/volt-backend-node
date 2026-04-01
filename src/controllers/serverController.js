@@ -18,8 +18,8 @@ const getAllServers = async (req, res) => {
       success: true,
       message: 'Servers retrieved successfully',
       data: {
-        // servers: servers.map(server => server.toJSON()),
-        servers: [],
+        servers: servers.map(server => server.toJSON()),
+        // servers: [],
         total: count,
         page: parseInt(page),
         pages: Math.ceil(count / limit)
