@@ -27,8 +27,8 @@ const getAggregatedPositions = async (req, res) => {
       });
     }
 
-    // Aggregate completed trades across all child users, grouped by instrument
-    const positions = await Trade.aggregate([
+    // Aggregate completed trades per user per instrument first
+    const perUserPositions = await Trade.aggregate([
       {
         $match: {
           user_id: { $in: childUserIds },
@@ -41,15 +41,16 @@ const getAggregatedPositions = async (req, res) => {
           _id: {
             instrument_token: '$instrument_token',
             tradingsymbol: '$tradingsymbol',
-            exchange: '$exchange'
+            exchange: '$exchange',
+            user_id: '$user_id'
           },
-          total_buy_qty: {
+          buy_qty: {
             $sum: { $cond: [{ $eq: ['$transaction_type', 'BUY'] }, '$executed_quantity', 0] }
           },
-          total_sell_qty: {
+          sell_qty: {
             $sum: { $cond: [{ $eq: ['$transaction_type', 'SELL'] }, '$executed_quantity', 0] }
           },
-          total_buy_value: {
+          buy_value: {
             $sum: {
               $cond: [
                 { $eq: ['$transaction_type', 'BUY'] },
@@ -58,7 +59,7 @@ const getAggregatedPositions = async (req, res) => {
               ]
             }
           },
-          total_sell_value: {
+          sell_value: {
             $sum: {
               $cond: [
                 { $eq: ['$transaction_type', 'SELL'] },
@@ -66,28 +67,41 @@ const getAggregatedPositions = async (req, res) => {
                 0
               ]
             }
-          },
-          user_ids: { $addToSet: '$user_id' }
+          }
         }
       }
     ]);
 
-    // Filter to only instruments with open positions (netQty != 0)
-    const openPositions = positions
-      .map(p => {
-        const netQty = p.total_buy_qty - p.total_sell_qty;
-        return {
+    // Aggregate per-instrument, counting only users with open positions (netQty != 0)
+    const instrAgg = {};
+    for (const p of perUserPositions) {
+      const key = p._id.instrument_token;
+      const userNetQty = p.buy_qty - p.sell_qty;
+      if (!instrAgg[key]) {
+        instrAgg[key] = {
           instrument_token: p._id.instrument_token,
           tradingsymbol: p._id.tradingsymbol,
           exchange: p._id.exchange,
-          net_qty: netQty,
-          total_buy_qty: p.total_buy_qty,
-          total_sell_qty: p.total_sell_qty,
-          total_buy_value: p.total_buy_value,
-          total_sell_value: p.total_sell_value,
-          user_count: p.user_ids.length
+          total_buy_qty: 0, total_sell_qty: 0,
+          total_buy_value: 0, total_sell_value: 0,
+          open_user_count: 0
         };
-      })
+      }
+      const agg = instrAgg[key];
+      agg.total_buy_qty += p.buy_qty;
+      agg.total_sell_qty += p.sell_qty;
+      agg.total_buy_value += p.buy_value;
+      agg.total_sell_value += p.sell_value;
+      if (userNetQty !== 0) agg.open_user_count++;
+    }
+
+    // Filter to only instruments with open positions (netQty != 0)
+    const openPositions = Object.values(instrAgg)
+      .map(p => ({
+        ...p,
+        net_qty: p.total_buy_qty - p.total_sell_qty,
+        user_count: p.open_user_count
+      }))
       .filter(p => p.net_qty !== 0);
 
     // Enrich with segment + lot_size from KiteInstrument
@@ -403,11 +417,124 @@ const getAdminMasterMetrics = async (req, res) => {
   }
 };
 
-const moduleExports = {
+/**
+ * Lightweight endpoint returning computed equity per user/master.
+ * Admin: returns equity for ALL users and masters.
+ * Master: returns equity for child users and child masters.
+ * Returns: { users: { id: equity }, masters: { id: equity } }
+ */
+const getBulkEquity = async (req, res) => {
+  try {
+    const tradeMetricsService = require('../services/tradeMetricsService');
+    const isAdmin = !!req.admin;
+    const masterId = req.master?.id;
+
+    let users, childMasters;
+    if (isAdmin) {
+      users = await User.find({ deleted_at: null }).select('_id');
+      childMasters = await Master.find({ deleted_at: null }).select('_id');
+    } else if (masterId) {
+      users = await User.find({ master_id: masterId, deleted_at: null }).select('_id');
+      childMasters = await Master.find({ master_id: masterId, deleted_at: null }).select('_id');
+    } else {
+      return res.status(200).json({ success: true, data: { users: {}, masters: {} } });
+    }
+
+    const userIds = users.map(u => u._id);
+    const activeTokens = await Trade.distinct('instrument_token', {
+      user_id: { $in: userIds },
+      status: 'completed',
+      deleted_at: null
+    });
+    const ltpMap = await _getLivePricesFromKite(activeTokens.map(t => parseInt(t)));
+
+    const userEquityMap = {};
+    await Promise.all(userIds.map(async (uid) => {
+      try {
+        const metrics = await tradeMetricsService.getUserMetrics(uid, ltpMap);
+        userEquityMap[uid.toString()] = Math.round(metrics.equity * 100) / 100;
+      } catch (_) {}
+    }));
+
+    const masterEquityMap = {};
+    if (childMasters.length > 0) {
+      const allMasterUsers = await User.find({
+        master_id: { $in: childMasters.map(m => m._id) },
+        deleted_at: null
+      }).select('_id master_id');
+
+      const usersByMaster = {};
+      allMasterUsers.forEach(u => {
+        const mid = u.master_id.toString();
+        if (!usersByMaster[mid]) usersByMaster[mid] = [];
+        usersByMaster[mid].push(u._id.toString());
+      });
+
+      for (const m of childMasters) {
+        const mid = m._id.toString();
+        const mUserIds = usersByMaster[mid] || [];
+        let totalEquity = 0;
+        for (const uid of mUserIds) {
+          if (userEquityMap[uid] !== undefined) {
+            totalEquity += userEquityMap[uid];
+          } else {
+            try {
+              const metrics = await tradeMetricsService.getUserMetrics(uid, ltpMap);
+              totalEquity += metrics.equity;
+            } catch (_) {}
+          }
+        }
+        masterEquityMap[mid] = Math.round(totalEquity * 100) / 100;
+      }
+    }
+
+    res.status(200).json({
+      success: true,
+      data: { users: userEquityMap, masters: masterEquityMap }
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message, data: null });
+  }
+};
+
+/**
+ * Get live metrics from metricsEngine cache.
+ * Query params: ?user_id=X or ?master_id=X
+ * Returns cached server-computed metrics (same values pushed via WebSocket).
+ */
+const getLiveMetrics = async (req, res) => {
+  try {
+    const metricsEngine = require('../services/metricsEngine');
+    const { user_id, master_id } = req.query;
+
+    if (user_id) {
+      const metrics = metricsEngine.getCachedMetrics(user_id);
+      return res.status(200).json({ success: true, data: metrics ? [metrics] : [] });
+    }
+
+    if (master_id) {
+      const userMetrics = metricsEngine.getMasterUserMetrics(master_id);
+      return res.status(200).json({ success: true, data: userMetrics });
+    }
+
+    // No filter: return all users under this master
+    const masterId = req.master?.id;
+    if (masterId) {
+      const userMetrics = metricsEngine.getMasterUserMetrics(masterId);
+      return res.status(200).json({ success: true, data: userMetrics });
+    }
+
+    res.status(200).json({ success: true, data: [] });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message, data: null });
+  }
+};
+
+module.exports = {
   getAggregatedPositions,
   getInstrumentUserBreakdown,
   getUserMetrics,
-  getAdminMasterMetrics
+  getAdminMasterMetrics,
+  getBulkEquity,
+  getLiveMetrics
 };
-
-module.exports = moduleExports;

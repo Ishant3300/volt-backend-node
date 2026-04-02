@@ -144,8 +144,9 @@ server.listen(PORT, async () => {
   const syntheticInstrumentService = require('./services/syntheticInstrumentService');
   await syntheticInstrumentService.init(livePriceService);
 
-  // Schedule lightweight midnight audit for metrics (12:01 AM)
+  // Initialize real-time metrics engine
   const metricsEngine = require('./services/metricsEngine');
+  await metricsEngine.init(livePriceService);
   metricsEngine.scheduleMidnightAudit();
 
   // Initialize margin square off monitoring service

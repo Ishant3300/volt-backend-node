@@ -182,6 +182,10 @@ class SyntheticInstrumentService {
           ask_price: r(newValue + newValue * 0.0005),
         }],
       });
+
+      // Update metricsEngine so synthetic positions get live P&L
+      const metricsEngine = require('./metricsEngine');
+      metricsEngine.onTick(BHUJ_NIFTY_TOKEN, r(newValue));
     }
 
     if (LOG_LIVE_TICKS) {

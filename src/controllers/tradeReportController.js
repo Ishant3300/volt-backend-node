@@ -1,5 +1,7 @@
 const Trade = require('../models/Trade');
 const User = require('../models/User');
+const BrokerageSettings = require('../models/BrokerageSettings');
+const KiteInstrument = require('../models/KiteInstrument');
 const mongoose = require('mongoose');
 
 /**
@@ -89,6 +91,16 @@ const getTradeReport = async (req, res) => {
       });
     }
 
+    // Load brokerage rules and instrument info for recalculation
+    const brkRules = await BrokerageSettings.find({ deleted_at: null }).lean();
+    const allTokens = [...new Set(trades.map(t => t.instrument_token))];
+    const kiteInstruments = await KiteInstrument.find(
+      { instrument_token: { $in: allTokens } },
+      'instrument_token lot_size segment raw_name'
+    ).lean();
+    const kiteMap = {};
+    kiteInstruments.forEach(ki => { kiteMap[ki.instrument_token] = ki; });
+
     // Build per-instrument summaries
     const instruments = [];
     let grandTotalPnl = 0;
@@ -108,9 +120,30 @@ const getTradeReport = async (req, res) => {
       const matchedQty = Math.min(totalBuyQty, totalSellQty);
       const pnl = matchedQty > 0 ? (avgSellPrice - avgBuyPrice) * matchedQty : 0;
 
-      // Brokerage from actual trades
+      // Recalculate brokerage from BrokerageSettings (stored trade.brokerage is unreliable)
       const instrTrades = trades.filter(t => `${t.exchange}::${t.tradingsymbol}` === key);
-      const brokerage = instrTrades.reduce((s, t) => s + (t.brokerage || 0), 0);
+      let brokerage = 0;
+      for (const t of instrTrades) {
+        const ki = kiteMap[t.instrument_token] || {};
+        const seg = ki.segment || '';
+        const rawName = ki.raw_name || '';
+        const lotSize = ki.lot_size || 1;
+
+        let rule = null;
+        if (rawName && seg) rule = brkRules.find(r => r.script_name?.toUpperCase() === rawName.toUpperCase() && r.exchange_name === seg.toUpperCase());
+        if (!rule && rawName) rule = brkRules.find(r => r.script_name?.toUpperCase() === rawName.toUpperCase());
+        if (!rule && seg) rule = brkRules.find(r => r.exchange_name === seg.toUpperCase() && !r.script_name);
+        if (!rule) rule = brkRules.find(r => r.exchange_name === (seg.split('-')[0] || '').toUpperCase() && !r.script_name);
+
+        if (rule) {
+          if (rule.type === 'TURNOVER WISE') {
+            brokerage += t.executed_price * t.executed_quantity * (rule.brk_value / 10000);
+          } else if (rule.type === 'LOT WISE') {
+            brokerage += (lotSize > 1 ? t.executed_quantity / lotSize : t.executed_quantity) * rule.brk_value;
+          }
+        }
+      }
+
       const netPnl = pnl - brokerage;
 
       grandTotalPnl += pnl;

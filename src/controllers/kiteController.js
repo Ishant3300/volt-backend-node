@@ -252,7 +252,7 @@ const searchInstruments = async (req, res) => {
  */
 const smartSearchInstruments = async (req, res) => {
   try {
-    const { q, category, limit } = req.query;
+    const { q, category, limit, page } = req.query;
 
     if (!q) {
       return res.status(400).json({
@@ -266,7 +266,8 @@ const smartSearchInstruments = async (req, res) => {
     const result = await instrumentSearchService.smartSearch(
       q,
       category || 'ALL',
-      limit ? parseInt(limit) : 50
+      limit ? parseInt(limit) : 10,
+      page ? parseInt(page) : 1
     );
 
     res.status(200).json({

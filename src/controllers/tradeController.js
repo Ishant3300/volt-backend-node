@@ -574,6 +574,7 @@ const placeTrade = async (req, res) => {
                 quantity,
                 price: executedPrice,
                 order_type,
+                placed_by: req.admin ? 'ADMIN' : (req.master ? 'MASTER' : 'USER'),
                 status: tradeStatus,
                 executed_at: shouldExecuteNow ? new Date() : null,
                 executed_price: shouldExecuteNow ? executedPrice : null,
@@ -777,6 +778,12 @@ const placeTrade = async (req, res) => {
         } catch (fcmErr) {
             console.error('⚠️  [FCM] placeTrade notification error:', fcmErr.message);
         }
+
+        // Notify metrics engine to rebuild user's cache and broadcast updated metrics
+        try {
+            const metricsEngine = require('../services/metricsEngine');
+            metricsEngine.onTradeExecuted(resultTrade.user_id.toString());
+        } catch (_) {}
     } catch (error) {
         session.endSession();
 

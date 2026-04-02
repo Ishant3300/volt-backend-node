@@ -47,6 +47,11 @@ const tradeSchema = new mongoose.Schema({
     required: true,
     enum: ['MARKET', 'LIMIT', 'SL', 'SL-M']
   },
+  placed_by: {
+    type: String,
+    enum: ['USER', 'ADMIN', 'MASTER'],
+    default: 'USER'
+  },
   status: {
     type: String,
     required: true,

@@ -527,43 +527,75 @@ const groupResults = (instruments) => {
 };
 
 // ── Main search entry point ────────────────────────────────
-const smartSearch = async (query, category = 'ALL', limit = 50) => {
+const smartSearch = async (query, category = 'ALL', limit = 10, page = 1) => {
   if (!query || query.trim().length === 0) {
-    return { groups: [], total: 0, query: '' };
+    return { groups: [], total: 0, query: '', page, hasMore: false };
   }
 
-  // Check query cache
-  const cacheKey = `${query.toLowerCase()}_${category}_${limit}`;
-  const cached = queryCache.get(cacheKey);
+  // Check query cache (cache full results, paginate from cache)
+  const fullCacheKey = `${query.toLowerCase()}_${category}`;
+  let allResults;
+  const cached = queryCache.get(fullCacheKey);
   if (cached && (Date.now() - cached.timestamp) < QUERY_CACHE_TTL) {
-    return cached.result;
+    allResults = cached.allResults;
+  } else {
+    await loadInstrumentCache();
+
+    const resolved = resolveQuery(query);
+    const candidateSet = gatherCandidates(resolved, category, query);
+    const ranked = scoreAndRank(candidateSet, resolved, query, 200);
+
+    // Map to clean instruments and sort: non-expired nearest expiry first
+    const now = new Date();
+    allResults = ranked.map(r => {
+      const { _underlying, _symUpper, _nameUpper, ...clean } = instrumentList[r.idx];
+      clean._score = r.score;
+      return clean;
+    });
+
+    // Sort: non-expired instruments first (nearest expiry), then expired, then no-expiry
+    allResults.sort((a, b) => {
+      const aExp = a.expiry ? new Date(a.expiry) : null;
+      const bExp = b.expiry ? new Date(b.expiry) : null;
+      const aExpired = aExp && aExp < now;
+      const bExpired = bExp && bExp < now;
+
+      // Non-expired before expired
+      if (!aExpired && bExpired) return -1;
+      if (aExpired && !bExpired) return 1;
+
+      // Among non-expired: nearest expiry first
+      if (!aExpired && !bExpired && aExp && bExp) return aExp - bExp;
+
+      // Among expired: most recent expiry first
+      if (aExpired && bExpired) return bExp - aExp;
+
+      // No expiry (indices/EQ) after derivatives but before expired
+      if (!aExp && bExp && !bExpired) return 1;
+      if (aExp && !aExpired && !bExp) return -1;
+
+      // Fall back to score
+      return (b._score || 0) - (a._score || 0);
+    });
+
+    // Clean up _score
+    allResults.forEach(r => delete r._score);
+
+    // Cache
+    if (queryCache.size >= MAX_QUERY_CACHE_SIZE) {
+      const firstKey = queryCache.keys().next().value;
+      queryCache.delete(firstKey);
+    }
+    queryCache.set(fullCacheKey, { allResults, timestamp: Date.now() });
   }
 
-  await loadInstrumentCache();
+  // Paginate
+  const start = (page - 1) * limit;
+  const pageResults = allResults.slice(start, start + limit);
+  const hasMore = start + limit < allResults.length;
 
-  const resolved = resolveQuery(query);
-  const candidateSet = gatherCandidates(resolved, category, query);
-
-  // FIX 5: Use scoreAndRank with short-circuit instead of scoring all + sorting all
-  const ranked = scoreAndRank(candidateSet, resolved, query, limit);
-
-  // Strip internal fields
-  const topResults = ranked.map(r => {
-    const { _underlying, _symUpper, _nameUpper, ...clean } = instrumentList[r.idx];
-    return clean;
-  });
-
-  const groups = groupResults(topResults);
-  const result = { groups, total: topResults.length, query };
-
-  // Cache result
-  if (queryCache.size >= MAX_QUERY_CACHE_SIZE) {
-    const firstKey = queryCache.keys().next().value;
-    queryCache.delete(firstKey);
-  }
-  queryCache.set(cacheKey, { result, timestamp: Date.now() });
-
-  return result;
+  const groups = groupResults(pageResults);
+  return { groups, total: allResults.length, query, page, hasMore };
 };
 
 const getCategories = () => {

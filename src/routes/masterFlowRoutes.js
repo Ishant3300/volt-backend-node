@@ -45,7 +45,9 @@ const {
   getAggregatedPositions,
   getInstrumentUserBreakdown,
   getUserMetrics,
-  getAdminMasterMetrics
+  getAdminMasterMetrics,
+  getBulkEquity,
+  getLiveMetrics
 } = require('../controllers/masterPositionController');
 
 const { getPnlSummary } = require('../controllers/pnlSummaryController');
@@ -156,6 +158,12 @@ router.get('/positions/aggregated/:instrumentToken', getInstrumentUserBreakdown)
 
 // Admin: get all masters with their users' positions for live P&L
 router.get('/positions/admin-master-metrics', getAdminMasterMetrics);
+
+// Bulk computed equity for user management list view
+router.get('/positions/bulk-equity', getBulkEquity);
+
+// Live metrics from metricsEngine cache (same data as WebSocket push)
+router.get('/positions/live-metrics', getLiveMetrics);
 
 // P&L summary: Master sees per-user, Admin sees per-master
 router.get('/pnl-summary', getPnlSummary);

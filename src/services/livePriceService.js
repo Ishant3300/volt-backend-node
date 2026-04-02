@@ -10,6 +10,7 @@ const syntheticInstrumentService = require('./syntheticInstrumentService');
 const KiteInstrument = require('../models/KiteInstrument');
 const KiteMarketQuote = require('../models/KiteMarketQuote');
 const { LOG_LIVE_TICKS, LOG_WS_BROADCAST } = require('../config/logFlags');
+const metricsEngine = require('./metricsEngine');
 
 class LivePriceService {
   constructor() {
@@ -78,7 +79,8 @@ class LivePriceService {
       case 'auth':
         if (data.userId) {
           ws.userId = data.userId;
-          console.log(`✅ Client authenticated for WS metrics as user: ${data.userId}`);
+          if (data.role === 'admin') ws.isAdmin = true;
+          console.log(`✅ Client authenticated for WS metrics as user: ${data.userId}${ws.isAdmin ? ' (admin)' : ''}`);
         }
         break;
 
@@ -303,6 +305,9 @@ class LivePriceService {
 
             // Update synthetic instruments that depend on this source
             syntheticInstrumentService.onTick(t.instrument_token, t.last_price);
+
+            // Update real-time metrics engine
+            metricsEngine.onTick(t.instrument_token, t.last_price);
           }
         });
 
