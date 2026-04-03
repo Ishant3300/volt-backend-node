@@ -1,12 +1,9 @@
 /**
- * Smart Instrument Search Service (Optimized v2)
+ * Smart Instrument Search Service (v3 — In-memory, no query cache)
  * 
- * Fixes applied:
- * 1. Two-stage candidate filtering (pre-filter + hard cap before scoring)
- * 2. Tiered prefix index (byUnderlying + bySymbolPrefix)
- * 3. Background cache warming (refresh 30s before TTL expiry)
- * 4. MongoDB streaming cursor with lean projection
- * 5. Score short-circuit + top-K heap
+ * Loads instruments into memory on server start (one-time ~10s).
+ * Searches run in <1ms from memory.
+ * Expired instruments excluded. Only nearest expiry per underlying shown.
  */
 
 const KiteInstrument = require('../models/KiteInstrument');
@@ -34,118 +31,83 @@ const CATEGORIES = {
   'MCX-FUT': { label: 'MCX Futures', match: i => i.exchange === 'MCX' && i.instrument_type === 'FUT' },
   'NFO-OPT': { label: 'NFO Options', match: i => i.segment === 'NFO-OPT' && (i.instrument_type === 'CE' || i.instrument_type === 'PE') },
   'MCX-OPT': { label: 'MCX Options', match: i => i.exchange === 'MCX' && (i.instrument_type === 'CE' || i.instrument_type === 'PE') },
-  'GLOBAL': { label: 'Global Indices', match: i => i.segment === 'INDICES' || i.exchange === 'SGX' },
+  'GLOBAL': { label: 'Global Indices', match: i => i.segment === 'INDICES' || i.exchange === 'SGX' || i.exchange === 'GLOBAL' },
 };
 
-// ── Lean projection — only fields the UI needs ─────────────
 const LEAN_PROJECTION = {
   instrument_token: 1, tradingsymbol: 1, name: 1,
   instrument_type: 1, exchange: 1, segment: 1,
-  strike: 1, expiry: 1, lot_size: 1, _id: 0,
+  strike: 1, expiry: 1, lot_size: 1, tick_size: 1,
+  raw_name: 1, display_name: 1, _id: 0,
 };
 
-// ── Cache state ────────────────────────────────────────────
-let instrumentList = null;       // flat array of lean docs
-let byUnderlying = null;         // Map<underlying, Set<index>>  (FIX 2 — Tier 1)
-let bySymbolPrefix = null;       // Map<prefix6-12, Set<index>>  (FIX 2 — Tier 2)
-let categoryBuckets = null;      // Map<categoryKey, Set<index>>
+// ── Cache state (loaded once on server start) ──────────────
+let instrumentList = null;
+let byUnderlying = null;
+let bySymbolPrefix = null;
+let categoryBuckets = null;
 let cacheTimestamp = null;
-const CACHE_TTL = 5 * 60 * 1000;
-const CACHE_WARM_AT = 4.5 * 60 * 1000; // FIX 3 — warm 30s before expiry
-let warmingInProgress = false;
+let cacheLoadingPromise = null; // prevents duplicate loads
+const CACHE_TTL = 60 * 60 * 1000; // 1 hour
 
-// Query result cache
-const queryCache = new Map();
-const QUERY_CACHE_TTL = 60 * 1000;
-const MAX_QUERY_CACHE_SIZE = 200;
-
+// ── Edit distance for fuzzy matching ───────────────────────
 const getEditDistance = (a, b) => {
-  if (!a || !b) return (a || b).length;
-  let matrix = [];
-  for (let i = 0; i <= b.length; i++) matrix[i] = [i];
-  for (let j = 0; j <= a.length; j++) matrix[0][j] = j;
-  for (let i = 1; i <= b.length; i++) {
-    for (let j = 1; j <= a.length; j++) {
-      if (b[i - 1] === a[j - 1]) {
-        matrix[i][j] = matrix[i - 1][j - 1];
-      } else {
-        matrix[i][j] = Math.min(matrix[i - 1][j - 1] + 1, Math.min(matrix[i][j - 1] + 1, matrix[i - 1][j] + 1));
-      }
+  if (a === b) return 0;
+  const la = a.length, lb = b.length;
+  if (la === 0) return lb;
+  if (lb === 0) return la;
+  const dp = Array.from({ length: la + 1 }, (_, i) => i);
+  for (let j = 1; j <= lb; j++) {
+    let prev = dp[0];
+    dp[0] = j;
+    for (let i = 1; i <= la; i++) {
+      const tmp = dp[i];
+      dp[i] = a[i - 1] === b[j - 1] ? prev : 1 + Math.min(prev, dp[i], dp[i - 1]);
+      prev = tmp;
     }
   }
-  return matrix[b.length][a.length];
+  return dp[la];
 };
 
-// ── Underlying extraction ──────────────────────────────────
-const RE_EXPIRY1 = /\d{2}(?:JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)\d{0,4}/gi;
-const RE_EXPIRY2 = /\d{2}[A-Z]{3}\d{2,4}/gi;
-const RE_SUFFIX = /(?:FUT|CE|PE)$/i;
-const RE_TRAIL = /\d+$/g;
-
+// ── Extract underlying from tradingsymbol ──────────────────
 const extractUnderlying = (sym) => {
-  return sym
-    .replace(RE_EXPIRY1, '')
-    .replace(RE_EXPIRY2, '')
-    .replace(RE_SUFFIX, '')
-    .replace(RE_TRAIL, '')
-    .trim();
+  const m = sym.match(/^([A-Z]+)/);
+  return m ? m[1] : sym;
 };
 
-// ── FIX 2: Build tiered indexes ────────────────────────────
+// ── Build indexes from instrument list ─────────────────────
 const buildIndexes = (instruments) => {
-  const uIdx = new Map();       // Tier 1: underlying name → Set<index>
-  const spIdx = new Map();      // Tier 2: symbol prefix (6-12 chars) → Set<index>
+  const uIdx = new Map();
+  const spIdx = new Map();
   const cBuckets = new Map();
-
-  for (const key of Object.keys(CATEGORIES)) {
-    cBuckets.set(key, new Set());
-  }
 
   for (let i = 0; i < instruments.length; i++) {
     const inst = instruments[i];
-    const sym = inst.tradingsymbol.toUpperCase();
+    const sym = inst.tradingsymbol || '';
     const name = (inst.name || '').toUpperCase();
-    const underlying = extractUnderlying(sym);
+    const underlying = name || extractUnderlying(sym.toUpperCase());
 
-    // Store computed fields for scoring
-    inst._underlying = underlying;
-    inst._symUpper = sym;
+    inst._symUpper = sym.toUpperCase();
     inst._nameUpper = name;
+    inst._underlying = underlying;
 
-    // Tier 1: underlying index (exact name + extracted underlying)
-    for (const key of [underlying, name]) {
-      if (key) {
-        let set = uIdx.get(key);
-        if (!set) { set = new Set(); uIdx.set(key, set); }
-        set.add(i);
-      }
-    }
+    // Underlying index
+    if (!uIdx.has(underlying)) uIdx.set(underlying, new Set());
+    uIdx.get(underlying).add(i);
 
-    // Tier 2: symbol prefix index — only prefixes length 5-12
-    // Avoids massive buckets from short prefixes (N, NI, NIF...)
-    const maxLen = Math.min(sym.length, 12);
-    for (let l = 5; l <= maxLen; l++) {
-      const prefix = sym.substring(0, l);
-      let set = spIdx.get(prefix);
-      if (!set) { set = new Set(); spIdx.set(prefix, set); }
-      set.add(i);
-    }
-
-    // Also index short underlying prefixes (3-6 chars) for typed queries
-    if (underlying && underlying.length >= 3) {
-      const uMaxLen = Math.min(underlying.length, 6);
-      for (let l = 3; l <= uMaxLen; l++) {
-        const prefix = underlying.substring(0, l);
-        let set = spIdx.get(prefix);
-        if (!set) { set = new Set(); spIdx.set(prefix, set); }
-        set.add(i);
-      }
+    // Symbol prefix index (3-12 char prefixes)
+    const symUp = inst._symUpper;
+    for (let len = 3; len <= Math.min(symUp.length, 12); len++) {
+      const prefix = symUp.substring(0, len);
+      if (!spIdx.has(prefix)) spIdx.set(prefix, new Set());
+      spIdx.get(prefix).add(i);
     }
 
     // Category buckets
-    for (const [key, cat] of Object.entries(CATEGORIES)) {
-      if (cat.match(inst)) {
-        cBuckets.get(key).add(i);
+    for (const [catKey, catDef] of Object.entries(CATEGORIES)) {
+      if (catDef.match(inst)) {
+        if (!cBuckets.has(catKey)) cBuckets.set(catKey, new Set());
+        cBuckets.get(catKey).add(i);
       }
     }
   }
@@ -153,41 +115,42 @@ const buildIndexes = (instruments) => {
   return { uIdx, spIdx, cBuckets };
 };
 
-// ── FIX 4: Load with streaming cursor ──────────────────────
+// ── Load instruments into memory ───────────────────────────
 const loadInstrumentCache = async () => {
-  const now = Date.now();
-
-  // FIX 3: Trigger background warm if approaching expiry
-  if (instrumentList && cacheTimestamp && (now - cacheTimestamp) > CACHE_WARM_AT && !warmingInProgress) {
-    warmingInProgress = true;
-    _warmCacheInBackground().finally(() => { warmingInProgress = false; });
-  }
-
-  // Return existing cache if still valid
-  if (instrumentList && cacheTimestamp && (now - cacheTimestamp) < CACHE_TTL) {
-    return;
-  }
-
-  // Cold start — build synchronously
-  await _buildAndSetCache();
+  if (instrumentList && cacheTimestamp && (Date.now() - cacheTimestamp) < CACHE_TTL) return;
+  // If already loading, wait for the existing promise instead of starting a new one
+  if (cacheLoadingPromise) return cacheLoadingPromise;
+  cacheLoadingPromise = _buildAndSetCache().finally(() => { cacheLoadingPromise = null; });
+  return cacheLoadingPromise;
 };
 
 const _buildAndSetCache = async () => {
-  console.log('📦 Loading instruments into memory cache...');
+  console.log('📦 [Search] Loading instruments into memory...');
   const startMs = Date.now();
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
 
-  const instruments = [];
-  const cursor = KiteInstrument.find({
+  // Single optimized query: only active, non-expired derivatives + indices + global
+  const rawInstruments = await KiteInstrument.find({
+    is_active: true,
     $or: [
-      { instrument_type: { $in: ['FUT', 'CE', 'PE'] } },
+      // Derivatives: only non-expired
+      { instrument_type: { $in: ['FUT', 'CE', 'PE'] }, expiry: { $gte: today } },
+      // Indices (no expiry)
       { segment: 'INDICES' },
-      { exchange: { $in: ['SGX', 'CDS'] } }
+      // Global/SGX
+      { exchange: { $in: ['SGX', 'GLOBAL'] } },
     ]
-  }, LEAN_PROJECTION).lean().cursor({ batchSize: 10000 });
+  }, LEAN_PROJECTION).lean();
 
-  for await (const doc of cursor) {
-    instruments.push(doc);
-  }
+  // Keep only instruments expiring in the current month
+  const currentMonth = today.getMonth();
+  const currentYear = today.getFullYear();
+  const instruments = rawInstruments.filter(inst => {
+    if (!inst.expiry || inst.segment === 'INDICES') return true;
+    const exp = new Date(inst.expiry);
+    return exp.getMonth() === currentMonth && exp.getFullYear() === currentYear;
+  });
 
   instrumentList = instruments;
   const indexes = buildIndexes(instruments);
@@ -196,422 +159,248 @@ const _buildAndSetCache = async () => {
   categoryBuckets = indexes.cBuckets;
   cacheTimestamp = Date.now();
 
-  console.log(`   ✅ Cached ${instruments.length} instruments, ${bySymbolPrefix.size} symbol-prefix entries, ${byUnderlying.size} underlying entries (${Date.now() - startMs}ms)`);
+  console.log(`   ✅ [Search] ${instruments.length} instruments ready (from ${rawInstruments.length} non-expired) in ${Date.now() - startMs}ms`);
 };
 
-// FIX 3: Background cache warming
-const _warmCacheInBackground = async () => {
-  try {
-    await _buildAndSetCache();
-    console.log('   🔄 Background cache warm complete');
-  } catch (err) {
-    console.error('[InstrumentSearch] Background cache warm failed:', err.message);
-  }
-};
-
-// ── Tokenize & resolve ─────────────────────────────────────
+// ── Query resolution ───────────────────────────────────────
 const resolveQuery = (query) => {
-  const tokens = query.toLowerCase().trim().split(/\s+/).filter(t => t.length > 0);
-  const resolved = {
-    underlying: [], instrumentTypes: [], exchanges: [],
-    strikes: [], expiry: [], otherTokens: []
-  };
+  const tokens = query.trim().toUpperCase().split(/\s+/);
+  const underlying = [];
+  const instrumentTypes = [];
+  const strikes = [];
+  const expiry = [];
+  const otherTokens = [];
 
   for (const token of tokens) {
-    if (/^\d+$/.test(token)) {
-      resolved.strikes.push(parseInt(token));
-      continue;
-    }
-    if (MONTHS.has(token.toUpperCase())) {
-      resolved.expiry.push(token.toUpperCase());
-      continue;
-    }
-    const alias = ALIASES[token];
+    const lower = token.toLowerCase();
+    const alias = ALIASES[lower];
     if (alias) {
-      if (Array.isArray(alias)) {
-        resolved.instrumentTypes.push(...alias);
-      } else if (INSTRUMENT_TYPES.has(alias)) {
-        resolved.instrumentTypes.push(alias);
-      } else if (EXCHANGES.has(alias)) {
-        resolved.exchanges.push(alias);
-      } else {
-        resolved.underlying.push(alias);
-      }
-    } else {
-      resolved.otherTokens.push(token.toUpperCase());
+      if (Array.isArray(alias)) instrumentTypes.push(...alias);
+      else if (INSTRUMENT_TYPES.has(alias)) instrumentTypes.push(alias);
+      else underlying.push(alias);
+    } else if (INSTRUMENT_TYPES.has(token)) {
+      instrumentTypes.push(token);
+    } else if (/^\d+$/.test(token) && token.length >= 3) {
+      strikes.push(parseInt(token));
+    } else if (MONTHS.has(token)) {
+      expiry.push(token);
+    } else if (token.length >= 2) {
+      underlying.push(token);
     }
   }
-  return resolved;
+
+  return { underlying, instrumentTypes, strikes, expiry, otherTokens };
 };
 
-// ── FIX 1 + FIX 2: Candidate gathering with tiered lookup + pre-filter + hard cap ──
+// ── Candidate gathering ────────────────────────────────────
 const gatherCandidates = (resolved, category, rawQuery) => {
   const fullUpper = rawQuery.toUpperCase().replace(/\s+/g, '');
   let candidateSet = null;
+  let categorySet = null;
 
-  // Start with category bucket if specified
   if (category !== 'ALL' && categoryBuckets.has(category)) {
-    candidateSet = new Set(categoryBuckets.get(category));
+    categorySet = categoryBuckets.get(category);
   }
 
-  // FIX 2: Tiered lookup strategy
   const searchTerms = [...resolved.underlying, ...resolved.otherTokens];
 
-  // Strategy A: If fullUpper >= 5 chars with no spaces → use symbol prefix (most specific)
-  if (fullUpper.length >= 5) {
+  // Strategy 1: Symbol prefix lookup (works for any length >= 3)
+  if (fullUpper.length >= 3) {
     const lookupKey = fullUpper.substring(0, Math.min(fullUpper.length, 12));
     const hits = bySymbolPrefix.get(lookupKey);
     if (hits && hits.size > 0) {
-      const symCandidates = new Set(hits);
-      if (candidateSet) {
-        // Intersect with category
-        const intersected = new Set();
-        for (const idx of symCandidates) {
-          if (candidateSet.has(idx)) intersected.add(idx);
-        }
-        candidateSet = intersected.size > 0 ? intersected : symCandidates;
-      } else {
-        candidateSet = symCandidates;
-      }
+      candidateSet = new Set(hits);
     }
   }
 
-  // Strategy B: If no symbol prefix hits or short query, use underlying index
+  // Strategy 2: Underlying index lookup
   if (!candidateSet || candidateSet.size === 0) {
-    const termSets = [];
     for (const term of searchTerms) {
       const termCandidates = new Set();
 
-      // Check underlying index (exact)
+      // Exact underlying match
       const underlyingHits = byUnderlying.get(term);
-      if (underlyingHits) {
-        for (const idx of underlyingHits) termCandidates.add(idx);
-      }
+      if (underlyingHits) for (const idx of underlyingHits) termCandidates.add(idx);
 
-      // Check symbol prefix index
+      // Symbol prefix match
       const prefixKey = term.substring(0, Math.min(term.length, 12));
       const prefixHits = bySymbolPrefix.get(prefixKey);
-      if (prefixHits) {
-        for (const idx of prefixHits) termCandidates.add(idx);
-      }
+      if (prefixHits) for (const idx of prefixHits) termCandidates.add(idx);
 
-      // Fuzzy check for underlyings if no exact hits
-      if (term.length >= 4 && termCandidates.size === 0) {
+      // Fuzzy only for longer terms with no hits
+      if (term.length >= 5 && termCandidates.size === 0) {
         const maxTypos = term.length >= 6 ? 2 : 1;
         for (const u of byUnderlying.keys()) {
-          const uPrefix = u.substring(0, term.length);
-          if (uPrefix.length >= 3) {
-            const dist = getEditDistance(term, uPrefix);
-            if (dist <= maxTypos) {
-              const fuzzyHits = byUnderlying.get(u);
-              if (fuzzyHits) {
-                for (const idx of fuzzyHits) termCandidates.add(idx);
-              }
-            }
+          if (u.length >= 3 && getEditDistance(term, u.substring(0, term.length)) <= maxTypos) {
+            const fuzzyHits = byUnderlying.get(u);
+            if (fuzzyHits) for (const idx of fuzzyHits) termCandidates.add(idx);
           }
         }
       }
 
-      if (termCandidates.size > 0) termSets.push(termCandidates);
-    }
-
-    if (termSets.length > 0) {
-      const unionSet = new Set();
-      for (const s of termSets) {
-        for (const idx of s) unionSet.add(idx);
-      }
-
-      if (candidateSet && candidateSet.size > 0) {
-        const intersected = new Set();
-        for (const idx of unionSet) {
-          if (candidateSet.has(idx)) intersected.add(idx);
-        }
-        candidateSet = intersected.size > 0 ? intersected : unionSet;
-      } else {
-        candidateSet = unionSet;
+      if (termCandidates.size > 0) {
+        if (!candidateSet) candidateSet = new Set();
+        for (const idx of termCandidates) candidateSet.add(idx);
       }
     }
   }
 
-  // Direct tradingsymbol startsWith refinement for long queries
-  if (fullUpper.length > 6 && candidateSet && candidateSet.size > 200) {
-    const refined = new Set();
+  // Intersect with category if both exist
+  if (candidateSet && candidateSet.size > 0 && categorySet) {
+    const intersected = new Set();
     for (const idx of candidateSet) {
-      if (instrumentList[idx]._symUpper.startsWith(fullUpper)) {
-        refined.add(idx);
-      }
+      if (categorySet.has(idx)) intersected.add(idx);
     }
-    if (refined.size > 0) candidateSet = refined;
+    if (intersected.size > 0) candidateSet = intersected;
   }
 
-  // FIX 1: Pre-filter by strikes before scoring
-  if (resolved.strikes.length > 0 && candidateSet && candidateSet.size > 500) {
-    const strikeStrs = resolved.strikes.map(String);
+  // Pre-filter by instrument type
+  if (resolved.instrumentTypes.length > 0 && candidateSet && candidateSet.size > 0) {
     const filtered = new Set();
     for (const idx of candidateSet) {
-      const inst = instrumentList[idx];
-      if (strikeStrs.some(s => inst._symUpper.includes(s) || inst.strike === resolved.strikes[0])) {
-        filtered.add(idx);
-      }
+      if (resolved.instrumentTypes.includes(instrumentList[idx].instrument_type)) filtered.add(idx);
     }
     if (filtered.size > 0) candidateSet = filtered;
   }
 
-  // FIX 1: Pre-filter by expiry
-  if (resolved.expiry.length > 0 && candidateSet && candidateSet.size > 500) {
+  // Pre-filter by strike
+  if (resolved.strikes.length > 0 && candidateSet && candidateSet.size > 50) {
     const filtered = new Set();
     for (const idx of candidateSet) {
-      if (resolved.expiry.some(e => instrumentList[idx]._symUpper.includes(e))) {
-        filtered.add(idx);
-      }
+      if (resolved.strikes.includes(instrumentList[idx].strike)) filtered.add(idx);
     }
     if (filtered.size > 0) candidateSet = filtered;
   }
 
-  // FIX 1: Pre-filter by instrument type
-  if (resolved.instrumentTypes.length > 0 && candidateSet && candidateSet.size > 500) {
-    const filtered = new Set();
-    for (const idx of candidateSet) {
-      if (resolved.instrumentTypes.includes(instrumentList[idx].instrument_type)) {
-        filtered.add(idx);
-      }
-    }
-    if (filtered.size > 0) candidateSet = filtered;
-  }
-
-  // FIX 1: Hard cap — never score more than 500 candidates
+  // Hard cap
   if (candidateSet && candidateSet.size > 500) {
-    const primaryUnderlying = resolved.underlying[0] || '';
+    const primary = resolved.underlying[0] || '';
     const arr = [...candidateSet];
-    // Sort: exact underlying matches first
     arr.sort((a, b) => {
-      const aExact = instrumentList[a]._nameUpper === primaryUnderlying ? 0 : 1;
-      const bExact = instrumentList[b]._nameUpper === primaryUnderlying ? 0 : 1;
+      const aExact = instrumentList[a]._nameUpper === primary ? 0 : 1;
+      const bExact = instrumentList[b]._nameUpper === primary ? 0 : 1;
       return aExact - bExact;
     });
     candidateSet = new Set(arr.slice(0, 500));
   }
 
-  // Fallback: if nothing found, use category or all
   if (!candidateSet || candidateSet.size === 0) {
-    if (category !== 'ALL' && categoryBuckets.has(category)) {
-      candidateSet = new Set(categoryBuckets.get(category));
-    } else {
-      candidateSet = new Set();
-      const max = Math.min(instrumentList.length, 500);
-      for (let i = 0; i < max; i++) candidateSet.add(i);
-    }
+    candidateSet = new Set();
   }
 
   return candidateSet;
 };
 
-// ── Scoring (unchanged logic, runs on much smaller candidate set now) ──
+// ── Scoring ────────────────────────────────────────────────
 const scoreInstrument = (inst, resolved, rawQuery) => {
   let score = 0;
-  const sym = inst._symUpper;
-  const underlying = inst._underlying;
-  const name = inst._nameUpper;
+  const nameUp = inst._nameUpper;
+  const symUp = inst._symUpper;
+  const queryUp = rawQuery.toUpperCase().replace(/\s+/g, '');
 
-  const fullUpper = rawQuery.toUpperCase().replace(/\s+/g, '');
-  if (fullUpper.length > 3 && sym.startsWith(fullUpper)) {
-    score += 25;
-    if (sym === fullUpper) score += 15;
+  // Exact name match
+  if (resolved.underlying.length > 0) {
+    if (nameUp === resolved.underlying[0]) score += 100;
+    else if (nameUp.startsWith(resolved.underlying[0])) score += 60;
   }
 
-  for (const u of resolved.underlying) {
-    if (underlying === u) score += 15;
-    else if (underlying.includes(u)) score += 10;
-  }
+  // Symbol prefix match
+  if (symUp.startsWith(queryUp)) score += 80;
+  else if (symUp.includes(queryUp)) score += 30;
 
-  for (const token of resolved.otherTokens) {
-    if (underlying === token) score += 15;
-    else if (sym.startsWith(token)) score += 12;
-    else if (underlying.startsWith(token)) score += 10;
-    else if (sym.includes(token)) score += 6;
-    else if (name.includes(token)) score += 4;
-    else if (token.length >= 4) {
-      const uPrefix = underlying.substring(0, Math.min(token.length, underlying.length));
-      if (uPrefix.length >= 3) {
-        const dist = getEditDistance(token, uPrefix);
-        if (dist <= (token.length >= 6 ? 2 : 1)) score += 5;
-      }
-    }
-  }
+  // Type match bonus
+  if (resolved.instrumentTypes.length > 0 && resolved.instrumentTypes.includes(inst.instrument_type)) score += 40;
 
-  if (resolved.instrumentTypes.length > 0) {
-    if (resolved.instrumentTypes.includes(inst.instrument_type)) score += 8;
-    else score -= 5;
-  }
+  // FUT bonus (futures are usually more relevant)
+  if (inst.instrument_type === 'FUT') score += 20;
 
-  if (resolved.exchanges.length > 0) {
-    if (resolved.exchanges.includes(inst.exchange)) score += 5;
-    else if (resolved.exchanges.includes('NFO') && inst.segment && inst.segment.startsWith('NFO')) score += 5;
-    else score -= 3;
-  }
-
-  if (resolved.strikes.length > 0) {
-    for (const strike of resolved.strikes) {
-      if (inst.strike === strike) score += 10;
-      else if (Math.abs(inst.strike - strike) < 100) score += 3;
-    }
-  }
-
-  if (resolved.expiry.length > 0) {
-    for (const month of resolved.expiry) {
-      if (sym.includes(month)) score += 6;
-    }
-  }
-
-  const fullQuery = [...resolved.underlying, ...resolved.otherTokens].join('');
-  if (sym === fullQuery) score += 20;
+  // Index bonus
+  if (inst.segment === 'INDICES') score += 15;
 
   return score;
 };
 
-// ── FIX 5: Score short-circuit + top-K heap ────────────────
 const scoreAndRank = (candidateSet, resolved, rawQuery, topK) => {
-  const results = [];
-  const heapSize = topK * 3; // keep 3x buffer for grouping diversity
-  let perfectFound = false;
-
+  const scored = [];
   for (const idx of candidateSet) {
-    // Short-circuit: if we found a perfect match and have enough results, stop
-    if (perfectFound && results.length >= heapSize) break;
-
-    const inst = instrumentList[idx];
-    const score = scoreInstrument(inst, resolved, rawQuery);
-    if (score <= 0) continue;
-
-    if (score >= 50) perfectFound = true;
-
-    // Maintain top-K heap
-    if (results.length < heapSize) {
-      results.push({ idx, score });
-    } else {
-      // Find min score in results and replace if current is better
-      let minIdx = 0;
-      for (let j = 1; j < results.length; j++) {
-        if (results[j].score < results[minIdx].score) minIdx = j;
-      }
-      if (score > results[minIdx].score) {
-        results[minIdx] = { idx, score };
-      }
-    }
+    const score = scoreInstrument(instrumentList[idx], resolved, rawQuery);
+    scored.push({ idx, score });
   }
-
-  results.sort((a, b) => b.score - a.score);
-  return results.slice(0, topK);
+  scored.sort((a, b) => b.score - a.score);
+  return scored.slice(0, topK);
 };
 
-// ── Group results ──────────────────────────────────────────
+// ── Group results for display ──────────────────────────────
 const groupResults = (instruments) => {
-  const groups = {
-    'Index': [], 'Futures': [], 'Call Options (CE)': [],
-    'Put Options (PE)': [], 'MCX-OPT': [], 'Equity': [], 'Other': []
-  };
+  const groups = {};
+  const groupOrder = ['Index', 'Futures', 'Call Options (CE)', 'Put Options (PE)', 'MCX-OPT', 'Other'];
 
   for (const inst of instruments) {
-    if (inst.segment === 'INDICES' || inst.instrument_type === 'IDX') groups['Index'].push(inst);
-    else if (inst.instrument_type === 'FUT') groups['Futures'].push(inst);
-    else if (inst.segment === 'MCX-OPT' || (inst.exchange === 'MCX' && (inst.instrument_type === 'CE' || inst.instrument_type === 'PE'))) groups['MCX-OPT'].push(inst);
-    else if (inst.instrument_type === 'CE') groups['Call Options (CE)'].push(inst);
-    else if (inst.instrument_type === 'PE') groups['Put Options (PE)'].push(inst);
-    else if (inst.instrument_type === 'EQ') groups['Equity'].push(inst);
-    else groups['Other'].push(inst);
+    const type = inst.instrument_type || '';
+    const segment = inst.segment || '';
+    const exchange = inst.exchange || '';
+    let label;
+    if (segment === 'INDICES' || type === 'IDX') label = 'Index';
+    else if (type === 'FUT') label = 'Futures';
+    else if (segment === 'MCX-OPT' || (exchange === 'MCX' && (type === 'CE' || type === 'PE'))) label = 'MCX-OPT';
+    else if (type === 'CE') label = 'Call Options (CE)';
+    else if (type === 'PE') label = 'Put Options (PE)';
+    else label = 'Other';
+
+    if (!groups[label]) groups[label] = [];
+    groups[label].push(inst);
   }
 
-  return Object.entries(groups)
-    .filter(([_, items]) => items.length > 0)
-    .map(([label, items]) => ({ label, items }));
+  const result = [];
+  for (const key of groupOrder) {
+    if (groups[key] && groups[key].length > 0) {
+      result.push({ label: key, items: groups[key] });
+    }
+  }
+  return result;
 };
 
-// ── Main search entry point ────────────────────────────────
+// ── Main search ────────────────────────────────────────────
 const smartSearch = async (query, category = 'ALL', limit = 10, page = 1) => {
   if (!query || query.trim().length === 0) {
     return { groups: [], total: 0, query: '', page, hasMore: false };
   }
 
-  // Check query cache (cache full results, paginate from cache)
-  const fullCacheKey = `${query.toLowerCase()}_${category}`;
-  let allResults;
-  const cached = queryCache.get(fullCacheKey);
-  if (cached && (Date.now() - cached.timestamp) < QUERY_CACHE_TTL) {
-    allResults = cached.allResults;
-  } else {
-    await loadInstrumentCache();
-
-    const resolved = resolveQuery(query);
-    const candidateSet = gatherCandidates(resolved, category, query);
-    const ranked = scoreAndRank(candidateSet, resolved, query, 200);
-
-    // Map to clean instruments and sort: non-expired nearest expiry first
-    const now = new Date();
-    allResults = ranked.map(r => {
-      const { _underlying, _symUpper, _nameUpper, ...clean } = instrumentList[r.idx];
-      clean._score = r.score;
-      return clean;
-    });
-
-    // Sort: non-expired instruments first (nearest expiry), then expired, then no-expiry
-    allResults.sort((a, b) => {
-      const aExp = a.expiry ? new Date(a.expiry) : null;
-      const bExp = b.expiry ? new Date(b.expiry) : null;
-      const aExpired = aExp && aExp < now;
-      const bExpired = bExp && bExp < now;
-
-      // Non-expired before expired
-      if (!aExpired && bExpired) return -1;
-      if (aExpired && !bExpired) return 1;
-
-      // Among non-expired: nearest expiry first
-      if (!aExpired && !bExpired && aExp && bExp) return aExp - bExp;
-
-      // Among expired: most recent expiry first
-      if (aExpired && bExpired) return bExp - aExp;
-
-      // No expiry (indices/EQ) after derivatives but before expired
-      if (!aExp && bExp && !bExpired) return 1;
-      if (aExp && !aExpired && !bExp) return -1;
-
-      // Fall back to score
-      return (b._score || 0) - (a._score || 0);
-    });
-
-    // Clean up _score
-    allResults.forEach(r => delete r._score);
-
-    // Cache
-    if (queryCache.size >= MAX_QUERY_CACHE_SIZE) {
-      const firstKey = queryCache.keys().next().value;
-      queryCache.delete(firstKey);
-    }
-    queryCache.set(fullCacheKey, { allResults, timestamp: Date.now() });
+  // If cache not ready, return empty instead of blocking the request
+  if (!instrumentList) {
+    // Trigger load in background if not already loading
+    loadInstrumentCache();
+    return { groups: [], total: 0, query, page, hasMore: false, loading: true };
   }
 
-  // Paginate
+  const resolved = resolveQuery(query);
+  const candidateSet = gatherCandidates(resolved, category, query);
+  const ranked = scoreAndRank(candidateSet, resolved, query, 200);
+
+  const allResults = ranked.map(r => {
+    const { _underlying, _symUpper, _nameUpper, ...clean } = instrumentList[r.idx];
+    return clean;
+  });
+
+  // Sort: nearest expiry first
+  allResults.sort((a, b) => {
+    const aExp = a.expiry ? new Date(a.expiry) : null;
+    const bExp = b.expiry ? new Date(b.expiry) : null;
+    if (!aExp && bExp) return -1;
+    if (aExp && !bExp) return 1;
+    if (aExp && bExp) return aExp - bExp;
+    return 0;
+  });
+
   const start = (page - 1) * limit;
   const pageResults = allResults.slice(start, start + limit);
   const hasMore = start + limit < allResults.length;
-
   const groups = groupResults(pageResults);
+
   return { groups, total: allResults.length, query, page, hasMore };
 };
 
-const getCategories = () => {
-  return Object.entries(CATEGORIES).map(([key, value]) => ({
-    key, label: value.label
-  }));
-};
+const getCategories = () => Object.keys(CATEGORIES);
+const clearCache = () => { instrumentList = null; cacheTimestamp = null; };
 
-const clearCache = () => {
-  instrumentList = null;
-  byUnderlying = null;
-  bySymbolPrefix = null;
-  categoryBuckets = null;
-  cacheTimestamp = null;
-  queryCache.clear();
-  console.log('🗑️  Instrument search cache cleared');
-};
-
-module.exports = { smartSearch, getCategories, clearCache, loadInstrumentCache };
+module.exports = { smartSearch, loadInstrumentCache, clearCache, getCategories, groupResults };

@@ -38,6 +38,9 @@ router.get('/brokerage-rules', tradeController.getBrokerageRules);
 // Trade report for PDF generation
 router.get('/report', getTradeReport);
 
+// Instrument info for trade card info sheet
+router.get('/instrument-info', tradeController.getInstrumentInfo);
+
 // Userwise open positions
 router.get('/userwise-positions', getUserwisePositions);
 

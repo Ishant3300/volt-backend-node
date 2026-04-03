@@ -116,7 +116,14 @@ const getAllUsers = async (req, res) => {
     const filter = {};
     if (status) filter.status = status;
     if (server_id) filter.server_id = server_id;
-    if (master_id) filter.master_id = master_id;
+
+    // If master_id is provided, get all users under that master's hierarchy
+    if (master_id) {
+      const { getAllSubMasterIds } = require('../services/masterHierarchyService');
+      const allMasterIds = await getAllSubMasterIds(master_id);
+      filter.master_id = { $in: allMasterIds };
+    }
+
     filter.deleted_at = null;
 
     const users = await User.find(filter)

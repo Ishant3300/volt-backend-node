@@ -118,4 +118,8 @@ kiteInstrumentSchema.index({ tradingsymbol: 1, expiry: 1 });
 // Index for options chain queries (symbol + strike + expiry)
 kiteInstrumentSchema.index({ name: 1, strike: 1, expiry: 1, instrument_type: 1 });
 
+// Compound index for direct DB search (no cache)
+kiteInstrumentSchema.index({ is_active: 1, name: 1, expiry: 1, instrument_type: 1 });
+kiteInstrumentSchema.index({ is_active: 1, raw_name: 1, expiry: 1, instrument_type: 1 });
+
 module.exports = mongoose.model('KiteInstrument', kiteInstrumentSchema);

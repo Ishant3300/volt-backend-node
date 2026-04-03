@@ -86,7 +86,7 @@ const getTradeReport = async (req, res) => {
         buy_qty: t.transaction_type === 'BUY' ? (t.executed_quantity || 0) : 0,
         sell_qty: t.transaction_type === 'SELL' ? (t.executed_quantity || 0) : 0,
         rate: t.executed_price || 0,
-        brokerage: t.brokerage || 0,
+        brokerage: 0, // Will be recalculated below
         pnl: t.pnl || 0,
       });
     }
@@ -96,7 +96,7 @@ const getTradeReport = async (req, res) => {
     const allTokens = [...new Set(trades.map(t => t.instrument_token))];
     const kiteInstruments = await KiteInstrument.find(
       { instrument_token: { $in: allTokens } },
-      'instrument_token lot_size segment raw_name'
+      'instrument_token lot_size segment raw_name name expiry instrument_type'
     ).lean();
     const kiteMap = {};
     kiteInstruments.forEach(ki => { kiteMap[ki.instrument_token] = ki; });
@@ -149,9 +149,55 @@ const getTradeReport = async (req, res) => {
       grandTotalPnl += pnl;
       grandBrokerage += brokerage;
 
+      // Recalculate per-trade brokerage in all_trades (stored t.brokerage is unreliable)
+      const ki = kiteMap[g.instrument_token] || {};
+      const seg = ki.segment || '';
+      const rawName = ki.raw_name || '';
+      const lotSize = ki.lot_size || 1;
+
+      let perTradeRule = null;
+      if (rawName && seg) perTradeRule = brkRules.find(r => r.script_name?.toUpperCase() === rawName.toUpperCase() && r.exchange_name === seg.toUpperCase());
+      if (!perTradeRule && rawName) perTradeRule = brkRules.find(r => r.script_name?.toUpperCase() === rawName.toUpperCase());
+      if (!perTradeRule && seg) perTradeRule = brkRules.find(r => r.exchange_name === seg.toUpperCase() && !r.script_name);
+      if (!perTradeRule) perTradeRule = brkRules.find(r => r.exchange_name === (seg.split('-')[0] || '').toUpperCase() && !r.script_name);
+
+      for (const at of g.all_trades) {
+        if (perTradeRule) {
+          const qty = (at.buy_qty || 0) + (at.sell_qty || 0);
+          const rate = at.rate || 0;
+          if (perTradeRule.type === 'TURNOVER WISE') {
+            at.brokerage = Math.round(rate * qty * (perTradeRule.brk_value / 10000) * 100) / 100;
+          } else if (perTradeRule.type === 'LOT WISE') {
+            at.brokerage = Math.round((lotSize > 1 ? qty / lotSize : qty) * perTradeRule.brk_value * 100) / 100;
+          }
+        }
+      }
+
+      // Build friendly display name from KiteInstrument data
+      let displayName = g.tradingsymbol;
+      if (ki.name) {
+        const base = ki.name;
+        if (ki.expiry) {
+          const exp = new Date(ki.expiry);
+          const months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+          const day = exp.getDate();
+          const month = months[exp.getMonth()];
+          if (ki.instrument_type === 'FUT') {
+            displayName = `${base} ${day} ${month} FUT`;
+          } else if (ki.instrument_type === 'CE' || ki.instrument_type === 'PE') {
+            displayName = `${base} ${ki.strike || ''} ${ki.instrument_type} ${day} ${month}`;
+          } else {
+            displayName = `${base} ${day} ${month}`;
+          }
+        } else {
+          displayName = base;
+        }
+      }
+
       instruments.push({
         exchange: g.exchange,
         tradingsymbol: g.tradingsymbol,
+        display_name: displayName,
         buys: g.buys,
         sells: g.sells,
         all_trades: g.all_trades,
@@ -172,6 +218,7 @@ const getTradeReport = async (req, res) => {
         carryForward.push({
           exchange: g.exchange,
           tradingsymbol: g.tradingsymbol,
+          display_name: displayName,
           type: diff > 0 ? 'Buy' : 'Sell',
           quantity: Math.abs(diff),
           price: diff > 0 ? avgBuyPrice : avgSellPrice,

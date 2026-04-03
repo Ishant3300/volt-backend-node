@@ -1156,6 +1156,65 @@ const autoSquareOffExpired = async (req, res) => {
     }
 };
 
+/**
+ * GET /trade/instrument-info?token=X
+ * Returns trade margin, brokerage rule, and instrument details for the info sheet.
+ */
+const getInstrumentInfo = async (req, res) => {
+    try {
+        const { token } = req.query;
+        if (!token) return res.status(400).json({ success: false, message: 'token is required' });
+
+        const KiteInstrument = require('../models/KiteInstrument');
+        const TradeMargin = require('../models/TradeMargin');
+        const BrokerageSettings = require('../models/BrokerageSettings');
+
+        const instrument = await KiteInstrument.findOne({ instrument_token: token }).lean();
+        if (!instrument) return res.status(404).json({ success: false, message: 'Instrument not found' });
+
+        const seg = instrument.segment || '';
+        const rawName = instrument.raw_name || '';
+        const exchange = seg.split('-')[0] || instrument.exchange || '';
+
+        // Trade margin: 4-level fallback (raw_name+segment → raw_name → segment → exchange)
+        let marginRule = null;
+        if (rawName && seg) marginRule = await TradeMargin.findOne({ script_name: { $regex: new RegExp(`^${rawName}$`, 'i') }, exchange_name: seg.toUpperCase(), deleted_at: null }).lean();
+        if (!marginRule && rawName) marginRule = await TradeMargin.findOne({ script_name: { $regex: new RegExp(`^${rawName}$`, 'i') }, deleted_at: null }).lean();
+        if (!marginRule && seg) marginRule = await TradeMargin.findOne({ exchange_name: seg.toUpperCase(), script_name: { $in: [null, ''] }, deleted_at: null }).lean();
+        if (!marginRule) marginRule = await TradeMargin.findOne({ exchange_name: exchange.toUpperCase(), script_name: { $in: [null, ''] }, deleted_at: null }).lean();
+
+        // Brokerage: same 4-level fallback
+        let brkRule = null;
+        if (rawName && seg) brkRule = await BrokerageSettings.findOne({ script_name: { $regex: new RegExp(`^${rawName}$`, 'i') }, exchange_name: seg.toUpperCase(), deleted_at: null }).lean();
+        if (!brkRule && rawName) brkRule = await BrokerageSettings.findOne({ script_name: { $regex: new RegExp(`^${rawName}$`, 'i') }, deleted_at: null }).lean();
+        if (!brkRule && seg) brkRule = await BrokerageSettings.findOne({ exchange_name: seg.toUpperCase(), script_name: { $in: [null, ''] }, deleted_at: null }).lean();
+        if (!brkRule) brkRule = await BrokerageSettings.findOne({ exchange_name: exchange.toUpperCase(), script_name: { $in: [null, ''] }, deleted_at: null }).lean();
+
+        res.status(200).json({
+            success: true,
+            data: {
+                script: rawName || instrument.name || instrument.tradingsymbol,
+                segment: seg,
+                exchange: instrument.exchange,
+                expiry: instrument.expiry,
+                lot_size: instrument.lot_size || 1,
+                tick_size: instrument.tick_size,
+                instrument_type: instrument.instrument_type,
+                trade_margin: marginRule ? {
+                    value: marginRule.trade_margin,
+                    type: marginRule.amount_type,
+                } : null,
+                brokerage: brkRule ? {
+                    value: brkRule.brk_value,
+                    type: brkRule.type,
+                } : null,
+            }
+        });
+    } catch (error) {
+        res.status(500).json({ success: false, message: error.message });
+    }
+};
+
 module.exports = {
     placeTrade,
     cancelTrade,
@@ -1166,4 +1225,5 @@ module.exports = {
     getMargins,
     getBrokerageRules,
     autoSquareOffExpired,
+    getInstrumentInfo,
 };
