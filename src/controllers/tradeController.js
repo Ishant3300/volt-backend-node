@@ -128,20 +128,22 @@ const placeTrade = async (req, res) => {
                 throw new Error('User not found');
             }
 
-            // Compute live equity for margin check:
-            // Use credits + sum(trade.pnl) + floatingPnl
-            // Note: trade.pnl is FIFO P&L without brokerage. We skip brokerage here
-            // because stored trade.brokerage values are unreliable (100x bug for turnover).
-            // Flutter recalculates brokerage client-side from BrokerageSettings.
-            const floatingPnl = await _computeUserFloatingPnl(user._id, session);
-            
-            const tradeAgg = await Trade.aggregate([
-                { $match: { user_id: user._id, status: 'completed', deleted_at: null } },
-                { $group: { _id: null, totalPnl: { $sum: '$pnl' } } }
-            ]).session(session);
-            const totalPnl = tradeAgg.length > 0 ? tradeAgg[0].totalPnl : 0;
-            
-            const liveEquity = (user.credits || 0) + totalPnl + floatingPnl;
+            // Compute live equity and free margin for margin check.
+            // ALWAYS use metricsEngine (single source of truth — same as orders page UI).
+            // equity = credit + m2mPnl
+            // freeMargin = equity - marginUsed
+            let liveEquity;
+            let liveFreeMargin;
+            const metricsEngine = require('../services/metricsEngine');
+            const freshMetrics = await metricsEngine.getFreshMetrics(user._id.toString());
+            if (freshMetrics) {
+                liveEquity = freshMetrics.equity;
+                liveFreeMargin = freshMetrics.free_margin;
+            } else {
+                // User has no trades at all — equity = freeMargin = credits
+                liveEquity = user.credits || 0;
+                liveFreeMargin = user.credits || 0;
+            }
 
             // ── BET check: if bet is OFF, user cannot trade at all (BUY or SELL) ──
             // Admin placing on behalf of user bypasses this check
@@ -352,7 +354,7 @@ const placeTrade = async (req, res) => {
                         }
 
                         const marginPerUnit = await calculateMargin(normalizedExchange, 1, priceForMargin, { rawName: instrumentRawName, instrumentToken: instrument_token, tradingsymbol });
-                        const availableBalance = liveEquity;
+                        const availableBalance = liveFreeMargin;
                         const maxAffordableQty = marginPerUnit > 0 ? Math.floor(availableBalance / marginPerUnit) : remainingQty;
                         const effectiveMaxQty = Math.min(remainingQty, maxAffordableQty);
 
@@ -411,7 +413,7 @@ const placeTrade = async (req, res) => {
                         }
 
                         const marginPerLot = await calculateMargin(normalizedExchange, lotSize, priceForMargin, { rawName: instrumentRawName, instrumentToken: instrument_token, tradingsymbol });
-                        const availableBalance = liveEquity;
+                        const availableBalance = liveFreeMargin;
                         const maxAffordableLots = marginPerLot > 0 ? Math.floor(availableBalance / marginPerLot) : remainingLots;
                         const effectiveMaxLots = Math.min(remainingLots, maxAffordableLots);
 
@@ -816,7 +818,32 @@ const getAccountMetrics = async (req, res) => {
             return res.status(401).json({ success: false, message: 'Unauthorized' });
         }
 
-        const user = await User.findById(userId, 'credits balance equity free_margin realised_pnl position_pnl m2m_pnl margin_used name username').lean();
+        // ALWAYS use metricsEngine (single source of truth)
+        const metricsEngine = require('../services/metricsEngine');
+        const metrics = await metricsEngine.getFreshMetrics(userId.toString());
+
+        if (metrics) {
+            const user = await User.findById(userId, 'name username').lean();
+            return res.status(200).json({
+                success: true,
+                message: 'Metrics fetched successfully',
+                data: {
+                    user_id: userId,
+                    name: user?.name,
+                    username: user?.username,
+                    credit: metrics.credit,
+                    equity: metrics.equity,
+                    free_margin: metrics.free_margin,
+                    realised_pnl: metrics.realised_pnl,
+                    position_pnl: metrics.position_pnl,
+                    m2m_pnl: metrics.m2m_pnl,
+                    margin_used: metrics.margin_used,
+                }
+            });
+        }
+
+        // User has no trades — return credits as equity
+        const user = await User.findById(userId, 'credits name username').lean();
         if (!user) {
             return res.status(404).json({ success: false, message: 'User not found' });
         }
@@ -829,13 +856,12 @@ const getAccountMetrics = async (req, res) => {
                 name: user.name,
                 username: user.username,
                 credit: user.credits || 0,
-                equity: user.equity || 0,
-                free_margin: user.free_margin || user.credits || 0,
-                // Also return last-saved computed metrics so client can seed from them
-                realised_pnl: Math.round((user.realised_pnl || 0) * 100) / 100,
-                position_pnl: Math.round((user.position_pnl || 0) * 100) / 100,
-                m2m_pnl: Math.round((user.m2m_pnl || 0) * 100) / 100,
-                margin_used: Math.round((user.margin_used || 0) * 100) / 100,
+                equity: user.credits || 0,
+                free_margin: user.credits || 0,
+                realised_pnl: 0,
+                position_pnl: 0,
+                m2m_pnl: 0,
+                margin_used: 0,
             }
         });
     } catch (error) {

@@ -88,11 +88,32 @@ class MetricsEngine {
       const userIds = await Trade.distinct('user_id', { status: 'completed', deleted_at: null });
       const users = await User.find({ _id: { $in: userIds }, deleted_at: null }).select('_id credits master_id').lean();
 
+      // Build master hierarchy maps for broadcast aggregation
+      const allMasters = await Master.find({ deleted_at: null }).select('_id master_id').lean();
+      this._masterParentMap = {};   // masterId → parentMasterId
+      this._masterChildrenMap = {}; // masterId → [childMasterId, ...]
+      for (const m of allMasters) {
+        const mid = m._id.toString();
+        const parentId = m.master_id?.toString() || null;
+        this._masterParentMap[mid] = parentId;
+        if (parentId) {
+          if (!this._masterChildrenMap[parentId]) this._masterChildrenMap[parentId] = [];
+          this._masterChildrenMap[parentId].push(mid);
+        }
+      }
+
       this._userCache.clear();
       this._tokenToUsers.clear();
 
       for (const user of users) {
         await this._rebuildUserCache(user._id.toString(), user.credits || 0, user.master_id?.toString());
+      }
+
+      // Compute initial metrics for all cached users (so getCachedMetrics works
+      // even before the first tick arrives for their instruments)
+      for (const userId of this._userCache.keys()) {
+        const metrics = this._computeUserMetrics(userId);
+        if (metrics) this._metricsCache.set(userId, metrics);
       }
     } catch (e) {
       console.error('📊 [MetricsEngine] Error rebuilding user caches:', e.message);
@@ -335,8 +356,8 @@ class MetricsEngine {
     const positionPnl = Math.round(totalFloating * 100) / 100;
     const m2mPnl = Math.round((realisedPnl + positionPnl) * 100) / 100;
     const marginUsed = Math.round(totalMargin * 100) / 100;
-    const equity = Math.round((credit + m2mPnl - marginUsed) * 100) / 100;
-    const freeMargin = equity;
+    const equity = Math.round((credit + m2mPnl) * 100) / 100;
+    const freeMargin = Math.round((equity - marginUsed) * 100) / 100;
 
     return {
       user_id: userId,
@@ -353,36 +374,62 @@ class MetricsEngine {
 
   /**
    * Send metrics to the specific user via WebSocket.
+   * Also sends to the user's master (and up the hierarchy) so admin/master
+   * viewing this user's Position tab gets live updates.
    */
   _broadcastUserMetrics(userId, metrics) {
     if (!this.livePriceService) return;
+
+    // Send to the user themselves
     this.livePriceService.broadcastToUser(userId, {
       type: 'metrics_update',
       data: metrics
     });
+
+    // Also send to the user's master and all ancestor masters
+    const cache = this._userCache.get(userId);
+    if (cache && cache.masterId) {
+      let currentMasterId = cache.masterId;
+      const visited = new Set();
+      while (currentMasterId && !visited.has(currentMasterId)) {
+        visited.add(currentMasterId);
+        this.livePriceService.broadcastToUser(currentMasterId, {
+          type: 'metrics_update',
+          data: metrics
+        });
+        currentMasterId = this._masterParentMap?.[currentMasterId] || null;
+      }
+    }
+
+    // Also send to all admin WebSocket clients
+    if (this.livePriceService.wss) {
+      const msg = JSON.stringify({ type: 'metrics_update', data: metrics });
+      this.livePriceService.wss.clients.forEach(client => {
+        if (client.readyState === 1 && client.isAdmin) {
+          client.send(msg);
+        }
+      });
+    }
   }
 
   /**
    * Aggregate per-user metrics into per-master totals and broadcast to masters/admins.
+   * Each master receives data for ALL users in their hierarchy (direct + sub-masters' users).
    */
   _broadcastMasterMetrics() {
     if (!this.livePriceService) return;
 
-    const masterAgg = {};
-
+    // Step 1: Build direct master → users mapping
+    const directMasterUsers = {};
     for (const [userId, cache] of this._userCache) {
       const masterId = cache.masterId;
       if (!masterId) continue;
-
+      if (!directMasterUsers[masterId]) directMasterUsers[masterId] = [];
+      
       const metrics = this._metricsCache.get(userId);
       if (!metrics) continue;
-
-      if (!masterAgg[masterId]) {
-        masterAgg[masterId] = { totalPnl: 0, users: [] };
-      }
-      const userPnl = metrics.realised_pnl + metrics.position_pnl;
-      masterAgg[masterId].totalPnl += userPnl;
-      masterAgg[masterId].users.push({
+      
+      directMasterUsers[masterId].push({
         user_id: userId,
         credit: metrics.credit,
         equity: metrics.equity,
@@ -394,24 +441,79 @@ class MetricsEngine {
       });
     }
 
-    // Broadcast to each master
-    for (const [masterId, agg] of Object.entries(masterAgg)) {
-      this.livePriceService.broadcastToUser(masterId, {
-        type: 'master_metrics_update',
-        data: {
-          total_pnl: Math.round(agg.totalPnl * 100) / 100,
-          users: agg.users
+    // Step 2: Build master hierarchy (master_id → parent_master_id)
+    // We need to know which masters are sub-masters of which
+    // Use _masterParentMap built during cache init
+    if (!this._masterParentMap) this._masterParentMap = {};
+
+    // Step 3: For each master, collect all descendant users
+    const allMasterIds = new Set(Object.keys(directMasterUsers));
+    // Also add masters that are parents of other masters
+    for (const mid of Object.values(this._masterParentMap)) {
+      if (mid) allMasterIds.add(mid);
+    }
+
+    for (const masterId of allMasterIds) {
+      // Get all sub-master IDs under this master (from cached hierarchy)
+      const descendantMasterIds = this._getDescendantMasterIds(masterId);
+      const allMasterIdsForThis = [masterId, ...descendantMasterIds];
+
+      let totalPnl = 0;
+      const allUsers = [];
+
+      for (const mid of allMasterIdsForThis) {
+        const users = directMasterUsers[mid] || [];
+        for (const u of users) {
+          const userPnl = (u.realised_pnl || 0) + (u.position_pnl || 0);
+          totalPnl += userPnl;
+          allUsers.push(u);
         }
-      });
+      }
+
+      if (allUsers.length > 0) {
+        this.livePriceService.broadcastToUser(masterId, {
+          type: 'master_metrics_update',
+          data: {
+            total_pnl: Math.round(totalPnl * 100) / 100,
+            users: allUsers
+          }
+        });
+      }
     }
 
     // Broadcast admin-level summary
     if (this.livePriceService.wss) {
-      const adminSummary = Object.entries(masterAgg).map(([mid, agg]) => ({
-        master_id: mid,
-        total_pnl: Math.round(agg.totalPnl * 100) / 100,
-        user_count: agg.users.length
-      }));
+      // For admin, group by top-level master (master_id = null or created by admin)
+      const adminSummary = [];
+      const topLevelMasters = new Set();
+      for (const mid of Object.keys(directMasterUsers)) {
+        // Walk up to find the top-level master
+        let current = mid;
+        while (this._masterParentMap[current]) {
+          current = this._masterParentMap[current];
+        }
+        topLevelMasters.add(current);
+      }
+
+      for (const masterId of topLevelMasters) {
+        const descendantMasterIds = this._getDescendantMasterIds(masterId);
+        const allMasterIdsForThis = [masterId, ...descendantMasterIds];
+        let totalPnl = 0;
+        let userCount = 0;
+        for (const mid of allMasterIdsForThis) {
+          const users = directMasterUsers[mid] || [];
+          userCount += users.length;
+          for (const u of users) {
+            totalPnl += (u.realised_pnl || 0) + (u.position_pnl || 0);
+          }
+        }
+        adminSummary.push({
+          master_id: masterId,
+          total_pnl: Math.round(totalPnl * 100) / 100,
+          user_count: userCount
+        });
+      }
+
       const msg = JSON.stringify({ type: 'admin_metrics_update', data: adminSummary });
       this.livePriceService.wss.clients.forEach(client => {
         if (client.readyState === 1 && client.isAdmin) {
@@ -419,6 +521,25 @@ class MetricsEngine {
         }
       });
     }
+  }
+
+  /**
+   * Get all descendant master IDs under a given master (not including itself).
+   * Uses the cached _masterChildrenMap.
+   */
+  _getDescendantMasterIds(masterId) {
+    if (!this._masterChildrenMap) return [];
+    const result = [];
+    const queue = [masterId];
+    while (queue.length > 0) {
+      const current = queue.shift();
+      const children = this._masterChildrenMap[current] || [];
+      for (const childId of children) {
+        result.push(childId);
+        queue.push(childId);
+      }
+    }
+    return result;
   }
 
   /**
@@ -456,12 +577,49 @@ class MetricsEngine {
   }
 
   /**
-   * Get cached metrics for all users under a master.
+   * Get metrics for a user — always fresh. If not cached, rebuild and compute on the spot.
+   * This is the method tradeController should use to guarantee consistency with the orders page.
+   */
+  async getFreshMetrics(userId) {
+    // Try cache first
+    const cached = this._metricsCache.get(userId);
+    if (cached) return cached;
+
+    // No cache — rebuild this user's data and compute
+    try {
+      const user = await User.findById(userId).select('credits master_id').lean();
+      if (!user) return null;
+
+      // Clear old token→user mappings for this user
+      for (const [token, users] of this._tokenToUsers) {
+        users.delete(userId);
+        if (users.size === 0) this._tokenToUsers.delete(token);
+      }
+
+      await this._rebuildUserCache(userId, user.credits || 0, user.master_id?.toString());
+
+      const metrics = this._computeUserMetrics(userId);
+      if (metrics) {
+        this._metricsCache.set(userId, metrics);
+        return metrics;
+      }
+    } catch (e) {
+      console.error(`📊 [MetricsEngine] getFreshMetrics error for ${userId}:`, e.message);
+    }
+
+    return null;
+  }
+
+  /**
+   * Get cached metrics for all users under a master (including sub-masters' users).
    */
   getMasterUserMetrics(masterId) {
+    const descendantMasterIds = this._getDescendantMasterIds(masterId);
+    const allMasterIds = new Set([masterId, ...descendantMasterIds]);
+
     const result = [];
     for (const [userId, cache] of this._userCache) {
-      if (cache.masterId === masterId) {
+      if (allMasterIds.has(cache.masterId)) {
         const metrics = this._metricsCache.get(userId);
         if (metrics) result.push(metrics);
       }

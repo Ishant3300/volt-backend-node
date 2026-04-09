@@ -32,7 +32,9 @@ const getAccountSummary = async (req, res) => {
     } else if (user_id) {
       targetUserIds = [new mongoose.Types.ObjectId(user_id)];
     } else if (role === 'master') {
-      const users = await User.find({ master_id: callerId, deleted_at: null }).select('_id').lean();
+      const { getAllSubMasterIds } = require('../services/masterHierarchyService');
+      const allMasterIds = await getAllSubMasterIds(callerId);
+      const users = await User.find({ master_id: { $in: allMasterIds }, deleted_at: null }).select('_id').lean();
       targetUserIds = users.map(u => u._id);
     } else {
       // Admin, no user selected — get all users

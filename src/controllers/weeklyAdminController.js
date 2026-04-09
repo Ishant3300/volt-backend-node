@@ -12,7 +12,9 @@ const getWeeklyAdminReport = async (req, res) => {
 
     if (role === 'master') {
       const master = await Master.findById(callerId).select('username pnl_sharing brokerage_sharing').lean();
-      const users = await User.find({ master_id: callerId, deleted_at: null }).select('_id name username').lean();
+      const { getAllSubMasterIds } = require('../services/masterHierarchyService');
+      const allMasterIds = await getAllSubMasterIds(callerId);
+      const users = await User.find({ master_id: { $in: allMasterIds }, deleted_at: null }).select('_id name username').lean();
       if (!users.length) return res.json({ success: true, data: [], totals: _emptyTotals() });
 
       const perUser = await _computePerUser(users.map(u => u._id), brkRules);

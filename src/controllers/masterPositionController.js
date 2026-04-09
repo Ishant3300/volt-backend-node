@@ -11,9 +11,11 @@ const getAggregatedPositions = async (req, res) => {
   try {
     const masterId = req.master.id;
 
-    // Get all child user IDs for this master
+    // Get all child user IDs for this master (full hierarchy including sub-masters' users)
+    const { getAllSubMasterIds } = require('../services/masterHierarchyService');
+    const allMasterIds = await getAllSubMasterIds(masterId);
     const childUsers = await User.find({
-      master_id: masterId,
+      master_id: { $in: allMasterIds },
       deleted_at: null
     }).select('_id name username');
 
@@ -147,9 +149,11 @@ const getInstrumentUserBreakdown = async (req, res) => {
     const masterId = req.master.id;
     const { instrumentToken } = req.params;
 
-    // Get all child user IDs
+    // Get all child user IDs (full hierarchy including sub-masters' users)
+    const { getAllSubMasterIds } = require('../services/masterHierarchyService');
+    const allMasterIds = await getAllSubMasterIds(masterId);
     const childUsers = await User.find({
-      master_id: masterId,
+      master_id: { $in: allMasterIds },
       deleted_at: null
     }).select('_id name username');
 
@@ -279,7 +283,7 @@ const _getLivePricesFromKite = async (instrumentTokens) => {
  */
 const getUserMetrics = async (req, res) => {
   try {
-    const tradeMetricsService = require('../services/tradeMetricsService');
+    const metricsEngine = require('../services/metricsEngine');
 
     // Admin passes ?master_id=xxx to view a specific master's users
     // Or ?user_id=xxx to view a single user's metrics
@@ -292,8 +296,11 @@ const getUserMetrics = async (req, res) => {
         .select('_id name username credits balance');
       childUsers = user ? [user] : [];
     } else if (masterId) {
+      // Get all users under this master AND all sub-masters (full hierarchy)
+      const { getAllSubMasterIds } = require('../services/masterHierarchyService');
+      const allMasterIds = await getAllSubMasterIds(masterId);
       childUsers = await User.find({
-        master_id: masterId,
+        master_id: { $in: allMasterIds },
         deleted_at: null
       }).select('_id name username credits balance');
     } else {
@@ -304,21 +311,43 @@ const getUserMetrics = async (req, res) => {
       return res.status(200).json({ success: true, data: [] });
     }
 
-    const childUserIds = childUsers.map(u => u._id);
-
-    // Find all active instrument_tokens for these users to fetch LTPs
-    const activeTokens = await Trade.distinct('instrument_token', {
-      user_id: { $in: childUserIds },
-      status: 'completed',
-      deleted_at: null
-    });
-
-    const ltpMap = await _getLivePricesFromKite(activeTokens.map(t => parseInt(t)));
-
-    // Compute metrics per user using the centralized service
+    // Use metricsEngine as single source of truth
     const result = await Promise.all(childUsers.map(async (user) => {
       try {
-        return await tradeMetricsService.getUserMetrics(user._id, ltpMap);
+        const metrics = await metricsEngine.getFreshMetrics(user._id.toString());
+        if (metrics) {
+          return {
+            user_id: user._id,
+            name: user.name,
+            username: user.username,
+            credit: metrics.credit,
+            balance: metrics.equity,
+            realised_pnl: metrics.realised_pnl,
+            position_pnl: metrics.position_pnl,
+            m2m_pnl: metrics.m2m_pnl,
+            equity: metrics.equity,
+            margin_used: metrics.margin_used,
+            free_margin: metrics.free_margin,
+            open_positions_count: metrics.positions.length,
+            positions: metrics.positions
+          };
+        }
+        // User has no trades
+        return {
+          user_id: user._id,
+          name: user.name,
+          username: user.username,
+          credit: user.credits || 0,
+          balance: user.credits || 0,
+          realised_pnl: 0,
+          position_pnl: 0,
+          m2m_pnl: 0,
+          equity: user.credits || 0,
+          margin_used: 0,
+          free_margin: user.credits || 0,
+          open_positions_count: 0,
+          positions: []
+        };
       } catch (err) {
         console.error(`Error computing metrics for user ${user._id}:`, err.message);
         return {
@@ -350,7 +379,7 @@ const getUserMetrics = async (req, res) => {
  */
 const getAdminMasterMetrics = async (req, res) => {
   try {
-    const tradeMetricsService = require('../services/tradeMetricsService');
+    const metricsEngine = require('../services/metricsEngine');
     const masters = await Master.find({ deleted_at: null }).select('_id name username');
 
     if (masters.length === 0) {
@@ -361,32 +390,24 @@ const getAdminMasterMetrics = async (req, res) => {
     const allUsers = await User.find({
       master_id: { $in: masterIds },
       deleted_at: null
-    }).select('_id master_id');
+    }).select('_id master_id credits');
 
     const usersByMaster = {};
     allUsers.forEach(u => {
       const mid = u.master_id.toString();
       if (!usersByMaster[mid]) usersByMaster[mid] = [];
-      usersByMaster[mid].push(u._id);
+      usersByMaster[mid].push(u);
     });
 
     const result = await Promise.all(masters.map(async (master) => {
       const mid = master._id.toString();
-      const userIds = usersByMaster[mid] || [];
+      const users = usersByMaster[mid] || [];
 
-      // Find active tokens for this master's users
-      const activeTokens = await Trade.distinct('instrument_token', {
-        user_id: { $in: userIds },
-        status: 'completed',
-        deleted_at: null
-      });
-
-      const ltpMap = await _getLivePricesFromKite(activeTokens.map(t => parseInt(t)));
-
-      // Fetch metrics for all users under this master
-      const userMetrics = await Promise.all(userIds.map(async (uid) => {
+      // Get metrics for all users under this master from metricsEngine
+      const userMetrics = await Promise.all(users.map(async (u) => {
         try {
-          return await tradeMetricsService.getUserMetrics(uid, ltpMap);
+          const metrics = await metricsEngine.getFreshMetrics(u._id.toString());
+          return metrics;
         } catch (e) {
           return null;
         }
@@ -394,17 +415,25 @@ const getAdminMasterMetrics = async (req, res) => {
 
       const validMetrics = userMetrics.filter(m => m !== null);
 
-      // Aggregate master-level metrics
+      // For users with no trades, add their credits as equity
+      let noTradeEquity = 0;
+      for (const u of users) {
+        const hasMetrics = validMetrics.some(m => m.user_id === u._id.toString());
+        if (!hasMetrics) {
+          noTradeEquity += u.credits || 0;
+        }
+      }
+
       const masterMetrics = {
         master_id: mid,
         name: master.name,
         username: master.username,
-        user_count: userIds.length,
+        user_count: users.length,
         realised_pnl: Math.round(validMetrics.reduce((sum, m) => sum + m.realised_pnl, 0) * 100) / 100,
         position_pnl: Math.round(validMetrics.reduce((sum, m) => sum + m.position_pnl, 0) * 100) / 100,
         m2m_pnl: Math.round(validMetrics.reduce((sum, m) => sum + m.m2m_pnl, 0) * 100) / 100,
         margin_used: Math.round(validMetrics.reduce((sum, m) => sum + m.margin_used, 0) * 100) / 100,
-        equity: Math.round(validMetrics.reduce((sum, m) => sum + m.equity, 0) * 100) / 100,
+        equity: Math.round((validMetrics.reduce((sum, m) => sum + m.equity, 0) + noTradeEquity) * 100) / 100,
         positions: [].concat(...validMetrics.map(m => m.positions))
       };
 
@@ -425,35 +454,31 @@ const getAdminMasterMetrics = async (req, res) => {
  */
 const getBulkEquity = async (req, res) => {
   try {
-    const tradeMetricsService = require('../services/tradeMetricsService');
+    const metricsEngine = require('../services/metricsEngine');
     const isAdmin = !!req.admin;
     const masterId = req.master?.id;
 
     let users, childMasters;
     if (isAdmin) {
-      users = await User.find({ deleted_at: null }).select('_id');
+      users = await User.find({ deleted_at: null }).select('_id credits');
       childMasters = await Master.find({ deleted_at: null }).select('_id');
     } else if (masterId) {
-      users = await User.find({ master_id: masterId, deleted_at: null }).select('_id');
+      users = await User.find({ master_id: masterId, deleted_at: null }).select('_id credits');
       childMasters = await Master.find({ master_id: masterId, deleted_at: null }).select('_id');
     } else {
       return res.status(200).json({ success: true, data: { users: {}, masters: {} } });
     }
 
-    const userIds = users.map(u => u._id);
-    const activeTokens = await Trade.distinct('instrument_token', {
-      user_id: { $in: userIds },
-      status: 'completed',
-      deleted_at: null
-    });
-    const ltpMap = await _getLivePricesFromKite(activeTokens.map(t => parseInt(t)));
-
     const userEquityMap = {};
-    await Promise.all(userIds.map(async (uid) => {
+    await Promise.all(users.map(async (u) => {
       try {
-        const metrics = await tradeMetricsService.getUserMetrics(uid, ltpMap);
-        userEquityMap[uid.toString()] = Math.round(metrics.equity * 100) / 100;
-      } catch (_) {}
+        const metrics = await metricsEngine.getFreshMetrics(u._id.toString());
+        userEquityMap[u._id.toString()] = metrics
+          ? Math.round(metrics.equity * 100) / 100
+          : Math.round((u.credits || 0) * 100) / 100;
+      } catch (_) {
+        userEquityMap[u._id.toString()] = Math.round((u.credits || 0) * 100) / 100;
+      }
     }));
 
     const masterEquityMap = {};
@@ -475,14 +500,7 @@ const getBulkEquity = async (req, res) => {
         const mUserIds = usersByMaster[mid] || [];
         let totalEquity = 0;
         for (const uid of mUserIds) {
-          if (userEquityMap[uid] !== undefined) {
-            totalEquity += userEquityMap[uid];
-          } else {
-            try {
-              const metrics = await tradeMetricsService.getUserMetrics(uid, ltpMap);
-              totalEquity += metrics.equity;
-            } catch (_) {}
-          }
+          totalEquity += userEquityMap[uid] || 0;
         }
         masterEquityMap[mid] = Math.round(totalEquity * 100) / 100;
       }

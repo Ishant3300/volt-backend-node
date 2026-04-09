@@ -26,7 +26,9 @@ const getUserwisePositions = async (req, res) => {
       users = await User.find({ _id: userId, deleted_at: null }).select('_id name username master_id');
     } else if (role === 'master') {
       const masterId = req.master.id;
-      userFilter = { master_id: masterId, deleted_at: null };
+      const { getAllSubMasterIds } = require('../services/masterHierarchyService');
+      const allMasterIds = await getAllSubMasterIds(masterId);
+      userFilter = { master_id: { $in: allMasterIds }, deleted_at: null };
       if (search) userFilter.username = { $regex: search, $options: 'i' };
       users = await User.find(userFilter).select('_id name username master_id');
     } else {

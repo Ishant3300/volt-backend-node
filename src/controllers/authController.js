@@ -601,6 +601,72 @@ const removeFcmToken = async (req, res) => {
   }
 };
 
+/**
+ * Soft-delete the currently authenticated account.
+ * Works for all roles: User, Master, Admin.
+ * Sets deleted_at timestamp and clears the session.
+ */
+const deleteAccount = async (req, res) => {
+  try {
+    const User = require('../models/User');
+    const Master = require('../models/Master');
+    const Admin = require('../models/Admin');
+    const Trade = require('../models/Trade');
+
+    const role = req.user ? 'user' : req.master ? 'master' : req.admin ? 'admin' : null;
+    const accountId = req.user?.id || req.master?.id || req.admin?.id;
+
+    if (!role || !accountId) {
+      return res.status(401).json({ success: false, message: 'Unauthorized' });
+    }
+
+    // For master: check if they have active child users or sub-masters with open positions
+    if (role === 'master') {
+      const { getAllSubMasterIds } = require('../services/masterHierarchyService');
+      const allMasterIds = await getAllSubMasterIds(accountId);
+      const childUsers = await User.find({ master_id: { $in: allMasterIds }, deleted_at: null }).select('_id').lean();
+      if (childUsers.length > 0) {
+        // Check if any child user has open positions
+        const childUserIds = childUsers.map(u => u._id);
+        const openTrades = await Trade.aggregate([
+          { $match: { user_id: { $in: childUserIds }, status: 'completed', deleted_at: null } },
+          { $group: { _id: '$user_id', buy: { $sum: { $cond: [{ $eq: ['$transaction_type', 'BUY'] }, '$executed_quantity', 0] } }, sell: { $sum: { $cond: [{ $eq: ['$transaction_type', 'SELL'] }, '$executed_quantity', 0] } } } },
+        ]);
+        const hasOpenPositions = openTrades.some(t => (t.buy - t.sell) !== 0);
+        if (hasOpenPositions) {
+          return res.status(400).json({ success: false, message: 'Cannot delete account while child users have open positions. Please square off all positions first.' });
+        }
+      }
+    }
+
+    // For user: check if they have open positions
+    if (role === 'user') {
+      const openTrades = await Trade.aggregate([
+        { $match: { user_id: require('mongoose').Types.ObjectId.createFromHexString(accountId), status: 'completed', deleted_at: null } },
+        { $group: { _id: null, buy: { $sum: { $cond: [{ $eq: ['$transaction_type', 'BUY'] }, '$executed_quantity', 0] } }, sell: { $sum: { $cond: [{ $eq: ['$transaction_type', 'SELL'] }, '$executed_quantity', 0] } } } },
+      ]);
+      if (openTrades.length > 0 && (openTrades[0].buy - openTrades[0].sell) !== 0) {
+        return res.status(400).json({ success: false, message: 'Cannot delete account while you have open positions. Please square off all positions first.' });
+      }
+    }
+
+    // Soft delete
+    const now = new Date();
+    if (role === 'user') {
+      await User.updateOne({ _id: accountId }, { $set: { deleted_at: now, active_status: false } });
+    } else if (role === 'master') {
+      await Master.updateOne({ _id: accountId }, { $set: { deleted_at: now, active_status: false } });
+    } else if (role === 'admin') {
+      await Admin.updateOne({ _id: accountId }, { $set: { deleted_at: now, active_status: false } });
+    }
+
+    res.status(200).json({ success: true, message: 'Account deleted successfully' });
+  } catch (error) {
+    console.error('❌ Delete account error:', error);
+    res.status(500).json({ success: false, message: error.message });
+  }
+};
+
 module.exports = {
   userLogin,
   adminLogin,
@@ -613,5 +679,6 @@ module.exports = {
   getNotificationSettings,
   updateNotificationSettings,
   registerFcmToken,
-  removeFcmToken
+  removeFcmToken,
+  deleteAccount
 };
