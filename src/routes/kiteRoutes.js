@@ -15,6 +15,7 @@ const {
   getInstrumentsInfo,
   searchInstruments,
   smartSearchInstruments,
+  browseInstruments,
   getSearchCategories,
   
   // Market Quotes
@@ -71,6 +72,9 @@ router.get('/instruments/search', searchInstruments);
 
 // Smart search instruments (new - with fuzzy matching and grouping)
 router.get('/instruments/smart-search', smartSearchInstruments);
+
+// Browse all instruments in a category (no search query)
+router.get('/instruments/browse', browseInstruments);
 
 // Get search categories
 router.get('/instruments/categories', getSearchCategories);

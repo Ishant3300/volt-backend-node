@@ -281,6 +281,12 @@ class MetricsEngine {
       if (metrics) {
         this._metricsCache.set(userId, metrics);
         this._broadcastUserMetrics(userId, metrics);
+
+        // Check margin square off threshold on every tick
+        try {
+          const marginSquareOffService = require('./marginSquareOffService');
+          marginSquareOffService.checkUser(userId, metrics);
+        } catch (_) {}
       }
     }
 

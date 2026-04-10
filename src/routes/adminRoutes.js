@@ -103,4 +103,12 @@ router.post('/announcements', authenticateAdmin, setAnnouncement);
 router.delete('/announcements', authenticateAdmin, clearAnnouncement);
 router.get('/announcements/active', authenticateAny, getActiveAnnouncement);
 
+// ==================== FRESH STOPLOSS LIMIT ROUTES ====================
+const { getAllFreshStoplossLimits, bulkCreateFreshStoplossLimits, updateFreshStoplossLimit, deleteFreshStoplossLimit, bulkUpdateFreshStoplossLimits } = require('../controllers/freshStoplossLimitController');
+router.get('/fresh-stoploss-limits', authenticateAdmin, getAllFreshStoplossLimits);
+router.post('/fresh-stoploss-limits/bulk-create', authenticateAdmin, bulkCreateFreshStoplossLimits);
+router.put('/fresh-stoploss-limits/bulk-update', authenticateAdmin, bulkUpdateFreshStoplossLimits);
+router.put('/fresh-stoploss-limits/:id', authenticateAdmin, updateFreshStoplossLimit);
+router.delete('/fresh-stoploss-limits/:id', authenticateAdmin, deleteFreshStoplossLimit);
+
 module.exports = router;

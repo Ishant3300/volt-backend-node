@@ -286,6 +286,78 @@ const smartSearchInstruments = async (req, res) => {
 };
 
 /**
+ * Browse all instruments in a category (no search query needed).
+ * Returns grouped, sorted instruments for the selected segment tab.
+ * GET /kite/instruments/browse?category=NFO-FUT&page=1&limit=50
+ */
+const browseInstruments = async (req, res) => {
+  try {
+    const { category, page = 1, limit = 100 } = req.query;
+    if (!category || category === 'ALL') {
+      return res.status(400).json({ success: false, message: 'category is required (not ALL)' });
+    }
+
+    const instrumentSearchService = require('../services/instrumentSearchService');
+    await instrumentSearchService.loadInstrumentCache();
+
+    const KiteInstrument = require('../models/KiteInstrument');
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+
+    // Build filter based on category
+    const CATEGORY_FILTERS = {
+      'NFO-FUT': { segment: 'NFO-FUT', instrument_type: 'FUT' },
+      'MCX-FUT': { exchange: 'MCX', instrument_type: 'FUT' },
+      'NFO-OPT': { segment: 'NFO-OPT', instrument_type: { $in: ['CE', 'PE'] } },
+      'MCX-OPT': { exchange: 'MCX', instrument_type: { $in: ['CE', 'PE'] } },
+      'GLOBAL': { $or: [{ segment: 'INDICES' }, { exchange: { $in: ['SGX', 'GLOBAL'] } }] },
+    };
+
+    const catFilter = CATEGORY_FILTERS[category.toUpperCase()];
+    if (!catFilter) {
+      return res.status(400).json({ success: false, message: `Unknown category: ${category}` });
+    }
+
+    // Only current month expiry for FUT/OPT, no expiry filter for indices
+    const filter = { ...catFilter, is_active: true };
+    if (category !== 'GLOBAL') {
+      filter.expiry = { $gte: today };
+    }
+
+    const pageNum = parseInt(page);
+    const limitNum = parseInt(limit);
+    const skip = (pageNum - 1) * limitNum;
+
+    const [instruments, total] = await Promise.all([
+      KiteInstrument.find(filter)
+        .select('instrument_token tradingsymbol name raw_name display_name instrument_type exchange segment strike expiry lot_size tick_size')
+        .sort({ raw_name: 1, expiry: 1, strike: 1 })
+        .skip(skip)
+        .limit(limitNum)
+        .lean(),
+      KiteInstrument.countDocuments(filter),
+    ]);
+
+    // Group by type
+    const groupResults = instrumentSearchService.groupResults;
+    const groups = groupResults(instruments);
+
+    res.status(200).json({
+      success: true,
+      data: {
+        groups,
+        total,
+        page: pageNum,
+        hasMore: skip + instruments.length < total,
+      }
+    });
+  } catch (error) {
+    console.error('❌ Browse instruments error:', error);
+    res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+/**
  * Get search categories
  */
 const getSearchCategories = async (req, res) => {
@@ -665,6 +737,7 @@ module.exports = {
   getInstrumentsInfo,
   searchInstruments,
   smartSearchInstruments,
+  browseInstruments,
   getSearchCategories,
   
   // Market Quotes

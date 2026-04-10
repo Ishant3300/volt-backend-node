@@ -65,10 +65,20 @@ const processPendingOrders = async () => {
 
             let shouldExecute = false;
 
-            if (trade.transaction_type === 'BUY' && livePrice <= trade.price) {
-                shouldExecute = true;
-            } else if (trade.transaction_type === 'SELL' && livePrice >= trade.price) {
-                shouldExecute = true;
+            if (trade.order_type === 'SL' || trade.order_type === 'SL-M') {
+                // Stop-Loss: BUY triggers when price >= trigger, SELL triggers when price <= trigger
+                if (trade.transaction_type === 'BUY' && livePrice >= trade.price) {
+                    shouldExecute = true;
+                } else if (trade.transaction_type === 'SELL' && livePrice <= trade.price) {
+                    shouldExecute = true;
+                }
+            } else {
+                // LIMIT: BUY triggers when price <= limit, SELL triggers when price >= limit
+                if (trade.transaction_type === 'BUY' && livePrice <= trade.price) {
+                    shouldExecute = true;
+                } else if (trade.transaction_type === 'SELL' && livePrice >= trade.price) {
+                    shouldExecute = true;
+                }
             }
 
             if (shouldExecute) {

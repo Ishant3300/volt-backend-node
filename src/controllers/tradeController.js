@@ -431,6 +431,85 @@ const placeTrade = async (req, res) => {
                 }
             }
 
+            // ── Fresh Stop-Loss Restrictions ──────────────────────────────
+            // Only applies when user has fresh_stoploss enabled and is not admin
+            if (!req.admin && user.fresh_stoploss === true && instrumentRawName) {
+                const FreshStoplossLimit = require('../models/FreshStoplossLimit');
+                const normalizedSeg = ((segment || exchange || '').toUpperCase()) === 'GLOBAL' ? 'INDICES' : (segment || exchange || '').toUpperCase();
+
+                const fslLimit = await FreshStoplossLimit.findOne({
+                    exchange_name: normalizedSeg,
+                    raw_name: instrumentRawName,
+                    deleted_at: null
+                });
+
+                if (fslLimit) {
+                    if (order_type === 'MARKET') {
+                        // TIME restriction: check if user is closing a position opened via MARKET within time_minutes
+                        if (fslLimit.time_minutes > 0) {
+                            // Find the user's current net position for this instrument
+                            const posAggFSL = await Trade.aggregate([
+                                { $match: { user_id: user._id, instrument_token, status: 'completed', deleted_at: null } },
+                                { $group: {
+                                    _id: null,
+                                    total_buy_qty: { $sum: { $cond: [{ $eq: ['$transaction_type', 'BUY'] }, '$executed_quantity', 0] } },
+                                    total_sell_qty: { $sum: { $cond: [{ $eq: ['$transaction_type', 'SELL'] }, '$executed_quantity', 0] } }
+                                }}
+                            ]).session(session);
+
+                            const currentNetQty = posAggFSL.length > 0 ? posAggFSL[0].total_buy_qty - posAggFSL[0].total_sell_qty : 0;
+
+                            // Only restrict if this is a closing trade (opposite direction of position)
+                            const isClosing = (transaction_type === 'SELL' && currentNetQty > 0) ||
+                                              (transaction_type === 'BUY' && currentNetQty < 0);
+
+                            if (isClosing) {
+                                // Find the most recent MARKET trade that opened/added to this position
+                                const oppositeType = transaction_type === 'SELL' ? 'BUY' : 'SELL';
+                                const lastOpeningTrade = await Trade.findOne({
+                                    user_id: user._id,
+                                    instrument_token,
+                                    transaction_type: oppositeType,
+                                    order_type: 'MARKET',
+                                    status: 'completed',
+                                    deleted_at: null
+                                }).sort({ executed_at: -1 }).session(session);
+
+                                if (lastOpeningTrade && lastOpeningTrade.executed_at) {
+                                    const elapsedMs = Date.now() - lastOpeningTrade.executed_at.getTime();
+                                    const requiredMs = fslLimit.time_minutes * 60 * 1000;
+                                    if (elapsedMs < requiredMs) {
+                                        const remainingMins = Math.ceil((requiredMs - elapsedMs) / 60000);
+                                        throw new Error(`Fresh Stop-Loss: Cannot close this position for ${remainingMins} more minute(s). Time restriction: ${fslLimit.time_minutes} minutes.`);
+                                    }
+                                }
+                            }
+                        }
+                    } else if (order_type === 'LIMIT' || order_type === 'SL' || order_type === 'SL-M') {
+                        // PRICE restriction: limit how far from CMP the user can place orders
+                        if (fslLimit.price_offset > 0 && price > 0) {
+                            // Fetch live price for comparison
+                            const ltpMapFSL = await _getLivePricesFromKite([parseInt(instrument_token)]);
+                            const cmpFSL = ltpMapFSL.get(parseInt(instrument_token)) || ltpMapFSL.get(instrument_token.toString());
+
+                            if (cmpFSL && cmpFSL > 0) {
+                                if (transaction_type === 'BUY') {
+                                    const minBuyPrice = cmpFSL - fslLimit.price_offset;
+                                    if (price < minBuyPrice) {
+                                        throw new Error(`Fresh Stop-Loss: Buy price ₹${price.toFixed(2)} is below minimum allowed ₹${minBuyPrice.toFixed(2)} (CMP ₹${cmpFSL.toFixed(2)} - offset ₹${fslLimit.price_offset}).`);
+                                    }
+                                } else if (transaction_type === 'SELL') {
+                                    const maxSellPrice = cmpFSL + fslLimit.price_offset;
+                                    if (price > maxSellPrice) {
+                                        throw new Error(`Fresh Stop-Loss: Sell price ₹${price.toFixed(2)} exceeds maximum allowed ₹${maxSellPrice.toFixed(2)} (CMP ₹${cmpFSL.toFixed(2)} + offset ₹${fslLimit.price_offset}).`);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
             // 1. Determine execution price
             let executedPrice = price;
             let livePrice = null;
@@ -449,7 +528,7 @@ const placeTrade = async (req, res) => {
                 }
             }
 
-            // 2. For LIMIT orders, check if the condition is already met
+            // 2. For LIMIT/SL orders, check if the condition is already met
             let shouldExecuteNow = false;
             if (order_type === 'MARKET') {
                 shouldExecuteNow = true;
@@ -457,6 +536,15 @@ const placeTrade = async (req, res) => {
                 if (transaction_type === 'BUY' && livePrice <= executedPrice) {
                     shouldExecuteNow = true;
                 } else if (transaction_type === 'SELL' && livePrice >= executedPrice) {
+                    shouldExecuteNow = true;
+                }
+            } else if ((order_type === 'SL' || order_type === 'SL-M') && livePrice) {
+                // Stop-Loss: triggers when price moves AGAINST the position
+                // SL BUY triggers when price >= trigger price (short covering)
+                // SL SELL triggers when price <= trigger price (long stop-loss)
+                if (transaction_type === 'BUY' && livePrice >= executedPrice) {
+                    shouldExecuteNow = true;
+                } else if (transaction_type === 'SELL' && livePrice <= executedPrice) {
                     shouldExecuteNow = true;
                 }
             }
@@ -726,7 +814,7 @@ const placeTrade = async (req, res) => {
 
             // Notify the user's Flutter client so Orders tab updates instantly
             const livePriceService = require('../services/livePriceService');
-            livePriceService.broadcastToUser(userId.toString(), {
+            livePriceService.broadcastToUser(resultTrade.user_id.toString(), {
                 type: 'trade_placed',
                 trade_id: resultTrade._id.toString(),
                 instrument_token: resultTrade.instrument_token,
