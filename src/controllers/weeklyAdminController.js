@@ -4,80 +4,150 @@ const Master = require('../models/Master');
 const BrokerageSettings = require('../models/BrokerageSettings');
 const KiteInstrument = require('../models/KiteInstrument');
 
+/**
+ * GET /api/master/weekly-admin-report
+ *
+ * Same hierarchy logic as P&L summary:
+ * - Admin: shows only top-level masters with aggregated sub-hierarchy data
+ * - Master: shows direct child masters (aggregated) + direct child users
+ *
+ * M2M = 0 when no open positions (it represents live P&L only).
+ */
 const getWeeklyAdminReport = async (req, res) => {
   try {
     const role = req.admin ? 'admin' : 'master';
     const callerId = req.admin?.id || req.master?.id;
-    const brkRules = await BrokerageSettings.find({ deleted_at: null }).lean();
+    const metricsEngine = require('../services/metricsEngine');
+    const { getAllSubMasterIds } = require('../services/masterHierarchyService');
 
-    if (role === 'master') {
-      const master = await Master.findById(callerId).select('username pnl_sharing brokerage_sharing').lean();
-      const { getAllSubMasterIds } = require('../services/masterHierarchyService');
-      const allMasterIds = await getAllSubMasterIds(callerId);
-      const users = await User.find({ master_id: { $in: allMasterIds }, deleted_at: null }).select('_id name username').lean();
-      if (!users.length) return res.json({ success: true, data: [], totals: _emptyTotals() });
+    const data = [];
 
-      const perUser = await _computePerUser(users.map(u => u._id), brkRules);
-      const data = users.map(u => {
-        const uid = u._id.toString();
-        const p = perUser[uid] || { realised: 0, position: 0, brokerage: 0 };
-        const totalPnl = p.realised + p.position;
-        const adminBrk = p.brokerage * ((master?.brokerage_sharing || 0) / 100);
-        const adminProfit = totalPnl * ((master?.pnl_sharing || 0) / 100);
-        return {
-          id: uid, name: u.name, username: u.username,
-          parent_username: master?.username || '',
-          realised_pnl: r2(p.realised), m2m_pnl: r2(totalPnl),
-          brokerage: r2(p.brokerage), admin_brk: r2(adminBrk),
-          total_pnl: r2(p.realised + totalPnl), admin_profit: r2(adminProfit),
+    if (role === 'admin') {
+      // Admin: show only top-level masters (master_id = null)
+      const topMasters = await Master.find({ master_id: null, deleted_at: null })
+        .select('_id name username pnl_sharing brokerage_sharing').lean();
+
+      for (const master of topMasters) {
+        const entry = await _getAggregatedEntry(master._id.toString(), master, metricsEngine);
+        entry.parent_username = 'ADMIN';
+        entry.type = 'master';
+        data.push(entry);
+      }
+    } else {
+      // Master: show direct child masters + direct child users
+      const callerMaster = await Master.findById(callerId)
+        .select('username pnl_sharing brokerage_sharing').lean();
+
+      // 1. Direct child masters (aggregated)
+      const childMasters = await Master.find({ master_id: callerId, deleted_at: null })
+        .select('_id name username pnl_sharing brokerage_sharing').lean();
+
+      for (const cm of childMasters) {
+        const entry = await _getAggregatedEntry(cm._id.toString(), cm, metricsEngine);
+        entry.parent_username = callerMaster?.username || '';
+        entry.type = 'master';
+        data.push(entry);
+      }
+
+      // 2. Direct child users
+      const directUsers = await User.find({ master_id: callerId, deleted_at: null })
+        .select('_id name username').lean();
+
+      for (const u of directUsers) {
+        const metrics = await metricsEngine.getFreshMetrics(u._id.toString());
+        const realised = metrics ? metrics.realised_pnl : 0;
+        const position = metrics ? metrics.position_pnl : 0;
+        const hasOpenPositions = metrics && metrics.positions && metrics.positions.length > 0;
+
+        // Compute brokerage for this user
+        const brokerage = await _getUserBrokerage(u._id);
+
+        const m2mPnl = hasOpenPositions ? (realised + position) : 0;
+        const totalPnl = realised + m2mPnl;
+        const adminBrk = brokerage * ((callerMaster?.brokerage_sharing || 0) / 100);
+        const adminProfit = m2mPnl * ((callerMaster?.pnl_sharing || 0) / 100);
+
+        data.push({
+          id: u._id.toString(),
+          name: u.name,
+          username: u.username,
+          parent_username: callerMaster?.username || '',
+          type: 'user',
+          realised_pnl: r2(realised),
+          m2m_pnl: r2(m2mPnl),
+          brokerage: r2(brokerage),
+          admin_brk: r2(adminBrk),
+          total_pnl: r2(totalPnl),
+          admin_profit: r2(adminProfit),
           total_admin: r2(adminProfit),
-        };
-      });
-      return res.json({ success: true, data, totals: _sumTotals(data) });
+        });
+      }
     }
 
-    const masters = await Master.find({ deleted_at: null }).select('_id name username pnl_sharing brokerage_sharing').lean();
-    if (!masters.length) return res.json({ success: true, data: [], totals: _emptyTotals() });
-
-    const allUsers = await User.find({ master_id: { $in: masters.map(m => m._id) }, deleted_at: null }).select('_id master_id').lean();
-    const usersByMaster = {};
-    allUsers.forEach(u => {
-      const mid = u.master_id.toString();
-      if (!usersByMaster[mid]) usersByMaster[mid] = [];
-      usersByMaster[mid].push(u._id);
-    });
-
-    const perUser = await _computePerUser(allUsers.map(u => u._id), brkRules);
-    const data = masters.map(m => {
-      const mid = m._id.toString();
-      const uids = (usersByMaster[mid] || []).map(id => id.toString());
-      let realised = 0, position = 0, brokerage = 0;
-      for (const uid of uids) {
-        const p = perUser[uid];
-        if (p) { realised += p.realised; position += p.position; brokerage += p.brokerage; }
-      }
-      const totalPnl = realised + position;
-      const adminBrk = brokerage * ((m.brokerage_sharing || 0) / 100);
-      const adminProfit = totalPnl * ((m.pnl_sharing || 0) / 100);
-      return {
-        id: mid, name: m.name, username: m.username, parent_username: 'ADMIN', user_count: uids.length,
-        realised_pnl: r2(realised), m2m_pnl: r2(totalPnl),
-        brokerage: r2(brokerage), admin_brk: r2(adminBrk),
-        total_pnl: r2(realised + totalPnl), admin_profit: r2(adminProfit),
-        total_admin: r2(adminProfit),
-      };
-    });
     res.json({ success: true, data, totals: _sumTotals(data) });
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });
   }
 };
 
-async function _computePerUser(userIds, brkRules) {
-  const trades = await Trade.find({
-    user_id: { $in: userIds }, status: 'completed', deleted_at: null
-  }).select('user_id instrument_token transaction_type executed_quantity executed_price pnl').lean();
+/**
+ * Get aggregated weekly report entry for a master and their entire sub-hierarchy.
+ */
+async function _getAggregatedEntry(masterId, masterDoc, metricsEngine) {
+  const { getAllSubMasterIds } = require('../services/masterHierarchyService');
+  const allMasterIds = await getAllSubMasterIds(masterId);
 
+  const users = await User.find({ master_id: { $in: allMasterIds }, deleted_at: null })
+    .select('_id').lean();
+
+  let realised = 0, position = 0, hasAnyOpenPositions = false;
+  for (const u of users) {
+    const metrics = await metricsEngine.getFreshMetrics(u._id.toString());
+    if (metrics) {
+      realised += metrics.realised_pnl;
+      position += metrics.position_pnl;
+      if (metrics.positions && metrics.positions.length > 0) hasAnyOpenPositions = true;
+    }
+  }
+
+  // M2M = realised + position when positions are open, otherwise just realised
+  const m2mPnl = hasAnyOpenPositions ? (realised + position) : 0;
+
+  // Brokerage for all users in hierarchy
+  let totalBrokerage = 0;
+  for (const u of users) {
+    totalBrokerage += await _getUserBrokerage(u._id);
+  }
+
+  const totalPnl = realised + m2mPnl;
+  const adminBrk = totalBrokerage * ((masterDoc.brokerage_sharing || 0) / 100);
+  const adminProfit = m2mPnl * ((masterDoc.pnl_sharing || 0) / 100);
+
+  return {
+    id: masterId,
+    name: masterDoc.name,
+    username: masterDoc.username,
+    realised_pnl: r2(realised),
+    m2m_pnl: r2(m2mPnl),
+    brokerage: r2(totalBrokerage),
+    admin_brk: r2(adminBrk),
+    total_pnl: r2(totalPnl),
+    admin_profit: r2(adminProfit),
+    total_admin: r2(adminProfit),
+  };
+}
+
+/**
+ * Compute total brokerage for a user from their trades.
+ */
+async function _getUserBrokerage(userId) {
+  const trades = await Trade.find({
+    user_id: userId, status: 'completed', deleted_at: null
+  }).select('instrument_token executed_price executed_quantity').lean();
+
+  if (trades.length === 0) return 0;
+
+  const brkRules = await BrokerageSettings.find({ deleted_at: null }).lean();
   const allTokens = [...new Set(trades.map(t => t.instrument_token))];
   const kiteInstruments = await KiteInstrument.find(
     { instrument_token: { $in: allTokens } }, 'instrument_token lot_size segment raw_name'
@@ -85,70 +155,24 @@ async function _computePerUser(userIds, brkRules) {
   const kiteMap = {};
   kiteInstruments.forEach(ki => { kiteMap[ki.instrument_token] = ki; });
 
-  const userInstrMap = {};
-  const userBrokerage = {};
+  let totalBrk = 0;
   for (const t of trades) {
-    const uid = t.user_id.toString();
-    if (!userInstrMap[uid]) userInstrMap[uid] = {};
-    if (!userBrokerage[uid]) userBrokerage[uid] = 0;
-    const key = t.instrument_token;
-    if (!userInstrMap[uid][key]) {
-      userInstrMap[uid][key] = { buyQty: 0, sellQty: 0, buyVal: 0, sellVal: 0, realisedPnl: 0 };
-    }
-    const a = userInstrMap[uid][key];
-    if (t.transaction_type === 'BUY') { a.buyQty += t.executed_quantity; a.buyVal += t.executed_quantity * t.executed_price; }
-    else { a.sellQty += t.executed_quantity; a.sellVal += t.executed_quantity * t.executed_price; }
-    a.realisedPnl += (t.pnl || 0);
-
     const ki = kiteMap[t.instrument_token];
     const seg = ki?.segment || '';
     const rawName = ki?.raw_name || '';
     const lotSize = ki?.lot_size || 1;
+
     let brkRule = null;
     if (rawName) brkRule = brkRules.find(r => r.script_name?.toUpperCase() === rawName.toUpperCase() && r.exchange_name === seg.toUpperCase());
     if (!brkRule && rawName) brkRule = brkRules.find(r => r.script_name?.toUpperCase() === rawName.toUpperCase());
     if (!brkRule) brkRule = brkRules.find(r => r.exchange_name === seg.toUpperCase());
-    let tradeBrk = 0;
+
     if (brkRule) {
-      if (brkRule.type === 'TURNOVER WISE') tradeBrk = t.executed_price * t.executed_quantity * (brkRule.brk_value / 10000);
-      else if (brkRule.type === 'LOT WISE') tradeBrk = (lotSize > 1 ? t.executed_quantity / lotSize : t.executed_quantity) * brkRule.brk_value;
-    }
-    userBrokerage[uid] += tradeBrk;
-  }
-
-  const openTokens = new Set();
-  for (const instruments of Object.values(userInstrMap)) {
-    for (const [token, a] of Object.entries(instruments)) {
-      if ((a.buyQty - a.sellQty) !== 0) openTokens.add(parseInt(token));
+      if (brkRule.type === 'TURNOVER WISE') totalBrk += t.executed_price * t.executed_quantity * (brkRule.brk_value / 10000);
+      else if (brkRule.type === 'LOT WISE') totalBrk += (lotSize > 1 ? t.executed_quantity / lotSize : t.executed_quantity) * brkRule.brk_value;
     }
   }
-  let ltpMap = new Map();
-  if (openTokens.size > 0) {
-    try {
-      const { getLatestQuotes } = require('../services/kiteService');
-      const quotes = await getLatestQuotes([...openTokens], 100);
-      quotes.forEach(q => { ltpMap.set(q.instrument_token.toString(), q.last_price); });
-    } catch (_) {}
-  }
-
-  const result = {};
-  for (const [uid, instruments] of Object.entries(userInstrMap)) {
-    let realisedPnlSum = 0, position = 0;
-    for (const [token, a] of Object.entries(instruments)) {
-      realisedPnlSum += a.realisedPnl;
-      const netQty = a.buyQty - a.sellQty;
-      if (netQty !== 0) {
-        const avgBuy = a.buyQty > 0 ? a.buyVal / a.buyQty : 0;
-        const avgSell = a.sellQty > 0 ? a.sellVal / a.sellQty : 0;
-        const ltp = ltpMap.get(token) || (netQty > 0 ? avgBuy : avgSell);
-        if (netQty > 0) position += (ltp - avgBuy) * netQty;
-        else position += (avgSell - ltp) * Math.abs(netQty);
-      }
-    }
-    const realised = realisedPnlSum - (userBrokerage[uid] || 0);
-    result[uid] = { realised: r2(realised), position: r2(position), brokerage: r2(userBrokerage[uid] || 0) };
-  }
-  return result;
+  return totalBrk;
 }
 
 function _sumTotals(data) {
@@ -161,10 +185,6 @@ function _sumTotals(data) {
     admin_profit: r2(data.reduce((s, d) => s + d.admin_profit, 0)),
     total_admin: r2(data.reduce((s, d) => s + d.total_admin, 0)),
   };
-}
-
-function _emptyTotals() {
-  return { realised_pnl: 0, m2m_pnl: 0, brokerage: 0, admin_brk: 0, total_pnl: 0, admin_profit: 0, total_admin: 0 };
 }
 
 const r2 = (n) => Math.round(n * 100) / 100;

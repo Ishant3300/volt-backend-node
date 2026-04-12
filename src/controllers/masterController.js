@@ -574,11 +574,12 @@ const creditMaster = async (req, res) => {
     let resultData;
 
     await session.withTransaction(async () => {
-      const master = await Master.findOne({
-        _id: id,
-        admin_id: req.admin.id,
-        deleted_at: null
-      }).session(session);
+      // Admin scopes by admin_id; master scopes by master_id (their child)
+      const query = { _id: id, deleted_at: null };
+      if (req.admin) query.admin_id = req.admin.id;
+      else if (req.master) query.master_id = req.master.id;
+
+      const master = await Master.findOne(query).session(session);
 
       if (!master) {
         throw new Error('Master not found');
@@ -593,6 +594,9 @@ const creditMaster = async (req, res) => {
 
       await master.save({ session });
 
+      const refId = req.admin ? req.admin.id : req.master.id;
+      const refModel = req.admin ? 'Admin' : 'Master';
+
       // Create universal transaction record
       const transaction = new Transaction({
         transactionId: `TXN_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`,
@@ -601,8 +605,8 @@ const creditMaster = async (req, res) => {
         type: 'CREDIT',
         status: 'SUCCESS',
         amount,
-        referenceId: req.admin.id,
-        referenceModel: 'Admin',
+        referenceId: refId,
+        referenceModel: refModel,
         balanceBefore: previousBalance,
         balanceAfter: master.equity,
         metadata: {
@@ -616,7 +620,7 @@ const creditMaster = async (req, res) => {
       // Create legacy credit transaction record for backwards compatibility
       await CreditTransaction.create([{
         master_id: master._id,
-        admin_id: req.admin.id,
+        admin_id: master.admin_id,
         transaction_type: 'CREDIT',
         amount,
         previous_balance: previousCredits,
@@ -675,11 +679,12 @@ const debitMaster = async (req, res) => {
     let resultData;
 
     await session.withTransaction(async () => {
-      const master = await Master.findOne({
-        _id: id,
-        admin_id: req.admin.id,
-        deleted_at: null
-      }).session(session);
+      // Admin scopes by admin_id; master scopes by master_id (their child)
+      const query = { _id: id, deleted_at: null };
+      if (req.admin) query.admin_id = req.admin.id;
+      else if (req.master) query.master_id = req.master.id;
+
+      const master = await Master.findOne(query).session(session);
 
       if (!master) {
         throw new Error('Master not found');
@@ -697,6 +702,9 @@ const debitMaster = async (req, res) => {
 
       await master.save({ session });
 
+      const refId = req.admin ? req.admin.id : req.master.id;
+      const refModel = req.admin ? 'Admin' : 'Master';
+
       // Create universal transaction record
       const transaction = new Transaction({
         transactionId: `TXN_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`,
@@ -705,8 +713,8 @@ const debitMaster = async (req, res) => {
         type: 'DEBIT',
         status: 'SUCCESS',
         amount,
-        referenceId: req.admin.id,
-        referenceModel: 'Admin',
+        referenceId: refId,
+        referenceModel: refModel,
         balanceBefore: previousBalance,
         balanceAfter: master.equity,
         metadata: {
@@ -720,7 +728,7 @@ const debitMaster = async (req, res) => {
       // Create legacy credit transaction record
       await CreditTransaction.create([{
         master_id: master._id,
-        admin_id: req.admin.id,
+        admin_id: master.admin_id,
         transaction_type: 'DEBIT',
         amount,
         previous_balance: previousCredits,

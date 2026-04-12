@@ -187,4 +187,21 @@ server.listen(PORT, async () => {
   }
 
   console.log('\n🚀 Server ready!\n');
+
+  // Refresh settlement prices on startup via OHLC API
+  // ohlc.close = previous day's official settlement price (available by ~8-9 AM)
+  setTimeout(async () => {
+    try {
+      const kiteStatus = await kiteAuthService.checkTokenStatus();
+      if (!kiteStatus.valid) {
+        console.log('⚠️  [Startup] Kite not authenticated, skipping settlement price refresh.');
+        return;
+      }
+      console.log('📊 [Startup] Refreshing settlement prices (OHLC API)...');
+      const result = await livePriceService.refreshSettlementPrices();
+      console.log('✅ [Startup] Settlement price refresh:', JSON.stringify(result));
+    } catch (err) {
+      console.error('⚠️  [Startup] Settlement price refresh failed:', err.message);
+    }
+  }, 15000);
 });

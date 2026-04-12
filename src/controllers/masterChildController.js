@@ -220,10 +220,16 @@ const createChildMaster = async (req, res) => {
 // Get All Child Masters
 const getAllChildMasters = async (req, res) => {
   try {
-    const { page = 1, limit = 20, status, server_id } = req.query;
+    const { page = 1, limit = 20, status, server_id, parent_id } = req.query;
+
+    // Support both: master viewing own children, or admin viewing a specific master's children
+    const parentMasterId = parent_id || (req.master ? req.master.id : null);
+    if (!parentMasterId) {
+      return res.status(400).json({ success: false, message: 'parent_id is required for admin' });
+    }
 
     const filter = {
-      master_id: req.master.id, // Only children of this master
+      master_id: parentMasterId,
       deleted_at: null
     };
 
@@ -263,11 +269,11 @@ const getChildMasterById = async (req, res) => {
   try {
     const { id } = req.params;
 
-    const master = await Master.findOne({
-      _id: id,
-      master_id: req.master.id, // Must be child of this master
-      deleted_at: null
-    })
+    // Admin can view any master; master can only view their own children
+    const query = { _id: id, deleted_at: null };
+    if (req.master) query.master_id = req.master.id;
+
+    const master = await Master.findOne(query)
       .populate('server_id', 'name')
       .populate('master_id', 'name username');
 
@@ -307,12 +313,12 @@ const updateChildMasterPermissions = async (req, res) => {
       });
     }
 
-    const parentMaster = await Master.findById(req.master.id);
-    const childMaster = await Master.findOne({
-      _id: id,
-      master_id: req.master.id,
-      deleted_at: null
-    });
+    // Admin can update any master's permissions; master can only update their children
+    const parentMaster = req.master ? await Master.findById(req.master.id) : null;
+    const permQuery = { _id: id, deleted_at: null };
+    if (req.master) permQuery.master_id = req.master.id;
+
+    const childMaster = await Master.findOne(permQuery);
 
     if (!childMaster) {
       return res.status(404).json({
@@ -322,14 +328,16 @@ const updateChildMasterPermissions = async (req, res) => {
       });
     }
 
-    // Validate permissions inheritance
-    for (const [key, value] of Object.entries(permissions)) {
-      if (value === true && parentMaster.permissions[key] !== true) {
-        return res.status(403).json({
-          success: false,
-          message: `Cannot grant permission '${key}' - you don't have this permission`,
-          data: null
-        });
+    // Validate permissions inheritance (skip for admin — admin has all permissions)
+    if (parentMaster) {
+      for (const [key, value] of Object.entries(permissions)) {
+        if (value === true && parentMaster.permissions[key] !== true) {
+          return res.status(403).json({
+            success: false,
+            message: `Cannot grant permission '${key}' - you don't have this permission`,
+            data: null
+          });
+        }
       }
     }
 
@@ -373,11 +381,11 @@ const updateChildMasterDetails = async (req, res) => {
       trade_limit
     } = req.body;
 
-    const childMaster = await Master.findOne({
-      _id: id,
-      master_id: req.master.id,
-      deleted_at: null
-    });
+    // Admin can update any master; master can only update their children
+    const detailQuery = { _id: id, deleted_at: null };
+    if (req.master) detailQuery.master_id = req.master.id;
+
+    const childMaster = await Master.findOne(detailQuery);
 
     if (!childMaster) {
       return res.status(404).json({
@@ -445,11 +453,11 @@ const creditChildMaster = async (req, res) => {
       });
     }
 
-    const childMaster = await Master.findOne({
-      _id: id,
-      master_id: req.master.id,
-      deleted_at: null
-    });
+    // Admin can credit any master; master can only credit their own children
+    const query = { _id: id, deleted_at: null };
+    if (req.master) query.master_id = req.master.id;
+
+    const childMaster = await Master.findOne(query);
 
     if (!childMaster) {
       return res.status(404).json({
@@ -514,11 +522,11 @@ const debitChildMaster = async (req, res) => {
       });
     }
 
-    const childMaster = await Master.findOne({
-      _id: id,
-      master_id: req.master.id,
-      deleted_at: null
-    });
+    // Admin can debit any master; master can only debit their own children
+    const query = { _id: id, deleted_at: null };
+    if (req.master) query.master_id = req.master.id;
+
+    const childMaster = await Master.findOne(query);
 
     if (!childMaster) {
       return res.status(404).json({
@@ -581,11 +589,11 @@ const getChildMasterPosition = async (req, res) => {
   try {
     const { id } = req.params;
 
-    const childMaster = await Master.findOne({
-      _id: id,
-      master_id: req.master.id,
-      deleted_at: null
-    });
+    // Admin can view any master's position; master can only view their children
+    const posQuery = { _id: id, deleted_at: null };
+    if (req.master) posQuery.master_id = req.master.id;
+
+    const childMaster = await Master.findOne(posQuery);
 
     if (!childMaster) {
       return res.status(404).json({
@@ -657,11 +665,11 @@ const sendMessageToChildMaster = async (req, res) => {
       });
     }
 
-    const childMaster = await Master.findOne({
-      _id: id,
-      master_id: req.master.id,
-      deleted_at: null
-    });
+    // Admin can message any master; master can only message their children
+    const msgQuery = { _id: id, deleted_at: null };
+    if (req.master) msgQuery.master_id = req.master.id;
+
+    const childMaster = await Master.findOne(msgQuery);
 
     if (!childMaster) {
       return res.status(404).json({
@@ -671,9 +679,12 @@ const sendMessageToChildMaster = async (req, res) => {
       });
     }
 
+    const senderId = req.admin ? req.admin.id : req.master.id;
+    const senderType = req.admin ? 'Admin' : 'Master';
+
     const newMessage = await Message.create({
-      sender_id: req.master.id,
-      sender_type: 'Master',
+      sender_id: senderId,
+      sender_type: senderType,
       recipient_id: childMaster._id,
       recipient_type: 'Master',
       subject: subject || '',
@@ -699,11 +710,11 @@ const deleteChildMaster = async (req, res) => {
   try {
     const { id } = req.params;
 
-    const childMaster = await Master.findOne({
-      _id: id,
-      master_id: req.master.id,
-      deleted_at: null
-    });
+    // Admin can delete any master; master can only delete their children
+    const delQuery = { _id: id, deleted_at: null };
+    if (req.master) delQuery.master_id = req.master.id;
+
+    const childMaster = await Master.findOne(delQuery);
 
     if (!childMaster) {
       return res.status(404).json({

@@ -77,30 +77,39 @@ class CronService {
 
         this.jobs.push(limitOrderCheck);
 
-        // ── Post-market close price refresh ──────────────────────────────
-        // NSE/NFO/BFO/BSE: market closes at 3:30 PM IST → refresh at 4:05 PM
-        const nseCloseRefresh = cron.schedule('5 16 * * 1-5', async () => {
-            console.log('📊 [CRON] Refreshing NSE/NFO close prices (settlement)...');
+        // ── Settlement Price Refresh Schedule ────────────────────────────
+        //
+        // NSE: settlement available in Kite Historical API by ~6 PM same day
+        // MCX: settlement available in Kite OHLC API ohlc.close by ~8-9 AM next morning
+        //
+        // Strategy:
+        // 1. 6:00 PM — NSE/NFO provisional close via Historical API (has settlement by then)
+        // 2. 8:30 AM — Full settlement refresh via OHLC API (covers MCX + validates NSE)
+
+        // NSE/NFO: Historical API has settlement price by 6 PM same day
+        const nseCloseRefresh = cron.schedule('0 18 * * 1-5', async () => {
+            console.log('📊 [CRON] Refreshing NSE/NFO settlement prices (Historical API)...');
             try {
                 await livePriceService.refreshClosePrices();
-                console.log('✅ [CRON] NSE/NFO close price refresh completed.');
+                console.log('✅ [CRON] NSE/NFO settlement refresh completed.');
             } catch (error) {
-                console.error('❌ [CRON] Error during NSE/NFO close price refresh:', error);
+                console.error('❌ [CRON] Error during NSE/NFO settlement refresh:', error);
             }
         }, { timezone: 'Asia/Kolkata' });
         this.jobs.push(nseCloseRefresh);
 
-        // MCX: market closes at 11:30 PM IST → refresh at 11:45 PM
-        const mcxCloseRefresh = cron.schedule('45 23 * * 1-5', async () => {
-            console.log('📊 [CRON] Refreshing MCX close prices (settlement)...');
+        // Morning full settlement refresh — OHLC API ohlc.close has all settlements by 8:30 AM
+        // This covers MCX (previous night) + validates NSE
+        const morningSettlementRefresh = cron.schedule('30 8 * * 1-6', async () => {
+            console.log('📊 [CRON] Morning settlement price refresh (OHLC API)...');
             try {
-                await livePriceService.refreshClosePrices();
-                console.log('✅ [CRON] MCX close price refresh completed.');
+                await livePriceService.refreshSettlementPrices();
+                console.log('✅ [CRON] Morning settlement price refresh completed.');
             } catch (error) {
-                console.error('❌ [CRON] Error during MCX close price refresh:', error);
+                console.error('❌ [CRON] Error during morning settlement refresh:', error);
             }
         }, { timezone: 'Asia/Kolkata' });
-        this.jobs.push(mcxCloseRefresh);
+        this.jobs.push(morningSettlementRefresh);
 
         const engineMode = redisService.isAvailable()
             ? 'Redis + BullMQ (cron fallback standby)'

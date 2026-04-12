@@ -97,6 +97,17 @@ router.post('/refresh-close-prices', authenticateAdmin, async (req, res) => {
   }
 });
 
+// Refresh settlement prices via OHLC API (admin-only, for testing / manual trigger)
+router.post('/refresh-settlement-prices', authenticateAdmin, async (req, res) => {
+  try {
+    const livePriceService = require('../services/livePriceService');
+    const result = await livePriceService.refreshSettlementPrices();
+    res.json({ success: true, message: 'Settlement prices refreshed', ...result });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
 // ==================== ANNOUNCEMENT ROUTES ====================
 const { setAnnouncement, clearAnnouncement, getActiveAnnouncement } = require('../controllers/announcementController');
 router.post('/announcements', authenticateAdmin, setAnnouncement);

@@ -318,7 +318,7 @@ const browseInstruments = async (req, res) => {
       return res.status(400).json({ success: false, message: `Unknown category: ${category}` });
     }
 
-    // Only current month expiry for FUT/OPT, no expiry filter for indices
+    // Only non-expired for FUT/OPT, no expiry filter for indices
     const filter = { ...catFilter, is_active: true };
     if (category !== 'GLOBAL') {
       filter.expiry = { $gte: today };
@@ -326,17 +326,32 @@ const browseInstruments = async (req, res) => {
 
     const pageNum = parseInt(page);
     const limitNum = parseInt(limit);
-    const skip = (pageNum - 1) * limitNum;
 
-    const [instruments, total] = await Promise.all([
-      KiteInstrument.find(filter)
-        .select('instrument_token tradingsymbol name raw_name display_name instrument_type exchange segment strike expiry lot_size tick_size')
-        .sort({ raw_name: 1, expiry: 1, strike: 1 })
-        .skip(skip)
-        .limit(limitNum)
-        .lean(),
-      KiteInstrument.countDocuments(filter),
-    ]);
+    // Use aggregation to pick nearest expiry per underlying in the DB
+    // This avoids loading all instruments into memory
+    const isOptions = category.toUpperCase().includes('OPT');
+    const groupId = isOptions
+      ? { raw_name: '$raw_name', instrument_type: '$instrument_type', strike: '$strike' }
+      : { raw_name: '$raw_name', instrument_type: '$instrument_type' };
+
+    const pipeline = [
+      { $match: filter },
+      { $sort: { expiry: 1 } },
+      { $group: {
+        _id: groupId,
+        doc: { $first: '$$ROOT' },
+      }},
+      { $replaceRoot: { newRoot: '$doc' } },
+      { $sort: { raw_name: 1, expiry: 1, strike: 1 } },
+      { $facet: {
+        data: [{ $skip: (pageNum - 1) * limitNum }, { $limit: limitNum }],
+        count: [{ $count: 'total' }],
+      }},
+    ];
+
+    const [aggResult] = await KiteInstrument.aggregate(pipeline);
+    const instruments = aggResult.data || [];
+    const total = aggResult.count?.[0]?.total || 0;
 
     // Group by type
     const groupResults = instrumentSearchService.groupResults;

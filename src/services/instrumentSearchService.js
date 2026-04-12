@@ -143,14 +143,34 @@ const _buildAndSetCache = async () => {
     ]
   }, LEAN_PROJECTION).lean();
 
-  // Keep only instruments expiring in the current month
-  const currentMonth = today.getMonth();
-  const currentYear = today.getFullYear();
-  const instruments = rawInstruments.filter(inst => {
-    if (!inst.expiry || inst.segment === 'INDICES') return true;
-    const exp = new Date(inst.expiry);
-    return exp.getMonth() === currentMonth && exp.getFullYear() === currentYear;
-  });
+  // Keep only the nearest expiry per (raw_name + instrument_type) combination.
+  // This ensures SILVER, SILVERM, SILVERMIC all show with their closest expiry,
+  // even if they expire in different months.
+  const nearestMap = new Map(); // key: "raw_name|instrument_type" → instrument with nearest expiry
+  for (const inst of rawInstruments) {
+    if (!inst.expiry || inst.segment === 'INDICES') {
+      // Non-expiring instruments (indices, etc.) — always include
+      const key = `${inst.instrument_token}`;
+      nearestMap.set(key, inst);
+      continue;
+    }
+    const rawName = inst.raw_name || inst.name || '';
+    const type = inst.instrument_type || '';
+    // For options, include strike in the key so each strike is separate
+    const strikeKey = (type === 'CE' || type === 'PE') ? `|${inst.strike}` : '';
+    const key = `${rawName}|${type}${strikeKey}`;
+    const existing = nearestMap.get(key);
+    if (!existing) {
+      nearestMap.set(key, inst);
+    } else {
+      const existingExpiry = new Date(existing.expiry).getTime();
+      const newExpiry = new Date(inst.expiry).getTime();
+      if (newExpiry < existingExpiry) {
+        nearestMap.set(key, inst);
+      }
+    }
+  }
+  const instruments = [...nearestMap.values()];
 
   instrumentList = instruments;
   const indexes = buildIndexes(instruments);
@@ -234,6 +254,16 @@ const gatherCandidates = (resolved, category, rawQuery) => {
           if (u.length >= 3 && getEditDistance(term, u.substring(0, term.length)) <= maxTypos) {
             const fuzzyHits = byUnderlying.get(u);
             if (fuzzyHits) for (const idx of fuzzyHits) termCandidates.add(idx);
+          }
+        }
+      }
+
+      // Also match all underlyings that START WITH the search term
+      // e.g. "SILVER" matches "SILVER", "SILVERM", "SILVERMIC"
+      if (term.length >= 3) {
+        for (const [u, idxSet] of byUnderlying) {
+          if (u.startsWith(term) && u !== term) {
+            for (const idx of idxSet) termCandidates.add(idx);
           }
         }
       }

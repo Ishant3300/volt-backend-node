@@ -546,6 +546,10 @@ class LivePriceService {
    * Fetch official settlement/close prices from Kite Historical API
    * and broadcast them to all connected Flutter clients.
    * Called via cron after market close.
+   *
+   * Uses Kite Historical daily candle API — the daily candle `close` field
+   * is the official settlement price (not the last traded price).
+   * Runs with concurrency control to avoid rate limits.
    */
   async refreshClosePrices() {
       try {
@@ -559,45 +563,63 @@ class LivePriceService {
         ]);
 
         if (allTokens.size === 0) {
-          console.log('📊 [refreshClosePrices] No tokens found (subscribed or watchlist), skipping.');
+          console.log('📊 [refreshClosePrices] No tokens found, skipping.');
           return;
         }
 
-        console.log(`📊 [refreshClosePrices] Refreshing close prices for ${allTokens.size} tokens (subscribed: ${this.subscribedTokens.size}, watchlist: ${watchlistTokens.length})...`);
+        console.log(`📊 [refreshClosePrices] Refreshing close prices for ${allTokens.size} tokens...`);
 
-        // Date range: today and 3 days back (covers weekends)
+        // Date range: today and 5 days back (covers weekends + holidays)
         const today = new Date();
-        const threeDaysAgo = new Date(today);
-        threeDaysAgo.setDate(today.getDate() - 3);
+        const daysBack = new Date(today);
+        daysBack.setDate(today.getDate() - 5);
         const fmt = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
-        const fromDate = fmt(threeDaysAgo);
+        const fromDate = fmt(daysBack);
         const toDate = fmt(today);
 
         const ticks = [];
         const dbBulkOps = [];
+        const instrumentOps = [];
+        let failed = 0;
 
-        for (const tokenStr of allTokens) {
-          try {
-            const candles = await kiteService.getHistoricalData(tokenStr, 'day', fromDate, toDate);
-            if (candles.length === 0) continue;
+        // Process tokens with concurrency limit to avoid Kite rate limits
+        const tokenArray = [...allTokens];
+        const CONCURRENCY = 5;
 
-            const lastCandle = candles[candles.length - 1];
-            const closePrice = lastCandle.close;
+        for (let i = 0; i < tokenArray.length; i += CONCURRENCY) {
+          const batch = tokenArray.slice(i, i + CONCURRENCY);
+          const results = await Promise.allSettled(
+            batch.map(async (tokenStr) => {
+              const candles = await kiteService.getHistoricalData(tokenStr, 'day', fromDate, toDate);
+              if (!candles || candles.length === 0) return null;
+
+              const lastCandle = candles[candles.length - 1];
+              const closePrice = lastCandle.close;
+              if (!closePrice || closePrice <= 0) return null;
+
+              return { tokenStr, closePrice, open: lastCandle.open, high: lastCandle.high, low: lastCandle.low };
+            })
+          );
+
+          for (const result of results) {
+            if (result.status !== 'fulfilled' || !result.value) {
+              if (result.status === 'rejected') failed++;
+              continue;
+            }
+            const { tokenStr, closePrice, open, high, low } = result.value;
 
             // Update in-memory latest prices
             this.latestPrices.set(tokenStr, closePrice);
             this.latestPrices.set(parseInt(tokenStr), closePrice);
 
-            // Build tick for broadcast (same format as _processKiteTick)
             ticks.push({
               instrument_token: tokenStr,
               last_price: closePrice,
-              open: lastCandle.open,
-              high: lastCandle.high,
-              low: lastCandle.low,
+              open: open || 0,
+              high: high || 0,
+              low: low || 0,
             });
 
-            // Queue DB update
             dbBulkOps.push({
               updateOne: {
                 filter: { instrument_token: tokenStr },
@@ -605,16 +627,24 @@ class LivePriceService {
                 upsert: true
               }
             });
-          } catch (err) {
-            console.log(`   ⚠️  Failed for token ${tokenStr}: ${err.message}`);
+
+            instrumentOps.push({
+              updateOne: {
+                filter: { instrument_token: tokenStr },
+                update: { $set: { last_price: closePrice } }
+              }
+            });
+          }
+
+          // Small delay between batches to respect rate limits
+          if (i + CONCURRENCY < tokenArray.length) {
+            await new Promise(r => setTimeout(r, 500));
           }
         }
 
         // Broadcast corrected prices to Flutter clients
         if (ticks.length > 0) {
-          console.log(`📊 [refreshClosePrices] Broadcasting ${ticks.length} corrected close prices`);
-          ticks.forEach(t => console.log(`   📊 Token: ${t.instrument_token} (type: ${typeof t.instrument_token}) → close: ${t.last_price}`));
-          console.log(`   📊 Connected WS clients: ${this.wss ? this.wss.clients.size : 0}`);
+          console.log(`📊 [refreshClosePrices] Broadcasting ${ticks.length} corrected close prices (${failed} failed)`);
           this._broadcastToClients({ type: 'ticks', data: ticks });
         }
 
@@ -624,25 +654,158 @@ class LivePriceService {
           console.log(`📊 [refreshClosePrices] Updated ${dbBulkOps.length} quotes in KiteMarketQuote`);
         }
 
-        // Also update KiteInstrument.last_price so app reload shows correct price
-        if (ticks.length > 0) {
-          const instrumentOps = ticks.map(t => ({
-            updateOne: {
-              filter: { instrument_token: t.instrument_token },
-              update: { $set: { last_price: t.last_price } }
-            }
-          }));
+        // Update KiteInstrument.last_price so app reload shows correct price
+        if (instrumentOps.length > 0) {
           await KiteInstrument.bulkWrite(instrumentOps, { ordered: false });
           console.log(`📊 [refreshClosePrices] Updated ${instrumentOps.length} KiteInstrument last_price values`);
         }
 
         console.log('✅ [refreshClosePrices] Done.');
-        return { tokensFound: allTokens.size, ticksBroadcast: ticks.length, dbUpdated: dbBulkOps.length, clientsConnected: this.wss ? this.wss.clients.size : 0 };
+        return { tokensFound: allTokens.size, ticksBroadcast: ticks.length, dbUpdated: dbBulkOps.length, failed, clientsConnected: this.wss ? this.wss.clients.size : 0 };
       } catch (error) {
         console.error('❌ [refreshClosePrices] Error:', error.message);
         return { error: error.message };
       }
     }
+
+  /**
+   * Fetch official settlement prices using Kite OHLC Quote API (batch).
+   * ohlc.close = previous day's official settlement price.
+   *
+   * For NSE: available by ~6 PM same day.
+   * For MCX: available by ~8-9 AM next morning.
+   *
+   * KEY: Only queries active, non-expired instruments to avoid silent drops.
+   */
+  async refreshSettlementPrices() {
+    try {
+      const today = new Date();
+      today.setHours(0, 0, 0, 0);
+
+      // 1. Get ALL active non-expired derivative instruments + indices
+      const instruments = await KiteInstrument.find({
+        is_active: true,
+        $or: [
+          { instrument_type: { $in: ['FUT', 'CE', 'PE'] }, expiry: { $gte: today } },
+          { segment: 'INDICES' },
+          { exchange: { $in: ['SGX', 'GLOBAL'] } },
+        ],
+      }).select('instrument_token tradingsymbol exchange').lean();
+
+      // Also include watchlisted + subscribed tokens that might be indices/EQ
+      const Watchlist = require('../models/Watchlist');
+      const watchlistTokens = await Watchlist.distinct('instrument_token', { deleted_at: null });
+      const extraTokens = new Set([
+        ...Array.from(this.subscribedTokens).map(t => t.toString()),
+        ...watchlistTokens.map(t => t.toString()),
+      ]);
+
+      // Merge: use instrument list as base, add any extra watchlisted tokens
+      const tokenSet = new Set(instruments.map(i => i.instrument_token.toString()));
+      const missingTokens = [...extraTokens].filter(t => !tokenSet.has(t));
+
+      let extraInstruments = [];
+      if (missingTokens.length > 0) {
+        extraInstruments = await KiteInstrument.find({
+          instrument_token: { $in: missingTokens },
+          is_active: true,
+        }).select('instrument_token tradingsymbol exchange').lean();
+      }
+
+      const allInstruments = [...instruments, ...extraInstruments];
+      console.log(`📊 [refreshSettlement] Found ${allInstruments.length} instruments (${instruments.length} derivatives + ${extraInstruments.length} extra)`);
+
+      // 2. Build EXCHANGE:TRADINGSYMBOL keys
+      const keyToToken = new Map();
+      const keys = [];
+      for (const inst of allInstruments) {
+        const key = `${inst.exchange}:${inst.tradingsymbol.trim()}`;
+        keyToToken.set(key, inst.instrument_token.toString());
+        keys.push(key);
+      }
+
+      if (keys.length === 0) {
+        console.log('📊 [refreshSettlement] No keys to query, skipping.');
+        return { total: 0, updated: 0, missing: 0 };
+      }
+
+      // 3. Batch OHLC API in chunks of 200
+      const BATCH_SIZE = 200;
+      const allOhlcData = {};
+
+      for (let i = 0; i < keys.length; i += BATCH_SIZE) {
+        const batch = keys.slice(i, i + BATCH_SIZE);
+        try {
+          const data = await kiteService.getMarketQuotes(batch, 'ohlc');
+          Object.assign(allOhlcData, data);
+        } catch (err) {
+          console.error(`⚠️  [refreshSettlement] Batch ${Math.floor(i / BATCH_SIZE) + 1} failed: ${err.message}`);
+        }
+      }
+
+      const returnedCount = Object.keys(allOhlcData).length;
+      console.log(`📊 [refreshSettlement] OHLC API returned ${returnedCount}/${keys.length} instruments`);
+
+      // Log missing keys for debugging
+      const missingKeys = keys.filter(k => !allOhlcData[k]);
+      if (missingKeys.length > 0 && missingKeys.length <= 20) {
+        console.warn(`⚠️  [refreshSettlement] Missing from OHLC (${missingKeys.length}):`, missingKeys.join(', '));
+      } else if (missingKeys.length > 20) {
+        console.warn(`⚠️  [refreshSettlement] ${missingKeys.length} instruments missing from OHLC response`);
+      }
+
+      // 4. Build bulk updates
+      const ticks = [];
+      const bulkOps = [];
+
+      for (const [instKey, quote] of Object.entries(allOhlcData)) {
+        const tokenStr = keyToToken.get(instKey);
+        if (!tokenStr || !quote) continue;
+
+        const ohlc = quote.ohlc || {};
+        const settlementPrice = ohlc.close;
+        if (!settlementPrice || settlementPrice <= 0) continue;
+
+        // Update in-memory
+        this.latestPrices.set(tokenStr, settlementPrice);
+        this.latestPrices.set(parseInt(tokenStr), settlementPrice);
+
+        ticks.push({
+          instrument_token: tokenStr,
+          last_price: settlementPrice,
+          open: ohlc.open || 0,
+          high: ohlc.high || 0,
+          low: ohlc.low || 0,
+          close: settlementPrice,
+        });
+
+        bulkOps.push({
+          updateOne: {
+            filter: { instrument_token: tokenStr },
+            update: { $set: { last_price: settlementPrice } },
+          }
+        });
+      }
+
+      // 5. Broadcast to Flutter clients
+      if (ticks.length > 0) {
+        console.log(`📊 [refreshSettlement] Broadcasting ${ticks.length} settlement prices`);
+        this._broadcastToClients({ type: 'ticks', data: ticks });
+      }
+
+      // 6. Update DB
+      if (bulkOps.length > 0) {
+        await KiteInstrument.bulkWrite(bulkOps, { ordered: false });
+        console.log(`📊 [refreshSettlement] Updated ${bulkOps.length} KiteInstrument last_price values`);
+      }
+
+      console.log('✅ [refreshSettlement] Done.');
+      return { total: allInstruments.length, updated: bulkOps.length, missing: missingKeys.length };
+    } catch (error) {
+      console.error('❌ [refreshSettlement] Error:', error.message);
+      return { error: error.message };
+    }
+  }
 
 }
 

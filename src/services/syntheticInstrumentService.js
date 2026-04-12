@@ -17,7 +17,7 @@ const { LOG_LIVE_TICKS } = require('../config/logFlags');
 const BHUJ_NIFTY_TOKEN = '9999999';
 
 const SOURCES = {
-  nifty50: 'NIFTY 50',
+  giftnifty: 'GIFT NIFTY',
   nasdaq:  'US 100',
   dow:     'US 30',
 };
@@ -60,8 +60,8 @@ class SyntheticInstrumentService {
     console.log(`📊 [BhujNifty] Ready: ${Object.values(this._sourceTokens).filter(Boolean).length}/${Object.keys(SOURCES).length} sources`);
 
     // Seed from DB
-    if (this._sourceTokens.nifty50) {
-      const ni = await KiteInstrument.findOne({ instrument_token: this._sourceTokens.nifty50 }).lean();
+    if (this._sourceTokens.giftnifty) {
+      const ni = await KiteInstrument.findOne({ instrument_token: this._sourceTokens.giftnifty }).lean();
       if (ni && ni.last_price > 0) {
         this._lastRealIndex = ni.last_price;
         this._currentValue = ni.last_price;
@@ -120,9 +120,13 @@ class SyntheticInstrumentService {
   _isMarketHours() {
     const ist = this._istNow();
     const day = ist.getDay();
-    if (day === 0 || day === 6) return false;
+    if (day === 0) return false; // Sunday — no trading
     const mins = ist.getHours() * 60 + ist.getMinutes();
-    return mins >= 555 && mins <= 930;
+    // GIFT NIFTY trades ~6:30 AM to ~2:30 AM next day (SGX hours)
+    // Use REAL mode when GIFT NIFTY is likely live (Mon 6:30 AM to Sat 2:30 AM)
+    // Simplified: 6:30 AM (390 min) to 2:30 AM next day (150 min)
+    if (day === 6) return mins < 150; // Saturday: only until 2:30 AM (Friday's session)
+    return mins >= 390 || mins < 150; // 6:30 AM onwards OR before 2:30 AM (prev day session)
   }
 
   _compute() {
@@ -130,7 +134,7 @@ class SyntheticInstrumentService {
     let newValue;
 
     if (isReal) {
-      const token = this._sourceTokens.nifty50;
+      const token = this._sourceTokens.giftnifty;
       const price = token ? this._prices.get(token) : null;
       if (price && price > 0) {
         newValue = price;
