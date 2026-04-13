@@ -307,11 +307,8 @@ const _processJob = async (job) => {
       });
 
       // Invalidate metrics cache & push updated metrics via WebSocket
-      metricsEngine.invalidateUser(
-        trade.user_id,
-        livePriceService.latestPrices,
-        livePriceService.broadcastToUser.bind(livePriceService)
-      ).catch(err => console.error('[MetricsEngine] Limit order invalidation error:', err.message));
+      metricsEngine.onTradeExecuted(trade.user_id.toString())
+        .catch(err => console.error('[MetricsEngine] Limit order invalidation error:', err.message));
 
       // FCM push notification for pending order execution
       firebaseService.sendNotification(trade.user_id.toString(), 'pending_order', {

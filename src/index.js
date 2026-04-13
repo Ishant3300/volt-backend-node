@@ -42,6 +42,14 @@ app.use(express.urlencoded({ extended: true, limit: '1mb' }));
 const { sanitizeBody } = require('./middlewares/validate');
 app.use(sanitizeBody);
 
+// Request logger (temporary debug)
+app.use((req, res, next) => {
+  if (req.path.startsWith('/api/')) {
+    console.log(`📨 ${req.method} ${req.path}`);
+  }
+  next();
+});
+
 // Global rate limiter — 200 requests per minute per IP
 const globalLimiter = rateLimit({
   windowMs: 60 * 1000,
@@ -51,16 +59,6 @@ const globalLimiter = rateLimit({
   message: { success: false, message: 'Too many requests, please try again later' },
 });
 app.use(globalLimiter);
-
-// Centralized error handler — never leak stack traces
-app.use((err, req, res, _next) => {
-  console.error('❌ Unhandled error:', err.message);
-  res.status(err.status || 500).json({
-    success: false,
-    message: process.env.NODE_ENV === 'production' ? 'Internal server error' : err.message,
-    data: null,
-  });
-});
 
 // Connect to database (awaited in server.listen callback)
 // connectDatabase() is called inside server.listen to ensure proper ordering
@@ -143,6 +141,16 @@ app.get('/api/my/login-history', authenticateAny, async (req, res) => {
 
 // Account summary (accessible by all roles)
 app.get('/api/account-summary', authenticateAny, getAccountSummary);
+
+// Centralized error handler — must be AFTER all routes
+app.use((err, req, res, _next) => {
+  console.error('❌ Unhandled error:', err.message);
+  res.status(err.status || 500).json({
+    success: false,
+    message: process.env.NODE_ENV === 'production' ? 'Internal server error' : err.message,
+    data: null,
+  });
+});
 
 // Start server
 const PORT = process.env.PORT || 5000;

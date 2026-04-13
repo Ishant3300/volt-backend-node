@@ -13,7 +13,7 @@ const { getDeletedTrades } = require('../controllers/deletedTradeController');
 router.use(authenticateAny);
 
 // Place a new trade
-router.post('/', validateTrade, tradeController.placeTrade);
+router.post('/', tradeController.placeTrade);
 
 // Cancel a pending trade
 router.put('/:tradeId/cancel', tradeController.cancelTrade);

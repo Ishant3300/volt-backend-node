@@ -679,46 +679,45 @@ class LivePriceService {
    */
   async refreshSettlementPrices() {
     try {
-      const today = new Date();
-      today.setHours(0, 0, 0, 0);
-
-      // 1. Get ALL active non-expired derivative instruments + indices
-      const instruments = await KiteInstrument.find({
-        is_active: true,
-        $or: [
-          { instrument_type: { $in: ['FUT', 'CE', 'PE'] }, expiry: { $gte: today } },
-          { segment: 'INDICES' },
-          { exchange: { $in: ['SGX', 'GLOBAL'] } },
-        ],
-      }).select('instrument_token tradingsymbol exchange').lean();
-
-      // Also include watchlisted + subscribed tokens that might be indices/EQ
+      // Only refresh prices for tokens that matter:
+      // 1. Currently subscribed (WebSocket clients watching)
+      // 2. In watchlists
+      // 3. With open positions (from metricsEngine)
       const Watchlist = require('../models/Watchlist');
       const watchlistTokens = await Watchlist.distinct('instrument_token', { deleted_at: null });
-      const extraTokens = new Set([
+
+      let positionTokens = [];
+      try {
+        const metricsEngine = require('./metricsEngine');
+        for (const [token] of metricsEngine._tokenToUsers || new Map()) {
+          positionTokens.push(token);
+        }
+      } catch (_) {}
+
+      const allTokens = new Set([
         ...Array.from(this.subscribedTokens).map(t => t.toString()),
         ...watchlistTokens.map(t => t.toString()),
+        ...positionTokens,
       ]);
 
-      // Merge: use instrument list as base, add any extra watchlisted tokens
-      const tokenSet = new Set(instruments.map(i => i.instrument_token.toString()));
-      const missingTokens = [...extraTokens].filter(t => !tokenSet.has(t));
-
-      let extraInstruments = [];
-      if (missingTokens.length > 0) {
-        extraInstruments = await KiteInstrument.find({
-          instrument_token: { $in: missingTokens },
-          is_active: true,
-        }).select('instrument_token tradingsymbol exchange').lean();
+      if (allTokens.size === 0) {
+        console.log('📊 [refreshSettlement] No relevant tokens, skipping.');
+        return { total: 0, updated: 0, missing: 0 };
       }
 
-      const allInstruments = [...instruments, ...extraInstruments];
-      console.log(`📊 [refreshSettlement] Found ${allInstruments.length} instruments (${instruments.length} derivatives + ${extraInstruments.length} extra)`);
+      // Look up exchange:tradingsymbol for these tokens only
+      const tokenArray = [...allTokens];
+      const instruments = await KiteInstrument.find({
+        instrument_token: { $in: tokenArray },
+        is_active: true,
+      }).select('instrument_token tradingsymbol exchange').lean();
 
-      // 2. Build EXCHANGE:TRADINGSYMBOL keys
+      console.log(`📊 [refreshSettlement] Refreshing ${instruments.length} instruments (from ${allTokens.size} tokens)`);
+
+      // Build EXCHANGE:TRADINGSYMBOL keys
       const keyToToken = new Map();
       const keys = [];
-      for (const inst of allInstruments) {
+      for (const inst of instruments) {
         const key = `${inst.exchange}:${inst.tradingsymbol.trim()}`;
         keyToToken.set(key, inst.instrument_token.toString());
         keys.push(key);
@@ -800,7 +799,7 @@ class LivePriceService {
       }
 
       console.log('✅ [refreshSettlement] Done.');
-      return { total: allInstruments.length, updated: bulkOps.length, missing: missingKeys.length };
+      return { total: instruments.length, updated: bulkOps.length, missing: missingKeys.length };
     } catch (error) {
       console.error('❌ [refreshSettlement] Error:', error.message);
       return { error: error.message };

@@ -431,9 +431,10 @@ const placeTrade = async (req, res) => {
                 }
             }
 
-            // ── Fresh Stop-Loss Restrictions ──────────────────────────────
-            // Only applies when user has fresh_stoploss enabled and is not admin
-            if (!req.admin && user.fresh_stoploss === true && instrumentRawName) {
+            // ── Fresh Stop-Loss & Limit Price Restrictions ─────────────────
+            // Price offset restrictions apply to ALL LIMIT/SL orders (independent of fresh_stoploss toggle).
+            // Fresh stoploss toggle controls whether user can place closing orders on open positions.
+            if (!req.admin && instrumentRawName) {
                 const FreshStoplossLimit = require('../models/FreshStoplossLimit');
                 const normalizedSeg = ((segment || exchange || '').toUpperCase()) === 'GLOBAL' ? 'INDICES' : (segment || exchange || '').toUpperCase();
 
@@ -444,10 +445,19 @@ const placeTrade = async (req, res) => {
                 });
 
                 if (fslLimit) {
-                    if (order_type === 'MARKET') {
-                        // TIME restriction: check if user is closing a position opened via MARKET within time_minutes
+                    // Get live CMP from metricsEngine/livePriceService
+                    const metricsEngFSL = require('../services/metricsEngine');
+                    const livePriceSvc = require('../services/livePriceService');
+                    const tokenStr = instrument_token.toString();
+                    const tokenInt = parseInt(instrument_token);
+                    const cmpFSL = metricsEngFSL._ltpMap?.get(tokenStr)
+                        || livePriceSvc.latestPrices?.get(tokenStr)
+                        || livePriceSvc.latestPrices?.get(tokenInt)
+                        || null;
+
+                    // ── 1. MARKET orders: time restriction (only when fresh_stoploss is ON) ──
+                    if (order_type === 'MARKET' && user.fresh_stoploss === true) {
                         if (fslLimit.time_minutes > 0) {
-                            // Find the user's current net position for this instrument
                             const posAggFSL = await Trade.aggregate([
                                 { $match: { user_id: user._id, instrument_token, status: 'completed', deleted_at: null } },
                                 { $group: {
@@ -458,21 +468,15 @@ const placeTrade = async (req, res) => {
                             ]).session(session);
 
                             const currentNetQty = posAggFSL.length > 0 ? posAggFSL[0].total_buy_qty - posAggFSL[0].total_sell_qty : 0;
-
-                            // Only restrict if this is a closing trade (opposite direction of position)
                             const isClosing = (transaction_type === 'SELL' && currentNetQty > 0) ||
                                               (transaction_type === 'BUY' && currentNetQty < 0);
 
                             if (isClosing) {
-                                // Find the most recent MARKET trade that opened/added to this position
                                 const oppositeType = transaction_type === 'SELL' ? 'BUY' : 'SELL';
                                 const lastOpeningTrade = await Trade.findOne({
-                                    user_id: user._id,
-                                    instrument_token,
-                                    transaction_type: oppositeType,
-                                    order_type: 'MARKET',
-                                    status: 'completed',
-                                    deleted_at: null
+                                    user_id: user._id, instrument_token,
+                                    transaction_type: oppositeType, order_type: 'MARKET',
+                                    status: 'completed', deleted_at: null
                                 }).sort({ executed_at: -1 }).session(session);
 
                                 if (lastOpeningTrade && lastOpeningTrade.executed_at) {
@@ -485,28 +489,42 @@ const placeTrade = async (req, res) => {
                                 }
                             }
                         }
-                    } else if (order_type === 'LIMIT' || order_type === 'SL' || order_type === 'SL-M') {
-                        // PRICE restriction: limit how far from CMP the user can place orders
-                        if (fslLimit.price_offset > 0 && price > 0) {
-                            // Fetch live price for comparison
-                            const ltpMapFSL = await _getLivePricesFromKite([parseInt(instrument_token)]);
-                            const cmpFSL = ltpMapFSL.get(parseInt(instrument_token)) || ltpMapFSL.get(instrument_token.toString());
+                    }
 
-                            if (cmpFSL && cmpFSL > 0) {
-                                if (transaction_type === 'BUY') {
-                                    const minBuyPrice = cmpFSL - fslLimit.price_offset;
-                                    if (price < minBuyPrice) {
-                                        throw new Error(`Fresh Stop-Loss: Buy price ₹${price.toFixed(2)} is below minimum allowed ₹${minBuyPrice.toFixed(2)} (CMP ₹${cmpFSL.toFixed(2)} - offset ₹${fslLimit.price_offset}).`);
-                                    }
-                                } else if (transaction_type === 'SELL') {
-                                    const maxSellPrice = cmpFSL + fslLimit.price_offset;
-                                    if (price > maxSellPrice) {
-                                        throw new Error(`Fresh Stop-Loss: Sell price ₹${price.toFixed(2)} exceeds maximum allowed ₹${maxSellPrice.toFixed(2)} (CMP ₹${cmpFSL.toFixed(2)} + offset ₹${fslLimit.price_offset}).`);
-                                    }
+                    // ── 2. LIMIT/SL orders: price offset restriction (always applies) ──
+                    if ((order_type === 'LIMIT' || order_type === 'SL' || order_type === 'SL-M') && fslLimit.price_offset > 0 && price > 0 && cmpFSL && cmpFSL > 0) {
+                        if (order_type === 'LIMIT') {
+                            // LIMIT: BUY below CMP, SELL above CMP
+                            if (transaction_type === 'BUY') {
+                                const maxBuyPrice = cmpFSL - fslLimit.price_offset;
+                                if (price > maxBuyPrice) {
+                                    throw new Error(`Price restriction: Buy limit must be at or below ₹${maxBuyPrice.toFixed(2)} (CMP ₹${cmpFSL.toFixed(2)} - ₹${fslLimit.price_offset}).`);
+                                }
+                            } else if (transaction_type === 'SELL') {
+                                const minSellPrice = cmpFSL + fslLimit.price_offset;
+                                if (price < minSellPrice) {
+                                    throw new Error(`Price restriction: Sell limit must be at or above ₹${minSellPrice.toFixed(2)} (CMP ₹${cmpFSL.toFixed(2)} + ₹${fslLimit.price_offset}).`);
+                                }
+                            }
+                        } else {
+                            // SL/SL-M: BUY above CMP, SELL below CMP (opposite of LIMIT)
+                            if (transaction_type === 'BUY') {
+                                const minBuyPrice = cmpFSL + fslLimit.price_offset;
+                                if (price < minBuyPrice) {
+                                    throw new Error(`Price restriction: Buy stoploss must be at or above ₹${minBuyPrice.toFixed(2)} (CMP ₹${cmpFSL.toFixed(2)} + ₹${fslLimit.price_offset}).`);
+                                }
+                            } else if (transaction_type === 'SELL') {
+                                const maxSellPrice = cmpFSL - fslLimit.price_offset;
+                                if (price > maxSellPrice) {
+                                    throw new Error(`Price restriction: Sell stoploss must be at or below ₹${maxSellPrice.toFixed(2)} (CMP ₹${cmpFSL.toFixed(2)} - ₹${fslLimit.price_offset}).`);
                                 }
                             }
                         }
                     }
+
+                    // Note: Time restriction only applies to MARKET closing orders (section 1 above).
+                    // SL/LIMIT closing orders are always allowed — user should be able to
+                    // place a stoploss to protect their position at any time.
                 }
             }
 

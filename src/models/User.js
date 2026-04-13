@@ -112,7 +112,7 @@ const userSchema = new mongoose.Schema({
   },
   fresh_stoploss: {
     type: Boolean,
-    default: false
+    default: true
   },
   change_pass_on_first_login: {
     type: Boolean,
