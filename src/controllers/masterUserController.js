@@ -219,13 +219,10 @@ const createUser = async (req, res) => {
 const getAllUsers = async (req, res) => {
   try {
     const { page = 1, limit = 20, status, server_id } = req.query;
-    const { getAllSubMasterIds } = require('../services/masterHierarchyService');
 
-    // Get all master IDs in the hierarchy (this master + all sub-masters recursively)
-    const allMasterIds = await getAllSubMasterIds(req.master.id);
-
+    // Only return DIRECT child users of this master (not sub-masters' users)
     const filter = {
-      master_id: { $in: allMasterIds },
+      master_id: req.master.id,
       deleted_at: null
     };
 
