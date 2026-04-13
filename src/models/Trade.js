@@ -49,8 +49,16 @@ const tradeSchema = new mongoose.Schema({
   },
   placed_by: {
     type: String,
-    enum: ['USER', 'ADMIN', 'MASTER'],
+    enum: ['USER', 'ADMIN', 'MASTER', 'SYSTEM'],
     default: 'USER'
+  },
+  // Trade type: 'regular' for normal trades, 'carry_forward' for ATP adjustment,
+  // 'margin_square_off' for auto margin square-off trades
+  // carry_forward and margin_square_off trades are hidden from orders/history page
+  trade_type: {
+    type: String,
+    enum: ['regular', 'carry_forward', 'margin_square_off'],
+    default: 'regular'
   },
   status: {
     type: String,

@@ -1204,11 +1204,17 @@ const autoSquareOffExpired = async (req, res) => {
             return res.status(400).json({ success: false, message: 'instrument_tokens array required' });
         }
 
+        const user = await User.findById(userId).populate('master_id');
+        if (!user) {
+            return res.status(404).json({ success: false, message: 'User not found' });
+        }
+
         const results = [];
         const errors = [];
 
         for (const token of instrument_tokens) {
             try {
+                // Get current net position
                 const posAgg = await Trade.aggregate([
                     { $match: { user_id: new mongoose.Types.ObjectId(userId), instrument_token: token.toString(), status: 'completed', deleted_at: null } },
                     { $group: {
@@ -1224,37 +1230,102 @@ const autoSquareOffExpired = async (req, res) => {
                 const inst = await KiteInstrument.findOne({ instrument_token: token.toString() }).lean();
                 if (!inst) { errors.push({ token, message: 'Instrument not found' }); continue; }
 
-                const lastTrade = await Trade.findOne({
-                    instrument_token: token.toString(), status: 'completed', deleted_at: null,
-                }).sort({ executed_at: -1 }).lean();
-
-                const closePrice = lastTrade?.executed_price || 0;
-                if (closePrice <= 0) { errors.push({ token, tradingsymbol: inst.tradingsymbol, message: 'No price for settlement' }); continue; }
-
-                const oppositeType = netQty > 0 ? 'SELL' : 'BUY';
-                const fakeReq = {
-                    user: req.user, master: req.master, admin: null,
-                    body: {
-                        instrument_token: token.toString(),
-                        tradingsymbol: inst.tradingsymbol,
-                        exchange: inst.exchange,
-                        transaction_type: oppositeType,
-                        quantity: Math.abs(netQty),
-                        price: closePrice,
-                        order_type: 'MARKET',
-                        segment: inst.segment,
-                    },
-                };
-
-                let tradeResult = null;
-                const fakeRes = { status: (code) => ({ json: (body) => { tradeResult = { code, ...body }; } }) };
-                await placeTrade(fakeReq, fakeRes);
-
-                if (tradeResult && tradeResult.success) {
-                    results.push({ token, tradingsymbol: inst.tradingsymbol, side: oppositeType, qty: Math.abs(netQty), price: closePrice });
-                } else {
-                    errors.push({ token, tradingsymbol: inst.tradingsymbol, message: tradeResult?.message || 'Trade failed' });
+                // Use settlement/close price from DB (updated by refreshSettlementPrices)
+                const closePrice = inst.last_price;
+                if (!closePrice || closePrice <= 0) {
+                    errors.push({ token, tradingsymbol: inst.tradingsymbol, message: 'No settlement price available' });
+                    continue;
                 }
+
+                const absQty = Math.abs(netQty);
+                const closeSide = netQty > 0 ? 'SELL' : 'BUY';
+                const reopenSide = netQty > 0 ? 'BUY' : 'SELL';
+                const now = new Date();
+
+                // Compute P&L for the closing trade (FIFO-based, same as placeTrade)
+                const closingTrades = await Trade.find({
+                    user_id: user._id,
+                    instrument_token: token.toString(),
+                    status: 'completed',
+                    deleted_at: null,
+                    transaction_type: netQty > 0 ? 'BUY' : 'SELL',
+                }).sort({ executed_at: 1 }).session(null);
+
+                let remainingQty = absQty;
+                let totalCost = 0;
+                for (const t of closingTrades) {
+                    if (remainingQty <= 0) break;
+                    const available = t.executed_quantity - (t._usedQty || 0);
+                    const used = Math.min(available, remainingQty);
+                    totalCost += used * t.executed_price;
+                    remainingQty -= used;
+                }
+                const avgEntryPrice = totalCost / absQty;
+                const closePnl = netQty > 0
+                    ? (closePrice - avgEntryPrice) * absQty
+                    : (avgEntryPrice - closePrice) * absQty;
+
+                // 1. CLOSE trade — settles the position at close price
+                const closeTrade = await Trade.create({
+                    user_id: user._id,
+                    master_id: user.master_id?._id || user.master_id,
+                    admin_id: user.admin_id,
+                    instrument_token: token.toString(),
+                    tradingsymbol: inst.tradingsymbol,
+                    exchange: inst.exchange,
+                    transaction_type: closeSide,
+                    quantity: absQty,
+                    price: closePrice,
+                    order_type: 'MARKET',
+                    placed_by: 'SYSTEM',
+                    trade_type: 'carry_forward',
+                    status: 'completed',
+                    executed_at: now,
+                    executed_price: closePrice,
+                    executed_quantity: absQty,
+                    pnl: Math.round(closePnl * 100) / 100,
+                    brokerage: 0,
+                    taxes: 0,
+                    net_amount: Math.round(closePnl * 100) / 100,
+                    remarks: 'Carry forward close — ATP adjustment',
+                });
+
+                // 2. REOPEN trade — reopens position at close price (new ATP = close price)
+                const reopenTrade = await Trade.create({
+                    user_id: user._id,
+                    master_id: user.master_id?._id || user.master_id,
+                    admin_id: user.admin_id,
+                    instrument_token: token.toString(),
+                    tradingsymbol: inst.tradingsymbol,
+                    exchange: inst.exchange,
+                    transaction_type: reopenSide,
+                    quantity: absQty,
+                    price: closePrice,
+                    order_type: 'MARKET',
+                    placed_by: 'SYSTEM',
+                    trade_type: 'carry_forward',
+                    status: 'completed',
+                    executed_at: now,
+                    executed_price: closePrice,
+                    executed_quantity: absQty,
+                    pnl: 0,
+                    brokerage: 0,
+                    taxes: 0,
+                    net_amount: 0,
+                    remarks: 'Carry forward reopen — ATP adjustment',
+                });
+
+                // Refresh metricsEngine for this user
+                const metricsEngine = require('../services/metricsEngine');
+                await metricsEngine.onTradeExecuted(userId);
+
+                results.push({
+                    token,
+                    tradingsymbol: inst.tradingsymbol,
+                    qty: absQty,
+                    close_price: closePrice,
+                    pnl: Math.round(closePnl * 100) / 100,
+                });
             } catch (e) {
                 errors.push({ token, message: e.message });
             }
@@ -1262,8 +1333,8 @@ const autoSquareOffExpired = async (req, res) => {
 
         res.status(200).json({
             success: true,
-            message: `Squared off ${results.length} position(s)${errors.length > 0 ? `, ${errors.length} failed` : ''}`,
-            data: { squared_off: results, errors },
+            message: `Carry forward ${results.length} position(s)${errors.length > 0 ? `, ${errors.length} failed` : ''}`,
+            data: { carried_forward: results, errors },
         });
     } catch (error) {
         res.status(500).json({ success: false, message: error.message, data: null });

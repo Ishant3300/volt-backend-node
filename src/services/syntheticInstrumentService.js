@@ -80,8 +80,10 @@ class SyntheticInstrumentService {
 
     if (this._lastRealIndex > 0) {
       this._compute();
-      setInterval(() => { if (this._lastRealIndex > 0) this._compute(); }, 30000);
     }
+    // Always start the compute interval — even if no baseline yet,
+    // it will start computing once the first GIFT NIFTY tick arrives
+    setInterval(() => { this._compute(); }, 30000);
   }
 
 
@@ -130,24 +132,70 @@ class SyntheticInstrumentService {
   }
 
   _compute() {
-    const isReal = this._isMarketHours();
-    let newValue;
+    // Weighted blend: 60% GIFT NIFTY, 30% US 30 (Dow), 10% US 100 (Nasdaq)
+    // All three contribute at all times (market hours and after hours)
+    const giftToken = this._sourceTokens.giftnifty;
+    const dowToken = this._sourceTokens.dow;
+    const nasdaqToken = this._sourceTokens.nasdaq;
 
-    if (isReal) {
-      const token = this._sourceTokens.giftnifty;
-      const price = token ? this._prices.get(token) : null;
-      if (price && price > 0) {
-        newValue = price;
-        this._lastRealIndex = price;
-        this._currentMode = 'REAL';
-        this._snapshotBaseline();
-      }
-    } else {
-      newValue = this._computeSynthetic();
-      this._currentMode = 'SYNTHETIC';
+    const giftPrice = giftToken ? this._prices.get(giftToken) : null;
+    const dowPrice = dowToken ? this._prices.get(dowToken) : null;
+    const nasdaqPrice = nasdaqToken ? this._prices.get(nasdaqToken) : null;
+
+    // Update last real index from GIFT NIFTY when available
+    if (giftPrice && giftPrice > 0) {
+      this._lastRealIndex = giftPrice;
     }
 
-    if (!newValue || newValue <= 0) return;
+    // Compute % change from baseline for each source
+    const giftBaseline = this._lastRealIndex;
+    const dowBaseline = this._globalBaseline.dow || 0;
+    const nasdaqBaseline = this._globalBaseline.nasdaq || 0;
+
+    // If we have no baseline at all, can't compute
+    if (giftBaseline <= 0) return;
+
+    // Snapshot baselines on first valid GIFT NIFTY tick
+    if (giftPrice && giftPrice > 0 && Object.keys(this._globalBaseline).length === 0) {
+      this._snapshotBaseline();
+    }
+
+    // Start with GIFT NIFTY as the base value
+    let newValue = 0;
+    let totalWeight = 0;
+
+    // 60% GIFT NIFTY — use live price if available, else last known
+    const giftLive = (giftPrice && giftPrice > 0) ? giftPrice : giftBaseline;
+    newValue += giftLive * 0.6;
+    totalWeight += 0.6;
+
+    // 30% US 30 (Dow) — apply % change to GIFT NIFTY base
+    if (dowPrice && dowPrice > 0 && dowBaseline > 0) {
+      const dowChange = (dowPrice - dowBaseline) / dowBaseline;
+      newValue += giftBaseline * (1 + dowChange) * 0.3;
+      totalWeight += 0.3;
+    }
+
+    // 10% US 100 (Nasdaq) — apply % change to GIFT NIFTY base
+    if (nasdaqPrice && nasdaqPrice > 0 && nasdaqBaseline > 0) {
+      const nasdaqChange = (nasdaqPrice - nasdaqBaseline) / nasdaqBaseline;
+      newValue += giftBaseline * (1 + nasdaqChange) * 0.1;
+      totalWeight += 0.1;
+    }
+
+    // Normalize if some sources are missing
+    if (totalWeight > 0 && totalWeight < 1) {
+      newValue = newValue / totalWeight;
+    }
+
+    if (newValue <= 0) return;
+
+    this._currentMode = (giftPrice && giftPrice > 0) ? 'REAL' : 'SYNTHETIC';
+
+    // Snapshot US baselines when GIFT NIFTY is live
+    if (giftPrice && giftPrice > 0) {
+      this._snapshotBaseline();
+    }
 
     // Daily OHLC
     const ist = this._istNow();

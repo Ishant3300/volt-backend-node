@@ -265,11 +265,11 @@ const getUserById = async (req, res) => {
   try {
     const { id } = req.params;
 
-    const user = await User.findOne({
-      _id: id,
-      master_id: req.master.id, // Must be created by this master
-      deleted_at: null
-    })
+    // Don't filter by deleted_at — master/admin should see deleted users' data
+    const query = { _id: id };
+    if (req.master) query.master_id = req.master.id;
+
+    const user = await User.findOne(query)
       .populate('server_id', 'name')
       .populate('master_id', 'name username');
 
@@ -317,7 +317,7 @@ const updateUserDetails = async (req, res) => {
       fresh_stoploss
     } = req.body;
 
-    const query = { _id: id, deleted_at: null };
+    const query = { _id: id };
     if (req.master) query.master_id = req.master.id;
 
     const user = await User.findOne(query);

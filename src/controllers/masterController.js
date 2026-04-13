@@ -197,9 +197,9 @@ const getMasterById = async (req, res) => {
     const { id } = req.params;
 
     // Build query based on who is requesting
+    // Don't filter by deleted_at — admin/parent master should see deleted masters' data
     let query = {
       _id: id,
-      deleted_at: null
     };
 
     // If admin is requesting, filter by admin_id

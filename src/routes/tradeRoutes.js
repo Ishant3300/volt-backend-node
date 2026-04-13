@@ -1,6 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const { authenticateAny } = require('../middlewares/auth');
+const { validateTrade } = require('../middlewares/validate');
 const tradeController = require('../controllers/tradeController');
 const { getTradeReport } = require('../controllers/tradeReportController');
 const { getRejectionLog } = require('../controllers/rejectionLogController');
@@ -12,7 +13,7 @@ const { getDeletedTrades } = require('../controllers/deletedTradeController');
 router.use(authenticateAny);
 
 // Place a new trade
-router.post('/', tradeController.placeTrade);
+router.post('/', validateTrade, tradeController.placeTrade);
 
 // Cancel a pending trade
 router.put('/:tradeId/cancel', tradeController.cancelTrade);

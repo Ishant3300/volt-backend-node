@@ -39,6 +39,7 @@ const getTradeReport = async (req, res) => {
       status: 'completed',
       deleted_at: null,
       executed_at: { $gte: fromDate, $lte: toDate },
+      trade_type: { $nin: ['carry_forward', 'margin_square_off'] }, // Hide system trades
     };
     if (targetUserId) match.user_id = targetUserId;
     else if (role === 'master') {

@@ -163,7 +163,8 @@ const getUserById = async (req, res) => {
       .populate('server_id', 'name')
       .populate('master_id', 'username');
 
-    if (!user || user.deleted_at) {
+    // Allow fetching deleted users (admin needs to see their data)
+    if (!user) {
       return res.status(404).json({
         success: false,
         message: 'User not found',
@@ -203,7 +204,7 @@ const updateUser = async (req, res) => {
 
     const user = await User.findById(id);
 
-    if (!user || user.deleted_at) {
+    if (!user) {
       return res.status(404).json({
         success: false,
         message: 'User not found',
@@ -322,7 +323,7 @@ const creditUserByAdmin = async (req, res) => {
     let result;
     await session.withTransaction(async () => {
       const user = await User.findById(id).session(session);
-      if (!user || user.deleted_at) throw new Error('User not found');
+      if (!user) throw new Error('User not found');
 
       const balanceBefore = user.equity;
       user.equity += amount;
@@ -365,7 +366,7 @@ const debitUserByAdmin = async (req, res) => {
     let result;
     await session.withTransaction(async () => {
       const user = await User.findById(id).session(session);
-      if (!user || user.deleted_at) throw new Error('User not found');
+      if (!user) throw new Error('User not found');
 
       const balanceBefore = user.equity;
       user.equity -= amount;

@@ -43,7 +43,7 @@ const { authenticateAdmin, authenticateAdminOrMaster, authenticateMaster, authen
 router.post('/users', authenticateMaster, createUser);
 router.get('/users', authenticateAdminOrMaster, getAllUsers);
 router.get('/users/:id', authenticateAdminOrMaster, getUserById);
-router.put('/users/:id', updateUser);
+router.put('/users/:id', authenticateAdminOrMaster, updateUser);
 router.delete('/users/:id', authenticateMaster, deleteUser);
 router.post('/users/:id/credit', authenticateAdmin, creditUserByAdmin);
 router.post('/users/:id/debit', authenticateAdmin, debitUserByAdmin);

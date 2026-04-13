@@ -3,6 +3,8 @@ require('dotenv').config({ path: path.resolve(__dirname, '../.env') });
 const express = require('express');
 const http = require('http');
 const cors = require('cors');
+const helmet = require('helmet');
+const rateLimit = require('express-rate-limit');
 const connectDatabase = require('./database/database');
 const kiteAuthService = require('./services/kiteAuthService');
 const livePriceService = require('./services/livePriceService');
@@ -15,10 +17,50 @@ const firebaseService = require('./services/firebaseService');
 const app = express();
 const server = http.createServer(app);
 
-// Middleware
-app.use(cors());
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
+// ── Security Middleware ──────────────────────────────────────────────────────
+
+// Security headers (CSP, X-Frame-Options, HSTS, X-Content-Type-Options, etc.)
+app.use(helmet({
+  contentSecurityPolicy: false, // Disable CSP for API-only server
+  crossOriginEmbedderPolicy: false,
+}));
+
+// CORS — restrict origins in production
+const allowedOrigins = process.env.ALLOWED_ORIGINS
+  ? process.env.ALLOWED_ORIGINS.split(',')
+  : ['*'];
+app.use(cors({
+  origin: allowedOrigins.includes('*') ? true : allowedOrigins,
+  credentials: true,
+}));
+
+// Body parsing with size limits
+app.use(express.json({ limit: '1mb' }));
+app.use(express.urlencoded({ extended: true, limit: '1mb' }));
+
+// Sanitize all request bodies
+const { sanitizeBody } = require('./middlewares/validate');
+app.use(sanitizeBody);
+
+// Global rate limiter — 200 requests per minute per IP
+const globalLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 200,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { success: false, message: 'Too many requests, please try again later' },
+});
+app.use(globalLimiter);
+
+// Centralized error handler — never leak stack traces
+app.use((err, req, res, _next) => {
+  console.error('❌ Unhandled error:', err.message);
+  res.status(err.status || 500).json({
+    success: false,
+    message: process.env.NODE_ENV === 'production' ? 'Internal server error' : err.message,
+    data: null,
+  });
+});
 
 // Connect to database (awaited in server.listen callback)
 // connectDatabase() is called inside server.listen to ensure proper ordering

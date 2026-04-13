@@ -363,7 +363,7 @@ const browseInstruments = async (req, res) => {
         groups,
         total,
         page: pageNum,
-        hasMore: skip + instruments.length < total,
+        hasMore: (pageNum - 1) * limitNum + instruments.length < total,
       }
     });
   } catch (error) {

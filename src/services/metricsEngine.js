@@ -145,23 +145,26 @@ class MetricsEngine {
         const token = t.instrument_token.toString();
         totalFifoPnl += (t.pnl || 0);
 
-        // Brokerage calculation (same 4-level fallback as Flutter)
-        const ki = this._kiteMap[token] || {};
-        const seg = ki.segment || '';
-        const rawName = ki.raw_name || '';
-        const lotSize = ki.lot_size || 1;
+        // Skip brokerage for carry_forward and margin_square_off trades (system trades)
+        if (t.trade_type !== 'carry_forward' && t.trade_type !== 'margin_square_off') {
+          // Brokerage calculation (same 4-level fallback as Flutter)
+          const ki = this._kiteMap[token] || {};
+          const seg = ki.segment || '';
+          const rawName = ki.raw_name || '';
+          const lotSize = ki.lot_size || 1;
 
-        let brkRule = null;
-        if (rawName && seg) brkRule = this._brokerageRules.find(r => r.script_name?.toUpperCase() === rawName.toUpperCase() && r.exchange_name === seg.toUpperCase());
-        if (!brkRule && rawName) brkRule = this._brokerageRules.find(r => r.script_name?.toUpperCase() === rawName.toUpperCase());
-        if (!brkRule && seg) brkRule = this._brokerageRules.find(r => r.exchange_name === seg.toUpperCase() && !r.script_name);
-        if (!brkRule) brkRule = this._brokerageRules.find(r => r.exchange_name === (seg.split('-')[0] || '').toUpperCase() && !r.script_name);
+          let brkRule = null;
+          if (rawName && seg) brkRule = this._brokerageRules.find(r => r.script_name?.toUpperCase() === rawName.toUpperCase() && r.exchange_name === seg.toUpperCase());
+          if (!brkRule && rawName) brkRule = this._brokerageRules.find(r => r.script_name?.toUpperCase() === rawName.toUpperCase());
+          if (!brkRule && seg) brkRule = this._brokerageRules.find(r => r.exchange_name === seg.toUpperCase() && !r.script_name);
+          if (!brkRule) brkRule = this._brokerageRules.find(r => r.exchange_name === (seg.split('-')[0] || '').toUpperCase() && !r.script_name);
 
-        if (brkRule) {
-          if (brkRule.type === 'TURNOVER WISE') {
-            totalBrokerage += t.executed_price * t.executed_quantity * (brkRule.brk_value / 10000);
-          } else if (brkRule.type === 'LOT WISE') {
-            totalBrokerage += (lotSize > 1 ? t.executed_quantity / lotSize : t.executed_quantity) * brkRule.brk_value;
+          if (brkRule) {
+            if (brkRule.type === 'TURNOVER WISE') {
+              totalBrokerage += t.executed_price * t.executed_quantity * (brkRule.brk_value / 10000);
+            } else if (brkRule.type === 'LOT WISE') {
+              totalBrokerage += (lotSize > 1 ? t.executed_quantity / lotSize : t.executed_quantity) * brkRule.brk_value;
+            }
           }
         }
 
