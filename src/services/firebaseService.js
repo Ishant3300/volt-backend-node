@@ -151,4 +151,20 @@ const sendNotification = async (userId, notificationType, { title, body, data = 
   }
 };
 
-module.exports = { init, isAvailable, sendNotification };
+/**
+ * Send a raw push notification to a specific FCM token (no user lookup).
+ */
+const sendRawNotification = async (fcmToken, { title, body, data = {} }) => {
+  if (!_initialized || !fcmToken) return;
+  try {
+    await admin.messaging().send({
+      token: fcmToken,
+      notification: { title, body },
+      data: Object.fromEntries(Object.entries(data).map(([k, v]) => [k, String(v)])),
+    });
+  } catch (err) {
+    console.error(`❌ [Firebase] sendRawNotification error:`, err.message);
+  }
+};
+
+module.exports = { init, isAvailable, sendNotification, sendRawNotification };

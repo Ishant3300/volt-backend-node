@@ -108,7 +108,7 @@ const userLogin = async (req, res) => {
 // Admin Login
 const adminLogin = async (req, res) => {
   try {
-    const { username, password } = req.body;
+    const { username, password, otp, otp_token } = req.body;
 
     if (!username || !password) {
       return res.status(400).json({
@@ -138,21 +138,52 @@ const adminLogin = async (req, res) => {
       });
     }
 
-    // Generate new token (no expiration)
-    const token = generateToken(admin._id, 'admin');
+    const adminOtpService = require('../services/adminOtpService');
 
-    // Update active_token to invalidate previous sessions
-    admin.active_token = token;
-    await admin.save();
+    // Step 2: If OTP is provided, verify it
+    if (otp && otp_token) {
+      const isValid = adminOtpService.verifyOtp(admin._id.toString(), otp, otp_token);
+      if (!isValid) {
+        return res.status(401).json({
+          success: false,
+          message: 'Invalid or expired OTP',
+          data: null
+        });
+      }
 
-    await _logLogin(req, admin._id, 'Admin', admin.username, admin.username);
+      // OTP verified — issue token
+      const token = generateToken(admin._id, 'admin');
+      admin.active_token = token;
+      await admin.save();
 
-    res.status(200).json({
+      await _logLogin(req, admin._id, 'Admin', admin.username, admin.username);
+
+      return res.status(200).json({
+        success: true,
+        message: 'Login successful',
+        data: {
+          token,
+          admin: admin.toJSON()
+        }
+      });
+    }
+
+    // Step 1: Password correct — generate and send OTP
+    const { otp: generatedOtp, otpToken } = adminOtpService.generateOtp(admin._id.toString());
+    const maskedPhone = adminOtpService.getMaskedPhone(username);
+
+    // Send OTP asynchronously (don't await — respond immediately)
+    adminOtpService.sendOtp(username, generatedOtp).catch(err => 
+      console.error('[AdminOTP] Send error:', err.message)
+    );
+
+    return res.status(200).json({
       success: true,
-      message: 'Login successful',
+      message: 'OTP sent to your registered phone',
       data: {
-        token,
-        admin: admin.toJSON()
+        requires_otp: true,
+        otp_token: otpToken,
+        masked_phone: maskedPhone,
       }
     });
   } catch (error) {
@@ -419,6 +450,41 @@ const universalLogin = async (req, res) => {
         message: 'Invalid credentials',
         data: null
       });
+    }
+
+    // Admin OTP flow: if admin, require OTP verification
+    if (roleType === 'admin') {
+      const { otp, otp_token } = req.body;
+      const adminOtpService = require('../services/adminOtpService');
+
+      if (otp && otp_token) {
+        // Verify OTP
+        const isValid = adminOtpService.verifyOtp(userAccount._id.toString(), otp, otp_token);
+        if (!isValid) {
+          return res.status(401).json({ success: false, message: 'Invalid or expired OTP', data: null });
+        }
+        // OTP verified — fall through to token generation below
+      } else {
+        // Send OTP
+        const { otp: generatedOtp, otpToken } = adminOtpService.generateOtp(userAccount._id.toString());
+        const maskedPhone = adminOtpService.getMaskedPhone(username);
+
+        // Send OTP asynchronously (don't await — respond immediately)
+        adminOtpService.sendOtp(username, generatedOtp).catch(err =>
+          console.error('[AdminOTP] Send error:', err.message)
+        );
+
+        return res.status(200).json({
+          success: true,
+          message: 'OTP sent to your registered phone',
+          data: {
+            requires_otp: true,
+            otp_token: otpToken,
+            masked_phone: maskedPhone,
+            role: 'ADMIN',
+          }
+        });
+      }
     }
 
     // Generate new token (no expiration)
