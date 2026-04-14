@@ -10,6 +10,23 @@ const {
   deleteServer
 } = require('../controllers/serverController');
 
+// Search servers by name (public — used by login page)
+router.get('/search', async (req, res) => {
+  try {
+    const { q } = req.query;
+    if (!q || q.trim().length < 1) {
+      return res.json({ success: true, data: [] });
+    }
+    const Server = require('../models/Server');
+    const servers = await Server.find({
+      name: { $regex: q.trim(), $options: 'i' }
+    }).select('name').limit(10).lean();
+    res.json({ success: true, data: servers.map(s => ({ id: s._id, name: s.name })) });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
 // Get all servers (public — used by login page before auth)
 router.get('/', getAllServers);
 

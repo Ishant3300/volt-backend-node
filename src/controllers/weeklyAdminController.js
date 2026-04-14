@@ -43,7 +43,10 @@ const getWeeklyAdminReport = async (req, res) => {
         .select('_id name username pnl_sharing brokerage_sharing').lean();
 
       for (const cm of childMasters) {
-        const entry = await _getAggregatedEntry(cm._id.toString(), cm, metricsEngine);
+        // Caller's share = what caller has - what they gave to child
+        const callerPnlShare = callerMaster?.pnl_sharing || 0;
+        const callerBrkShare = callerMaster?.brokerage_sharing || 0;
+        const entry = await _getAggregatedEntry(cm._id.toString(), cm, metricsEngine, callerPnlShare, callerBrkShare);
         entry.parent_username = callerMaster?.username || '';
         entry.type = 'master';
         data.push(entry);
@@ -51,21 +54,21 @@ const getWeeklyAdminReport = async (req, res) => {
 
       // 2. Direct child users
       const directUsers = await User.find({ master_id: callerId, deleted_at: null })
-        .select('_id name username').lean();
+        .select('_id name username pnl_sharing brokerage_sharing').lean();
 
       for (const u of directUsers) {
         const metrics = await metricsEngine.getFreshMetrics(u._id.toString());
         const realised = metrics ? metrics.realised_pnl : 0;
         const position = metrics ? metrics.position_pnl : 0;
-        const hasOpenPositions = metrics && metrics.positions && metrics.positions.length > 0;
 
         // Compute brokerage for this user
         const brokerage = await _getUserBrokerage(u._id);
 
-        const m2mPnl = hasOpenPositions ? (realised + position) : 0;
-        const totalPnl = realised + m2mPnl;
-        const adminBrk = brokerage * ((callerMaster?.brokerage_sharing || 0) / 100);
-        const adminProfit = m2mPnl * ((callerMaster?.pnl_sharing || 0) / 100);
+        const m2mPnl = realised + position;
+        const totalPnl = m2mPnl;
+        // For users: admin brk = full brokerage, admin profit = full P&L (no sharing formula)
+        const adminBrk = brokerage;
+        const adminProfit = m2mPnl;
 
         data.push({
           id: u._id.toString(),
@@ -77,9 +80,9 @@ const getWeeklyAdminReport = async (req, res) => {
           m2m_pnl: r2(m2mPnl),
           brokerage: r2(brokerage),
           admin_brk: r2(adminBrk),
-          total_pnl: r2(totalPnl),
-          admin_profit: r2(adminProfit),
-          total_admin: r2(adminProfit),
+          total_pnl: r2(-totalPnl),
+          admin_profit: r2(-adminProfit),
+          total_admin: r2(-adminProfit + adminBrk),
         });
       }
     }
@@ -93,7 +96,7 @@ const getWeeklyAdminReport = async (req, res) => {
 /**
  * Get aggregated weekly report entry for a master and their entire sub-hierarchy.
  */
-async function _getAggregatedEntry(masterId, masterDoc, metricsEngine) {
+async function _getAggregatedEntry(masterId, masterDoc, metricsEngine, callerPnlShare = 100, callerBrkShare = 100) {
   const { getAllSubMasterIds } = require('../services/masterHierarchyService');
   const allMasterIds = await getAllSubMasterIds(masterId);
 
@@ -110,8 +113,8 @@ async function _getAggregatedEntry(masterId, masterDoc, metricsEngine) {
     }
   }
 
-  // M2M = realised + position when positions are open, otherwise just realised
-  const m2mPnl = hasAnyOpenPositions ? (realised + position) : 0;
+  // M2M = realised + position (always, regardless of open positions)
+  const m2mPnl = realised + position;
 
   // Brokerage for all users in hierarchy
   let totalBrokerage = 0;
@@ -119,9 +122,12 @@ async function _getAggregatedEntry(masterId, masterDoc, metricsEngine) {
     totalBrokerage += await _getUserBrokerage(u._id);
   }
 
-  const totalPnl = realised + m2mPnl;
-  const adminBrk = totalBrokerage * ((masterDoc.brokerage_sharing || 0) / 100);
-  const adminProfit = m2mPnl * ((masterDoc.pnl_sharing || 0) / 100);
+  const totalPnl = m2mPnl;
+  // Caller's share = caller's sharing% - child master's sharing%
+  const pnlKeep = callerPnlShare - (masterDoc.pnl_sharing || 0);
+  const brkKeep = callerBrkShare - (masterDoc.brokerage_sharing || 0);
+  const adminBrk = totalBrokerage * (brkKeep / 100);
+  const adminProfit = m2mPnl * (pnlKeep / 100);
 
   return {
     id: masterId,
@@ -131,9 +137,9 @@ async function _getAggregatedEntry(masterId, masterDoc, metricsEngine) {
     m2m_pnl: r2(m2mPnl),
     brokerage: r2(totalBrokerage),
     admin_brk: r2(adminBrk),
-    total_pnl: r2(totalPnl),
-    admin_profit: r2(adminProfit),
-    total_admin: r2(adminProfit),
+    total_pnl: r2(-totalPnl),
+    admin_profit: r2(-adminProfit),
+    total_admin: r2(-adminProfit + adminBrk),
   };
 }
 

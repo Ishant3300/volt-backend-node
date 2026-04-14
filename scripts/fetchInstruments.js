@@ -94,8 +94,8 @@ const GLOBAL_INDICES_MAP = {
  * - Global indices from INDICES segment
  */
 function shouldIncludeInstrument(instrument) {
-  // Include global indices
-  if (instrument.segment === 'INDICES' && instrument.exchange === 'NSE') {
+  // Include global indices (NSE and NSEIX exchanges)
+  if (instrument.segment === 'INDICES' && (instrument.exchange === 'NSE' || instrument.exchange === 'NSEIX')) {
     return true;
   }
   
@@ -399,7 +399,7 @@ async function fetchInstruments() {
     // Exclude synthetic tokens (9999xxx) and GLOBAL exchange instruments (manually seeded)
     const activeTokens = uniqueInstruments.map(i => i.instrument_token);
     const deactivated = await KiteInstrument.updateMany(
-      { instrument_token: { $nin: activeTokens, $not: /^9999/ }, exchange: { $ne: 'GLOBAL' }, is_active: true },
+      { instrument_token: { $nin: activeTokens, $not: /^9999/ }, exchange: { $nin: ['GLOBAL', 'SGX'] }, is_active: true },
       { $set: { is_active: false } }
     );
 

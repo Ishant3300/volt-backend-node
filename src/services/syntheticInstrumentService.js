@@ -98,6 +98,11 @@ class SyntheticInstrumentService {
 
     this._prices.set(tokenStr, ltp);
 
+    // Update _lastRealIndex immediately when GIFT NIFTY tick arrives
+    if (this._sourceTokens.giftnifty === tokenStr && ltp > 0) {
+      this._lastRealIndex = ltp;
+    }
+
     // Set baseline on first tick if not seeded from DB
     for (const key of ['nasdaq', 'dow']) {
       if (this._sourceTokens[key] === tokenStr && !this._globalBaseline[key]) {
