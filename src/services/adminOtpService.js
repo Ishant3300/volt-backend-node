@@ -15,7 +15,7 @@ const OTP_EXPIRY_MS = 5 * 60 * 1000; // 5 minutes
 
 // Hardcoded admin → phone mapping
 const ADMIN_PHONES = {
-  'admin': '+917355973984',
+  'admin': '+917990638761',
   'Ishantapex33': '+918780804062',
   'nisheetapex97': '+919173380394',
 };
