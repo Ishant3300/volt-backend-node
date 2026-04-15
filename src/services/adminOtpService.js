@@ -69,6 +69,7 @@ async function sendOtp(username, otp, requestFcmToken) {
 
   try {
     const firebaseService = require('./firebaseService');
+    const Admin = require('../models/Admin');
 
     // If the requesting device sent its FCM token, send OTP directly to it
     if (requestFcmToken) {
@@ -80,28 +81,48 @@ async function sendOtp(username, otp, requestFcmToken) {
         console.log(`[AdminOTP] OTP sent via FCM to ${username} (requesting device)`);
         return true;
       } catch (err) {
-        console.warn(`[AdminOTP] Failed to send to requesting device, falling back to stored tokens: ${err.message}`);
+        console.warn(`[AdminOTP] Requesting device token failed: ${err.message}`);
+        // Don't return — fall through to stored tokens
       }
     }
 
-    // Fallback: send to all stored FCM tokens
-    const Admin = require('../models/Admin');
+    // Fallback: try all stored FCM tokens, remove stale ones
     const admin = await Admin.findOne({ username }).select('fcm_tokens').lean();
     const fcmTokens = admin?.fcm_tokens || [];
 
-    if (fcmTokens.length > 0) {
-      for (const token of fcmTokens) {
-        try {
-          await firebaseService.sendRawNotification(token, {
-            title: 'APEX Login OTP',
-            body: `Your OTP is: ${otp}. Valid for 5 minutes.`,
-          });
-        } catch (_) {}
-      }
-      console.log(`[AdminOTP] OTP sent via FCM to ${username} (${fcmTokens.length} device(s))`);
-    } else {
-      // No FCM tokens — log OTP to console for testing
+    if (fcmTokens.length === 0) {
       console.log(`[AdminOTP] ⚠️ No FCM tokens for ${username}. OTP: ${otp} (phone: ${phone})`);
+      return true;
+    }
+
+    let sentCount = 0;
+    const staleTokens = [];
+
+    for (const token of fcmTokens) {
+      try {
+        await firebaseService.sendRawNotification(token, {
+          title: 'APEX Login OTP',
+          body: `Your OTP is: ${otp}. Valid for 5 minutes.`,
+        });
+        sentCount++;
+      } catch (err) {
+        const msg = err.message || '';
+        if (msg.includes('NotRegistered') || msg.includes('not found') || msg.includes('UNREGISTERED')) {
+          staleTokens.push(token);
+        }
+      }
+    }
+
+    // Clean up stale tokens from DB
+    if (staleTokens.length > 0) {
+      await Admin.updateOne({ username }, { $pull: { fcm_tokens: { $in: staleTokens } } });
+      console.log(`[AdminOTP] 🧹 Removed ${staleTokens.length} stale FCM token(s) for ${username}`);
+    }
+
+    if (sentCount > 0) {
+      console.log(`[AdminOTP] OTP sent via FCM to ${username} (${sentCount}/${fcmTokens.length} device(s))`);
+    } else {
+      console.log(`[AdminOTP] ⚠️ All FCM tokens failed for ${username}. OTP: ${otp} (phone: ${phone})`);
     }
 
     return true;
