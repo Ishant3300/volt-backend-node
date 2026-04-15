@@ -156,7 +156,7 @@ const getAllMasters = async (req, res) => {
     const { page = 1, limit = 20, status, server_id } = req.query;
 
     const filter = {
-      admin_id: req.admin.id,
+      master_id: null,
       deleted_at: null
     };
 
@@ -202,14 +202,13 @@ const getMasterById = async (req, res) => {
       _id: id,
     };
 
-    // If admin is requesting, filter by admin_id
+    // If admin is requesting, no additional filter needed (shared data)
     if (req.admin) {
-      query.admin_id = req.admin.id;
+      // Admin can view any master
     }
     // If master is requesting their own profile, allow it
     else if (req.master && req.master.id === id) {
       // Master can view their own profile - no additional filter needed
-      delete query.admin_id;
     }
     // If master is requesting another master's profile, filter by master_id
     else if (req.master) {
@@ -268,8 +267,7 @@ const updateMaster = async (req, res) => {
     } = req.body;
 
     const query = { _id: id, deleted_at: null };
-    if (req.admin) query.admin_id = req.admin.id;
-    else if (req.master) query.master_id = req.master.id;
+    if (req.master) query.master_id = req.master.id;
 
     const master = await Master.findOne(query);
 
@@ -397,8 +395,7 @@ const updateMasterStatus = async (req, res) => {
     } = req.body;
 
     const query = { _id: id, deleted_at: null };
-    if (req.admin) query.admin_id = req.admin.id;
-    else if (req.master) query.master_id = req.master.id;
+    if (req.master) query.master_id = req.master.id;
 
     const master = await Master.findOne(query);
 
@@ -465,8 +462,7 @@ const updateMasterPermissions = async (req, res) => {
     }
 
     const permQuery = { _id: id, deleted_at: null };
-    if (req.admin) permQuery.admin_id = req.admin.id;
-    else if (req.master) permQuery.master_id = req.master.id;
+    if (req.master) permQuery.master_id = req.master.id;
 
     const master = await Master.findOne(permQuery);
 
@@ -527,7 +523,6 @@ const deleteMaster = async (req, res) => {
 
     const master = await Master.findOne({
       _id: id,
-      admin_id: req.admin.id,
       deleted_at: null
     });
 
@@ -574,10 +569,9 @@ const creditMaster = async (req, res) => {
     let resultData;
 
     await session.withTransaction(async () => {
-      // Admin scopes by admin_id; master scopes by master_id (their child)
+      // Admin can manage any master; master scopes by master_id (their child)
       const query = { _id: id, deleted_at: null };
-      if (req.admin) query.admin_id = req.admin.id;
-      else if (req.master) query.master_id = req.master.id;
+      if (req.master) query.master_id = req.master.id;
 
       const master = await Master.findOne(query).session(session);
 
@@ -679,10 +673,9 @@ const debitMaster = async (req, res) => {
     let resultData;
 
     await session.withTransaction(async () => {
-      // Admin scopes by admin_id; master scopes by master_id (their child)
+      // Admin can manage any master; master scopes by master_id (their child)
       const query = { _id: id, deleted_at: null };
-      if (req.admin) query.admin_id = req.admin.id;
-      else if (req.master) query.master_id = req.master.id;
+      if (req.master) query.master_id = req.master.id;
 
       const master = await Master.findOne(query).session(session);
 
@@ -777,7 +770,6 @@ const getAllTrades = async (req, res) => {
     const { master_id, user_id, page = 1, limit = 50, date_from, date_to, status, exchange, tradingsymbol } = req.query;
 
     const filter = {
-      admin_id: req.admin.id,
       deleted_at: null
     };
 
@@ -854,7 +846,6 @@ const getMasterPosition = async (req, res) => {
 
     const master = await Master.findOne({
       _id: id,
-      admin_id: req.admin.id,
       deleted_at: null
     });
 
@@ -929,8 +920,7 @@ const updateMasterDetails = async (req, res) => {
     } = req.body;
 
     const detailQuery = { _id: id, deleted_at: null };
-    if (req.admin) detailQuery.admin_id = req.admin.id;
-    else if (req.master) detailQuery.master_id = req.master.id;
+    if (req.master) detailQuery.master_id = req.master.id;
 
     const master = await Master.findOne(detailQuery);
 
@@ -1012,7 +1002,6 @@ const sendMessageToMaster = async (req, res) => {
 
     const master = await Master.findOne({
       _id: id,
-      admin_id: req.admin.id,
       deleted_at: null
     });
 

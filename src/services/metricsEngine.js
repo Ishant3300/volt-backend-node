@@ -36,6 +36,10 @@ class MetricsEngine {
     // LTP map: instrument_token (string) → last_price
     this._ltpMap = new Map();
 
+    // Bid/Ask maps: instrument_token (string) → best bid/ask price
+    this._bidMap = new Map();
+    this._askMap = new Map();
+
     // Debounce: batch tick processing
     this._pendingTokens = new Set();
     this._tickTimer = null;
@@ -252,11 +256,13 @@ class MetricsEngine {
    * Called by livePriceService on every Kite tick.
    * Debounces to batch-process multiple tokens arriving in the same tick frame.
    */
-  onTick(instrumentToken, lastPrice) {
+  onTick(instrumentToken, lastPrice, bidPrice, askPrice) {
     if (!this._initialized) return;
 
     const token = instrumentToken.toString();
     this._ltpMap.set(token, lastPrice);
+    if (bidPrice && bidPrice > 0) this._bidMap.set(token, bidPrice);
+    if (askPrice && askPrice > 0) this._askMap.set(token, askPrice);
     this._pendingTokens.add(token);
 
     // Debounce: process all pending tokens after 50ms of quiet
@@ -313,11 +319,22 @@ class MetricsEngine {
     for (const pos of openPositions) {
       const ltp = this._ltpMap.get(pos.token) || (pos.avgBuy > 0 ? pos.avgBuy : pos.avgSell);
 
+      // CMP: use bid for BUY positions (exit = sell at bid), ask for SELL positions (exit = buy at ask)
+      // Fall back to LTP if bid/ask not available
+      let cmp;
+      if (pos.netQty > 0) {
+        // BUY position — exit by selling at bid
+        cmp = this._bidMap.get(pos.token) || ltp;
+      } else {
+        // SELL position — exit by buying at ask
+        cmp = this._askMap.get(pos.token) || ltp;
+      }
+
       let floating = 0;
       if (pos.netQty > 0) {
-        floating = (ltp - pos.avgBuy) * pos.netQty;
+        floating = (cmp - pos.avgBuy) * pos.netQty;
       } else if (pos.netQty < 0) {
-        floating = (pos.avgSell - ltp) * Math.abs(pos.netQty);
+        floating = (pos.avgSell - cmp) * Math.abs(pos.netQty);
       }
       totalFloating += floating;
 
@@ -354,6 +371,9 @@ class MetricsEngine {
         avg_buy_price: Math.round(pos.avgBuy * 100) / 100,
         avg_sell_price: Math.round(pos.avgSell * 100) / 100,
         ltp: Math.round(ltp * 100) / 100,
+        cmp: Math.round(cmp * 100) / 100,
+        bid_price: Math.round((this._bidMap.get(pos.token) || 0) * 100) / 100,
+        ask_price: Math.round((this._askMap.get(pos.token) || 0) * 100) / 100,
         floating_pnl: Math.round(floating * 100) / 100,
         margin: Math.round(positionMargin * 100) / 100,
         segment: pos.segment,

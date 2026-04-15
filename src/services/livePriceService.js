@@ -306,8 +306,8 @@ class LivePriceService {
             // Update synthetic instruments that depend on this source
             syntheticInstrumentService.onTick(t.instrument_token, t.last_price);
 
-            // Update real-time metrics engine
-            metricsEngine.onTick(t.instrument_token, t.last_price);
+            // Update real-time metrics engine (with bid/ask for P&L computation)
+            metricsEngine.onTick(t.instrument_token, t.last_price, t.bid_price, t.ask_price);
           }
         });
 

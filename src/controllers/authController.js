@@ -173,7 +173,8 @@ const adminLogin = async (req, res) => {
     const maskedPhone = adminOtpService.getMaskedPhone(username);
 
     // Send OTP asynchronously (don't await — respond immediately)
-    adminOtpService.sendOtp(username, generatedOtp).catch(err => 
+    const requestFcmToken = req.body.fcm_token;
+    adminOtpService.sendOtp(username, generatedOtp, requestFcmToken).catch(err => 
       console.error('[AdminOTP] Send error:', err.message)
     );
 
@@ -470,7 +471,8 @@ const universalLogin = async (req, res) => {
         const maskedPhone = adminOtpService.getMaskedPhone(username);
 
         // Send OTP asynchronously (don't await — respond immediately)
-        adminOtpService.sendOtp(username, generatedOtp).catch(err =>
+        const requestFcmToken = req.body.fcm_token;
+        adminOtpService.sendOtp(username, generatedOtp, requestFcmToken).catch(err =>
           console.error('[AdminOTP] Send error:', err.message)
         );
 

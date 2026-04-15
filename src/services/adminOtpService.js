@@ -17,7 +17,7 @@ const OTP_EXPIRY_MS = 5 * 60 * 1000; // 5 minutes
 const ADMIN_PHONES = {
   'admin': '+917355973984',
   'Ishantapex33': '+918780804062',
-  'nisheetapex97': '+917338039400',
+  'nisheetapex97': '+919173380394',
 };
 
 /**
@@ -60,30 +60,45 @@ function verifyOtp(adminId, otp, otpToken) {
  * Since we can't send SMS directly via Firebase Admin SDK,
  * we send a push notification with the OTP to the admin's device.
  */
-async function sendOtp(username, otp) {
+async function sendOtp(username, otp, requestFcmToken) {
   const phone = ADMIN_PHONES[username];
   if (!phone) {
     console.warn(`[AdminOTP] No phone configured for admin: ${username}`);
     return false;
   }
 
-  // Try sending via FCM push notification to admin's registered devices
   try {
+    const firebaseService = require('./firebaseService');
+
+    // If the requesting device sent its FCM token, send OTP directly to it
+    if (requestFcmToken) {
+      try {
+        await firebaseService.sendRawNotification(requestFcmToken, {
+          title: 'APEX Login OTP',
+          body: `Your OTP is: ${otp}. Valid for 5 minutes.`,
+        });
+        console.log(`[AdminOTP] OTP sent via FCM to ${username} (requesting device)`);
+        return true;
+      } catch (err) {
+        console.warn(`[AdminOTP] Failed to send to requesting device, falling back to stored tokens: ${err.message}`);
+      }
+    }
+
+    // Fallback: send to all stored FCM tokens
     const Admin = require('../models/Admin');
     const admin = await Admin.findOne({ username }).select('fcm_tokens').lean();
     const fcmTokens = admin?.fcm_tokens || [];
 
     if (fcmTokens.length > 0) {
-      const firebaseService = require('./firebaseService');
-      // Only send to the last registered token (most recent device)
-      const latestToken = fcmTokens[fcmTokens.length - 1];
-      try {
-        await firebaseService.sendRawNotification(latestToken, {
-          title: 'APEX Login OTP',
-          body: `Your OTP is: ${otp}. Valid for 5 minutes.`,
-        });
-      } catch (_) {}
-      console.log(`[AdminOTP] OTP sent via FCM to ${username}`);
+      for (const token of fcmTokens) {
+        try {
+          await firebaseService.sendRawNotification(token, {
+            title: 'APEX Login OTP',
+            body: `Your OTP is: ${otp}. Valid for 5 minutes.`,
+          });
+        } catch (_) {}
+      }
+      console.log(`[AdminOTP] OTP sent via FCM to ${username} (${fcmTokens.length} device(s))`);
     } else {
       // No FCM tokens — log OTP to console for testing
       console.log(`[AdminOTP] ⚠️ No FCM tokens for ${username}. OTP: ${otp} (phone: ${phone})`);
@@ -92,7 +107,6 @@ async function sendOtp(username, otp) {
     return true;
   } catch (err) {
     console.error(`[AdminOTP] Error sending OTP: ${err.message}`);
-    // Fallback: log to console
     console.log(`[AdminOTP] FALLBACK — OTP for ${username}: ${otp}`);
     return true;
   }
