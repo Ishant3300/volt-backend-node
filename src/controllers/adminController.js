@@ -325,9 +325,8 @@ const creditUserByAdmin = async (req, res) => {
       const user = await User.findById(id).session(session);
       if (!user) throw new Error('User not found');
 
-      const balanceBefore = user.equity;
-      user.equity += amount;
-      if (user.credits < user.equity) user.credits = user.equity;
+      const creditsBefore = user.credits;
+      user.credits += amount;
       await user.save({ session });
 
       const tx = new Transaction({
@@ -339,12 +338,12 @@ const creditUserByAdmin = async (req, res) => {
         amount,
         referenceId: req.admin ? req.admin.id : null,
         referenceModel: 'Admin',
-        balanceBefore,
-        balanceAfter: user.equity,
+        balanceBefore: creditsBefore,
+        balanceAfter: user.credits,
         metadata: { note: note || 'Admin credit', credited_by: req.admin?.username }
       });
       await tx.save({ session });
-      result = { new_balance: user.equity, amount_credited: amount };
+      result = { new_balance: user.credits, amount_credited: amount, current_credits: user.credits };
     });
     session.endSession();
     res.status(200).json({ success: true, message: 'Amount credited successfully', data: result });
@@ -368,8 +367,8 @@ const debitUserByAdmin = async (req, res) => {
       const user = await User.findById(id).session(session);
       if (!user) throw new Error('User not found');
 
-      const balanceBefore = user.equity;
-      user.equity -= amount;
+      const creditsBefore = user.credits;
+      user.credits -= amount;
       await user.save({ session });
 
       const tx = new Transaction({
@@ -381,12 +380,12 @@ const debitUserByAdmin = async (req, res) => {
         amount,
         referenceId: req.admin ? req.admin.id : null,
         referenceModel: 'Admin',
-        balanceBefore,
-        balanceAfter: user.equity,
+        balanceBefore: creditsBefore,
+        balanceAfter: user.credits,
         metadata: { note: note || 'Admin debit', debited_by: req.admin?.username }
       });
       await tx.save({ session });
-      result = { new_balance: user.equity, amount_debited: amount };
+      result = { new_balance: user.credits, amount_debited: amount, current_credits: user.credits };
     });
     session.endSession();
     res.status(200).json({ success: true, message: 'Amount debited successfully', data: result });

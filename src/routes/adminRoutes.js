@@ -74,6 +74,22 @@ router.get('/trade-margins/exchange/:exchange_name', authenticateAdminOrMaster, 
 router.post('/trade-margins', authenticateAdminOrMaster, createTradeMargin);
 router.get('/trade-margins', authenticateAdminOrMaster, getAllTradeMargins);
 router.get('/trade-margins/:id', authenticateAdminOrMaster, getTradeMarginById);
+// Bulk update trade margins (update multiple IDs with same value)
+router.put('/trade-margins/bulk-update', authenticateAdminOrMaster, async (req, res) => {
+  try {
+    const { ids, trade_margin, amount_type } = req.body;
+    if (!ids || !Array.isArray(ids) || ids.length === 0 || trade_margin === undefined) {
+      return res.status(400).json({ success: false, message: 'ids array and trade_margin are required', data: null });
+    }
+    const TradeMargin = require('../models/TradeMargin');
+    const updateFields = { trade_margin };
+    if (amount_type) updateFields.amount_type = amount_type;
+    const result = await TradeMargin.updateMany({ _id: { $in: ids }, deleted_at: null }, { $set: updateFields });
+    res.json({ success: true, message: `Updated ${result.modifiedCount} trade margin(s)`, data: { modified: result.modifiedCount } });
+  } catch (e) {
+    res.status(500).json({ success: false, message: e.message, data: null });
+  }
+});
 router.put('/trade-margins/:id', authenticateAdminOrMaster, updateTradeMargin);
 router.delete('/trade-margins/:id', authenticateAdminOrMaster, deleteTradeMargin);
 
@@ -83,6 +99,22 @@ router.get('/brokerage-settings/exchange/:exchange_name', authenticateAdminOrMas
 router.post('/brokerage-settings', authenticateAdminOrMaster, createBrokerageSettings);
 router.get('/brokerage-settings', authenticateAdminOrMaster, getAllBrokerageSettings);
 router.get('/brokerage-settings/:id', authenticateAdminOrMaster, getBrokerageSettingsById);
+// Bulk update brokerage settings (update multiple IDs with same value)
+router.put('/brokerage-settings/bulk-update', authenticateAdminOrMaster, async (req, res) => {
+  try {
+    const { ids, brk_value, type } = req.body;
+    if (!ids || !Array.isArray(ids) || ids.length === 0 || brk_value === undefined) {
+      return res.status(400).json({ success: false, message: 'ids array and brk_value are required', data: null });
+    }
+    const BrokerageSettings = require('../models/BrokerageSettings');
+    const updateFields = { brk_value };
+    if (type) updateFields.type = type;
+    const result = await BrokerageSettings.updateMany({ _id: { $in: ids }, deleted_at: null }, { $set: updateFields });
+    res.json({ success: true, message: `Updated ${result.modifiedCount} brokerage setting(s)`, data: { modified: result.modifiedCount } });
+  } catch (e) {
+    res.status(500).json({ success: false, message: e.message, data: null });
+  }
+});
 router.put('/brokerage-settings/:id', authenticateAdminOrMaster, updateBrokerageSettings);
 router.delete('/brokerage-settings/:id', authenticateAdminOrMaster, deleteBrokerageSettings);
 
@@ -121,5 +153,59 @@ router.post('/fresh-stoploss-limits/bulk-create', authenticateAdmin, bulkCreateF
 router.put('/fresh-stoploss-limits/bulk-update', authenticateAdmin, bulkUpdateFreshStoplossLimits);
 router.put('/fresh-stoploss-limits/:id', authenticateAdmin, updateFreshStoplossLimit);
 router.delete('/fresh-stoploss-limits/:id', authenticateAdmin, deleteFreshStoplossLimit);
+
+// ==================== TOTP ROUTES ====================
+const totpService = require('../services/adminOtpService');
+
+router.get('/totp/status', authenticateAdmin, async (req, res) => {
+  try {
+    const status = await totpService.getTotpStatus(req.admin.id);
+    if (!status) return res.status(404).json({ success: false, message: 'Admin not found', data: null });
+    res.json({ success: true, data: status });
+  } catch (e) {
+    res.status(500).json({ success: false, message: e.message, data: null });
+  }
+});
+
+router.post('/totp/generate', authenticateAdmin, async (req, res) => {
+  try {
+    const result = await totpService.generateSecret(req.admin.id);
+    res.json({ success: true, data: { qr_data_url: result.qrDataUrl, secret: result.secret } });
+  } catch (e) {
+    res.status(500).json({ success: false, message: e.message, data: null });
+  }
+});
+
+router.post('/totp/verify-setup', authenticateAdmin, async (req, res) => {
+  try {
+    const { token } = req.body;
+    if (!token) return res.status(400).json({ success: false, message: 'TOTP code required', data: null });
+    const verified = await totpService.verifySetup(req.admin.id, token);
+    if (!verified) return res.status(400).json({ success: false, message: 'Invalid TOTP code', data: null });
+    res.json({ success: true, message: 'TOTP activated successfully' });
+  } catch (e) {
+    res.status(500).json({ success: false, message: e.message, data: null });
+  }
+});
+
+router.post('/totp/toggle', authenticateAdmin, async (req, res) => {
+  try {
+    const { enabled } = req.body;
+    if (enabled === undefined) return res.status(400).json({ success: false, message: 'enabled field required', data: null });
+    await totpService.toggleTotp(req.admin.id, enabled);
+    res.json({ success: true, message: `TOTP ${enabled ? 'enabled' : 'disabled'}` });
+  } catch (e) {
+    res.status(500).json({ success: false, message: e.message, data: null });
+  }
+});
+
+router.post('/totp/reset', authenticateAdmin, async (req, res) => {
+  try {
+    await totpService.resetTotp(req.admin.id);
+    res.json({ success: true, message: 'TOTP reset successfully' });
+  } catch (e) {
+    res.status(500).json({ success: false, message: e.message, data: null });
+  }
+});
 
 module.exports = router;

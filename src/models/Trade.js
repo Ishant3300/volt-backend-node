@@ -14,7 +14,7 @@ const tradeSchema = new mongoose.Schema({
   admin_id: {
     type: mongoose.Schema.Types.ObjectId,
     ref: 'Admin',
-    required: true
+    default: null
   },
   instrument_token: {
     type: String,

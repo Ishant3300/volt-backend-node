@@ -108,7 +108,7 @@ const userLogin = async (req, res) => {
 // Admin Login
 const adminLogin = async (req, res) => {
   try {
-    const { username, password, otp, otp_token } = req.body;
+    const { username, password, totp_code } = req.body;
 
     if (!username || !password) {
       return res.status(400).json({
@@ -138,53 +138,45 @@ const adminLogin = async (req, res) => {
       });
     }
 
-    const adminOtpService = require('../services/adminOtpService');
-
-    // Step 2: If OTP is provided, verify it
-    if (otp && otp_token) {
-      const isValid = adminOtpService.verifyOtp(admin._id.toString(), otp, otp_token);
-      if (!isValid) {
-        return res.status(401).json({
-          success: false,
-          message: 'Invalid or expired OTP',
-          data: null
+    // Check if TOTP is enabled for this admin
+    if (admin.totp_enabled) {
+      if (!totp_code) {
+        // Password correct but TOTP required — tell client
+        return res.status(200).json({
+          success: true,
+          message: 'TOTP verification required',
+          data: {
+            requires_totp: true,
+            totp_configured: !!admin.totp_secret,
+          }
         });
       }
 
-      // OTP verified — issue token
-      const token = generateToken(admin._id, 'admin');
-      admin.active_token = token;
-      await admin.save();
-
-      await _logLogin(req, admin._id, 'Admin', admin.username, admin.username);
-
-      return res.status(200).json({
-        success: true,
-        message: 'Login successful',
-        data: {
-          token,
-          admin: admin.toJSON()
-        }
-      });
+      // Verify TOTP code
+      const totpService = require('../services/adminOtpService');
+      const verified = await totpService.verifyLogin(admin._id.toString(), totp_code);
+      if (!verified) {
+        return res.status(401).json({
+          success: false,
+          message: 'Invalid or expired TOTP code',
+          data: null
+        });
+      }
     }
 
-    // Step 1: Password correct — generate and send OTP
-    const { otp: generatedOtp, otpToken } = adminOtpService.generateOtp(admin._id.toString());
-    const maskedPhone = adminOtpService.getMaskedPhone(username);
+    // All verified (or TOTP not enabled) — issue token
+    const token = generateToken(admin._id, 'admin');
+    admin.active_token = token;
+    await admin.save();
 
-    // Send OTP asynchronously (don't await — respond immediately)
-    const requestFcmToken = req.body.fcm_token;
-    adminOtpService.sendOtp(username, generatedOtp, requestFcmToken).catch(err => 
-      console.error('[AdminOTP] Send error:', err.message)
-    );
+    await _logLogin(req, admin._id, 'Admin', admin.username, admin.username);
 
     return res.status(200).json({
       success: true,
-      message: 'OTP sent to your registered phone',
+      message: 'Login successful',
       data: {
-        requires_otp: true,
-        otp_token: otpToken,
-        masked_phone: maskedPhone,
+        token,
+        admin: admin.toJSON()
       }
     });
   } catch (error) {
@@ -453,40 +445,28 @@ const universalLogin = async (req, res) => {
       });
     }
 
-    // Admin OTP flow: if admin, require OTP verification
-    if (roleType === 'admin') {
-      const { otp, otp_token } = req.body;
-      const adminOtpService = require('../services/adminOtpService');
+    // Admin TOTP flow: if admin and TOTP enabled, require verification
+    if (roleType === 'admin' && userAccount.totp_enabled) {
+      const { totp_code } = req.body;
 
-      if (otp && otp_token) {
-        // Verify OTP
-        const isValid = adminOtpService.verifyOtp(userAccount._id.toString(), otp, otp_token);
-        if (!isValid) {
-          return res.status(401).json({ success: false, message: 'Invalid or expired OTP', data: null });
-        }
-        // OTP verified — fall through to token generation below
-      } else {
-        // Send OTP
-        const { otp: generatedOtp, otpToken } = adminOtpService.generateOtp(userAccount._id.toString());
-        const maskedPhone = adminOtpService.getMaskedPhone(username);
-
-        // Send OTP asynchronously (don't await — respond immediately)
-        const requestFcmToken = req.body.fcm_token;
-        adminOtpService.sendOtp(username, generatedOtp, requestFcmToken).catch(err =>
-          console.error('[AdminOTP] Send error:', err.message)
-        );
-
+      if (!totp_code) {
         return res.status(200).json({
           success: true,
-          message: 'OTP sent to your registered phone',
+          message: 'TOTP verification required',
           data: {
-            requires_otp: true,
-            otp_token: otpToken,
-            masked_phone: maskedPhone,
+            requires_totp: true,
+            totp_configured: !!userAccount.totp_secret,
             role: 'ADMIN',
           }
         });
       }
+
+      const totpService = require('../services/adminOtpService');
+      const verified = await totpService.verifyLogin(userAccount._id.toString(), totp_code);
+      if (!verified) {
+        return res.status(401).json({ success: false, message: 'Invalid or expired TOTP code', data: null });
+      }
+      // Verified — fall through to token generation below
     }
 
     // Generate new token (no expiration)

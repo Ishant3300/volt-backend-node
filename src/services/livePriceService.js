@@ -30,8 +30,8 @@ class LivePriceService {
    * Initialize WebSocket server on the HTTP server
    */
   init(server) {
-    this.wss = new WebSocket.Server({ server, path: '/ws/live-prices' });
-    console.log('📡 WebSocket server initialized at /ws/live-prices');
+    this.wss = new WebSocket.Server({ noServer: true });
+    console.log('📡 WebSocket server initialized (noServer mode)');
 
     this.wss.on('connection', (ws) => {
       console.log('🔌 New Flutter client connected');

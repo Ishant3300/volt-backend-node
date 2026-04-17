@@ -26,6 +26,7 @@ const QUEUE_NAME = 'price-updates';
 
 let queue = null;
 let worker = null;
+const _startTime = Date.now();
 
 // ─── Producer ───────────────────────────────────────────────────────────────
 
@@ -37,10 +38,7 @@ let worker = null;
  * @param {number} livePrice
  */
 const publishPriceUpdate = async (instrumentToken, livePrice) => {
-  if (!queue) {
-    console.log(`⚠️  [PriceQueue] Cannot publish - queue not initialized`);
-    return;
-  }
+  if (!queue) return;  // Silently skip if queue not ready
 
   try {
     const jobId = `price_${instrumentToken}_${Date.now()}`; // Unique ID to prevent replacement

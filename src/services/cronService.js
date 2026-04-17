@@ -111,6 +111,22 @@ class CronService {
         }, { timezone: 'Asia/Kolkata' });
         this.jobs.push(morningSettlementRefresh);
 
+        // ── Weekend Carry Forward ────────────────────────────────────────
+        // Saturday 9:00 AM IST — after all markets close (MCX closes ~11:30 PM Friday)
+        // 1. Cancels all pending orders (limit/SL expired)
+        // 2. Carries forward open positions at Friday's close price (ATP reset)
+        const weekendCarryForward = cron.schedule('0 9 * * 6', async () => {
+            console.log('🔄 [CRON] Starting Weekend Carry Forward...');
+            try {
+                const { runWeekendCarryForward } = require('./weekendCarryForwardService');
+                await runWeekendCarryForward();
+                console.log('✅ [CRON] Weekend Carry Forward completed.');
+            } catch (error) {
+                console.error('❌ [CRON] Error during Weekend Carry Forward:', error);
+            }
+        }, { timezone: 'Asia/Kolkata' });
+        this.jobs.push(weekendCarryForward);
+
         const engineMode = redisService.isAvailable()
             ? 'Redis + BullMQ (cron fallback standby)'
             : 'DB polling every 10s (Redis unavailable)';

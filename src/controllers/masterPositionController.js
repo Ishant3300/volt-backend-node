@@ -380,24 +380,42 @@ const getUserMetrics = async (req, res) => {
 const getAdminMasterMetrics = async (req, res) => {
   try {
     const metricsEngine = require('../services/metricsEngine');
-    const masters = await Master.find({ deleted_at: null }).select('_id name username');
+    // Only fetch top-level masters (master_id: null) — same hierarchy as user management
+    const masters = await Master.find({ master_id: null, deleted_at: null }).select('_id name username');
 
     if (masters.length === 0) {
       return res.status(200).json({ success: true, data: [] });
     }
 
     const masterIds = masters.map(m => m._id);
+    
+    // For each top-level master, get all descendant master IDs (sub-masters)
+    const { getAllSubMasterIds } = require('../services/masterHierarchyService');
+    const masterToAllIds = {};
+    for (const m of masters) {
+      const allIds = await getAllSubMasterIds(m._id.toString());
+      masterToAllIds[m._id.toString()] = allIds;
+    }
+
+    // Get all users across all masters and their sub-masters
+    const allMasterIds = new Set();
+    masterIds.forEach(id => allMasterIds.add(id.toString()));
+    for (const ids of Object.values(masterToAllIds)) {
+      ids.forEach(id => allMasterIds.add(id));
+    }
+
     const allUsers = await User.find({
-      master_id: { $in: masterIds },
+      master_id: { $in: [...allMasterIds] },
       deleted_at: null
     }).select('_id master_id credits');
 
+    // Group users by top-level master (including sub-masters' users)
     const usersByMaster = {};
-    allUsers.forEach(u => {
-      const mid = u.master_id.toString();
-      if (!usersByMaster[mid]) usersByMaster[mid] = [];
-      usersByMaster[mid].push(u);
-    });
+    for (const master of masters) {
+      const mid = master._id.toString();
+      const allIds = new Set([mid, ...(masterToAllIds[mid] || [])]);
+      usersByMaster[mid] = allUsers.filter(u => allIds.has(u.master_id.toString()));
+    }
 
     const result = await Promise.all(masters.map(async (master) => {
       const mid = master._id.toString();

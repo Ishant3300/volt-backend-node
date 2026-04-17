@@ -478,9 +478,8 @@ const creditUser = async (req, res) => {
       // Master pays from balance
       master.equity -= amount;
 
-      // User receives in balance; credits only rises if balance exceeds it
-      user.equity += amount;
-      user.credits = Math.max(user.credits, user.equity);
+      // User receives in credits
+      user.credits += amount;
 
       await master.save({ session });
       await user.save({ session });
@@ -558,6 +557,15 @@ const creditUser = async (req, res) => {
 
     session.endSession();
 
+    // Rebuild metricsEngine cache so credit change is reflected in live metrics
+    try {
+      const metricsEngine = require('../services/metricsEngine');
+      if (resultData?.user?.current_credits !== undefined) {
+        const userId = id;
+        metricsEngine.onTradeExecuted(userId);
+      }
+    } catch (_) {}
+
     res.status(200).json({
       success: true,
       message: 'Credit added successfully',
@@ -604,9 +612,9 @@ const debitUser = async (req, res) => {
 
       if (!user) throw new Error('User not found');
 
-      // User pays from their balance, not credits
-      if (user.equity < amount) {
-        throw new Error('Insufficient balance on user account');
+      // User pays from their credits
+      if (user.credits < amount) {
+        throw new Error('Insufficient credits on user account');
       }
 
       const master = await Master.findById(req.master.id).session(session);
@@ -618,8 +626,8 @@ const debitUser = async (req, res) => {
       const previousMasterCredits = master.credits;
       const previousMasterBalance = master.equity;
 
-      // Deduct from user's balance only; credits stay unchanged
-      user.equity -= amount;
+      // Deduct from user's credits
+      user.credits -= amount;
 
       // Add back to master's working balance (master's credits remain unaffected)
       master.equity += amount;
@@ -699,6 +707,13 @@ const debitUser = async (req, res) => {
     });
 
     session.endSession();
+
+    // Rebuild metricsEngine cache so credit change is reflected in live metrics
+    try {
+      const metricsEngine = require('../services/metricsEngine');
+      const userId = id;
+      metricsEngine.onTradeExecuted(userId);
+    } catch (_) {}
 
     res.status(200).json({
       success: true,

@@ -29,6 +29,14 @@ const adminSchema = new mongoose.Schema({
   fcm_tokens: {
     type: [String],
     default: []
+  },
+  totp_enabled: {
+    type: Boolean,
+    default: false
+  },
+  totp_secret: {
+    type: String,
+    default: null
   }
 }, {
   timestamps: true
@@ -40,6 +48,7 @@ adminSchema.set('toJSON', {
     ret.id = ret._id;
     delete ret._id;
     delete ret.__v;
+    delete ret.totp_secret;
     ret.created_at = ret.createdAt;
     ret.updated_at = ret.updatedAt;
     delete ret.createdAt;

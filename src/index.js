@@ -19,11 +19,17 @@ const server = http.createServer(app);
 
 // ── Security Middleware ──────────────────────────────────────────────────────
 
+// Helper: skip middleware for WebSocket upgrade path
+const skipForWs = (middleware) => (req, res, next) => {
+  if (req.url === '/ws/live-prices') return next();
+  return middleware(req, res, next);
+};
+
 // Security headers (CSP, X-Frame-Options, HSTS, X-Content-Type-Options, etc.)
-app.use(helmet({
+app.use(skipForWs(helmet({
   contentSecurityPolicy: false, // Disable CSP for API-only server
   crossOriginEmbedderPolicy: false,
-}));
+})));
 
 // CORS — restrict origins in production
 const allowedOrigins = process.env.ALLOWED_ORIGINS
@@ -58,7 +64,7 @@ const globalLimiter = rateLimit({
   legacyHeaders: false,
   message: { success: false, message: 'Too many requests, please try again later' },
 });
-app.use(globalLimiter);
+app.use(skipForWs(globalLimiter));
 
 // Connect to database (awaited in server.listen callback)
 // connectDatabase() is called inside server.listen to ensure proper ordering
@@ -152,6 +158,21 @@ app.use((err, req, res, _next) => {
   });
 });
 
+// Initialize WebSocket live price service BEFORE server.listen
+// so the upgrade handler is registered before any connections arrive
+livePriceService.init(server);
+
+// Handle WebSocket upgrade manually to bypass Express middleware
+server.on('upgrade', (request, socket, head) => {
+  if (request.url === '/ws/live-prices') {
+    livePriceService.wss.handleUpgrade(request, socket, head, (ws) => {
+      livePriceService.wss.emit('connection', ws, request);
+    });
+  } else {
+    socket.destroy();
+  }
+});
+
 // Start server
 const PORT = process.env.PORT || 5000;
 server.listen(PORT, async () => {
@@ -172,8 +193,11 @@ server.listen(PORT, async () => {
   // Initialize Redis connection
   try {
     redisService.init();
-    // Give Redis a moment to connect before proceeding
-    await new Promise(resolve => setTimeout(resolve, 1000));
+    // Wait for Redis to be ready (up to 5 seconds)
+    for (let i = 0; i < 10; i++) {
+      await new Promise(resolve => setTimeout(resolve, 500));
+      if (redisService.isAvailable()) break;
+    }
 
     if (redisService.isAvailable()) {
       // Bootstrap: sync pending orders from MongoDB into Redis order book
@@ -189,8 +213,6 @@ server.listen(PORT, async () => {
     console.error('⚠️  Redis init error:', err.message, '– falling back to DB polling');
   }
 
-  // Initialize WebSocket live price service
-  livePriceService.init(server);
   console.log('📡 Live price WebSocket ready at ws://localhost:' + PORT + '/ws/live-prices');
 
   // Initialize synthetic instruments (e.g. BHUJ NIFTY)

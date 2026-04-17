@@ -1,146 +1,122 @@
 /**
- * Admin OTP Service
+ * Admin TOTP Service
  *
- * Generates and verifies OTPs for admin login without DB storage.
- * Uses HMAC signing: hash(adminId + otp + expiry) → sent to client as opaque token.
- * Client sends back (otp + token) → server re-hashes and compares.
+ * Uses speakeasy for TOTP generation/verification with authenticator apps
+ * (Google Authenticator, Microsoft Authenticator, etc.)
  *
- * OTP is sent via Firebase Admin SDK to the admin's registered phone number.
+ * Flow:
+ * 1. Admin enables TOTP → generate secret → show QR → admin scans → verifies first code → activated
+ * 2. On login: if totp_enabled, ask for TOTP code → verify → issue JWT
+ * 3. Reset: clear secret, disable TOTP → admin can re-setup
  */
 
-const crypto = require('crypto');
+const speakeasy = require('speakeasy');
+const QRCode = require('qrcode');
+const Admin = require('../models/Admin');
 
-const OTP_SECRET = process.env.JWT_SECRET + '_OTP_SALT';
-const OTP_EXPIRY_MS = 5 * 60 * 1000; // 5 minutes
-
-// Hardcoded admin → phone mapping
-const ADMIN_PHONES = {
-  'admin': '+917990638761',
-  'Ishantapex33': '+918780804062',
-  'nisheetapex97': '+919173380394',
-};
+const ISSUER = 'APEX Trading';
 
 /**
- * Generate a 6-digit OTP and a signed verification token.
- * @returns {{ otp: string, otpToken: string, expiresAt: number }}
+ * Generate a new TOTP secret and QR code data URL for an admin.
+ * Saves the secret to DB (not yet activated — totp_enabled stays false until verify-setup).
  */
-function generateOtp(adminId) {
-  const otp = String(Math.floor(100000 + Math.random() * 900000)); // 6 digits
-  const expiresAt = Date.now() + OTP_EXPIRY_MS;
-  const payload = `${adminId}:${otp}:${expiresAt}`;
-  const hmac = crypto.createHmac('sha256', OTP_SECRET).update(payload).digest('hex');
-  const otpToken = `${hmac}:${expiresAt}`;
-  return { otp, otpToken, expiresAt };
+async function generateSecret(adminId) {
+  const admin = await Admin.findById(adminId);
+  if (!admin) throw new Error('Admin not found');
+
+  const secret = speakeasy.generateSecret({
+    name: `${ISSUER} (${admin.username})`,
+    issuer: ISSUER,
+    length: 20,
+  });
+
+  // Save secret (not activated yet)
+  admin.totp_secret = secret.base32;
+  await admin.save();
+
+  // Generate QR code as data URL (base64 PNG)
+  const qrDataUrl = await QRCode.toDataURL(secret.otpauth_url);
+
+  return {
+    qrDataUrl,
+    secret: secret.base32, // for manual entry fallback
+    otpauthUrl: secret.otpauth_url,
+  };
 }
 
 /**
- * Verify an OTP against the signed token.
- * @returns {boolean}
+ * Verify the first TOTP code after QR scan — activates TOTP for the admin.
  */
-function verifyOtp(adminId, otp, otpToken) {
-  if (!otpToken || !otp) return false;
-  const parts = otpToken.split(':');
-  if (parts.length !== 2) return false;
+async function verifySetup(adminId, token) {
+  const admin = await Admin.findById(adminId).select('+totp_secret');
+  if (!admin || !admin.totp_secret) throw new Error('No TOTP secret configured');
 
-  const [receivedHmac, expiresAtStr] = parts;
-  const expiresAt = parseInt(expiresAtStr, 10);
+  const verified = speakeasy.totp.verify({
+    secret: admin.totp_secret,
+    encoding: 'base32',
+    token,
+    window: 1, // ±30 sec clock drift
+  });
 
-  // Check expiry
-  if (Date.now() > expiresAt) return false;
+  if (!verified) return false;
 
-  // Recompute HMAC
-  const payload = `${adminId}:${otp}:${expiresAt}`;
-  const expectedHmac = crypto.createHmac('sha256', OTP_SECRET).update(payload).digest('hex');
-
-  return crypto.timingSafeEqual(Buffer.from(receivedHmac), Buffer.from(expectedHmac));
+  admin.totp_enabled = true;
+  await admin.save();
+  return true;
 }
 
 /**
- * Send OTP to admin's phone via Firebase Cloud Messaging.
- * Since we can't send SMS directly via Firebase Admin SDK,
- * we send a push notification with the OTP to the admin's device.
+ * Verify TOTP code during login.
  */
-async function sendOtp(username, otp, requestFcmToken) {
-  const phone = ADMIN_PHONES[username];
-  if (!phone) {
-    console.warn(`[AdminOTP] No phone configured for admin: ${username}`);
-    return false;
-  }
+async function verifyLogin(adminId, token) {
+  const admin = await Admin.findById(adminId).select('+totp_secret');
+  if (!admin || !admin.totp_secret) return false;
 
-  try {
-    const firebaseService = require('./firebaseService');
-    const Admin = require('../models/Admin');
+  return speakeasy.totp.verify({
+    secret: admin.totp_secret,
+    encoding: 'base32',
+    token,
+    window: 1,
+  });
+}
 
-    // If the requesting device sent its FCM token, send OTP directly to it
-    if (requestFcmToken) {
-      try {
-        await firebaseService.sendRawNotification(requestFcmToken, {
-          title: 'APEX Login OTP',
-          body: `Your OTP is: ${otp}. Valid for 5 minutes.`,
-        });
-        console.log(`[AdminOTP] OTP sent via FCM to ${username} (requesting device)`);
-        return true;
-      } catch (err) {
-        console.warn(`[AdminOTP] Requesting device token failed: ${err.message}`);
-        // Don't return — fall through to stored tokens
-      }
-    }
+/**
+ * Reset TOTP — clears secret and disables TOTP.
+ */
+async function resetTotp(adminId) {
+  await Admin.findByIdAndUpdate(adminId, {
+    totp_secret: null,
+    totp_enabled: false,
+  });
+}
 
-    // Fallback: try all stored FCM tokens, remove stale ones
-    const admin = await Admin.findOne({ username }).select('fcm_tokens').lean();
-    const fcmTokens = admin?.fcm_tokens || [];
-
-    if (fcmTokens.length === 0) {
-      console.log(`[AdminOTP] ⚠️ No FCM tokens for ${username}. OTP: ${otp} (phone: ${phone})`);
-      return true;
-    }
-
-    let sentCount = 0;
-    const staleTokens = [];
-
-    for (const token of fcmTokens) {
-      try {
-        await firebaseService.sendRawNotification(token, {
-          title: 'APEX Login OTP',
-          body: `Your OTP is: ${otp}. Valid for 5 minutes.`,
-        });
-        sentCount++;
-      } catch (err) {
-        const msg = err.message || '';
-        if (msg.includes('NotRegistered') || msg.includes('not found') || msg.includes('UNREGISTERED')) {
-          staleTokens.push(token);
-        }
-      }
-    }
-
-    // Clean up stale tokens from DB
-    if (staleTokens.length > 0) {
-      await Admin.updateOne({ username }, { $pull: { fcm_tokens: { $in: staleTokens } } });
-      console.log(`[AdminOTP] 🧹 Removed ${staleTokens.length} stale FCM token(s) for ${username}`);
-    }
-
-    if (sentCount > 0) {
-      console.log(`[AdminOTP] OTP sent via FCM to ${username} (${sentCount}/${fcmTokens.length} device(s))`);
-    } else {
-      console.log(`[AdminOTP] ⚠️ All FCM tokens failed for ${username}. OTP: ${otp} (phone: ${phone})`);
-    }
-
-    return true;
-  } catch (err) {
-    console.error(`[AdminOTP] Error sending OTP: ${err.message}`);
-    console.log(`[AdminOTP] FALLBACK — OTP for ${username}: ${otp}`);
-    return true;
+/**
+ * Toggle TOTP enabled/disabled for an admin.
+ * If disabling, also clears the secret.
+ */
+async function toggleTotp(adminId, enabled) {
+  if (!enabled) {
+    await Admin.findByIdAndUpdate(adminId, {
+      totp_enabled: false,
+      totp_secret: null,
+    });
+  } else {
+    await Admin.findByIdAndUpdate(adminId, {
+      totp_enabled: true,
+    });
   }
 }
 
 /**
- * Get the phone number for an admin (masked for display).
+ * Get TOTP status for an admin.
  */
-function getMaskedPhone(username) {
-  const phone = ADMIN_PHONES[username];
-  if (!phone) return null;
-  // Show last 4 digits: +91 ****3984
-  return phone.slice(0, 4) + '****' + phone.slice(-4);
+async function getTotpStatus(adminId) {
+  const admin = await Admin.findById(adminId).select('totp_enabled totp_secret');
+  if (!admin) return null;
+  return {
+    enabled: admin.totp_enabled || false,
+    configured: !!admin.totp_secret,
+  };
 }
 
-module.exports = { generateOtp, verifyOtp, sendOtp, getMaskedPhone, ADMIN_PHONES };
+module.exports = { generateSecret, verifySetup, verifyLogin, resetTotp, toggleTotp, getTotpStatus };
