@@ -9,8 +9,8 @@ const KiteInstrument = require('../src/models/KiteInstrument');
 // CONFIGURATION
 // ══════════════════════════════════════════════════════════════════════════════
 
-// Allowed exchanges for derivatives (FUT, CE, PE)
-const ALLOWED_EXCHANGES = ['BFO', 'NFO', 'MCX'];
+// Path to the master list of allowed instruments
+const ACTIVE_INSTRUMENTS_CSV = path.join(__dirname, 'required_scripts', 'active_instruments (UPDATED).csv');
 
 // ══════════════════════════════════════════════════════════════════════════════
 // MCX LOT SIZES — from official MCX contract specifications table
@@ -21,6 +21,7 @@ const MCX_LOT_SIZES = {
   'GOLD':        100,
   'GOLDM':       10,
   'GOLDPETAL':   1,
+  'GOLDTEN':     10,
   'SILVER':      30,
   'SILVERM':     5,
   'SILVERMIC':   1,
@@ -31,12 +32,16 @@ const MCX_LOT_SIZES = {
   'CRUDEOILM':   10,
   'NATURALGAS':  1250,
   'NATGAS':      1250,
+  'NATGASMINI':  250,
   'ALUMINIUM':   5000,
   'ALUMINIUMM':  1000,
+  'ALUMINI':     1000,
   'ZINC':        5000,
   'ZINCM':       1000,
+  'ZINCMINI':    1000,
   'LEAD':        5000,
   'LEADM':       1000,
+  'LEADMINI':    1000,
   'NICKEL':      1500,
   'NICKELM':     100,
   'COTTON':      25,
@@ -58,9 +63,6 @@ function getMcxLotSize(name) {
   return null;
 }
 
-// Allowed instrument types for derivatives
-const ALLOWED_INSTRUMENT_TYPES = ['FUT', 'CE', 'PE'];
-
 // Global indices name mapping for user-friendly display
 const GLOBAL_INDICES_MAP = {
   'US 100': 'Nasdaq 100',
@@ -81,34 +83,48 @@ const GLOBAL_INDICES_MAP = {
   'NIFTY FIN SERVICE': 'Nifty Financial Services',
   'NIFTY MIDCAP 50': 'Nifty Midcap 50',
   'NIFTY IT': 'Nifty IT',
-  'NIFTY NEXT 50': 'Nifty Next 50'
+  'NIFTY NEXT 50': 'Nifty Next 50',
+  'GIFT NIFTY': 'Gift Nifty',
 };
+
+// ══════════════════════════════════════════════════════════════════════════════
+// LOAD ALLOWED INSTRUMENTS FROM CSV
+// ══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Load the set of allowed raw_name values from the active instruments CSV.
+ * Only instruments whose `name` matches one of these will be kept.
+ */
+function loadAllowedRawNames() {
+  if (!fs.existsSync(ACTIVE_INSTRUMENTS_CSV)) {
+    console.error(`❌ Active instruments CSV not found: ${ACTIVE_INSTRUMENTS_CSV}`);
+    process.exit(1);
+  }
+
+  const csvText = fs.readFileSync(ACTIVE_INSTRUMENTS_CSV, 'utf8');
+  const lines = csvText.trim().split('\n');
+  const headers = lines[0].split(',').map(h => h.trim());
+  const rawNameIdx = headers.indexOf('raw_name');
+
+  if (rawNameIdx === -1) {
+    console.error('❌ CSV missing "raw_name" column');
+    process.exit(1);
+  }
+
+  const allowedNames = new Set();
+  for (let i = 1; i < lines.length; i++) {
+    const values = lines[i].split(',');
+    const rawName = (values[rawNameIdx] || '').trim();
+    if (rawName) allowedNames.add(rawName.toUpperCase());
+  }
+
+  console.log(`📋 Loaded ${allowedNames.size} allowed instrument names from CSV.`);
+  return allowedNames;
+}
 
 // ══════════════════════════════════════════════════════════════════════════════
 // HELPER FUNCTIONS
 // ══════════════════════════════════════════════════════════════════════════════
-
-/**
- * Check if instrument passes the filter criteria
- * - Derivatives (FUT, CE, PE) from BFO, NFO, MCX
- * - Global indices from INDICES segment
- */
-function shouldIncludeInstrument(instrument) {
-  // Include global indices (NSE and NSEIX exchanges)
-  if (instrument.segment === 'INDICES' && (instrument.exchange === 'NSE' || instrument.exchange === 'NSEIX')) {
-    return true;
-  }
-  
-  // Include derivatives from allowed exchanges
-  if (
-    ALLOWED_INSTRUMENT_TYPES.includes(instrument.instrument_type) &&
-    ALLOWED_EXCHANGES.includes(instrument.exchange)
-  ) {
-    return true;
-  }
-  
-  return false;
-}
 
 /**
  * Generate display name for an instrument
@@ -133,7 +149,6 @@ function generateDisplayName(instrument) {
     if (instrument.instrument_type === 'FUT') {
       return `${baseName} FUT ${expiryStr}`.trim();
     } else {
-      // Options: include strike price
       const strike = instrument.strike || '';
       return `${baseName} ${strike} ${instrument.instrument_type} ${expiryStr}`.trim();
     }
@@ -143,16 +158,15 @@ function generateDisplayName(instrument) {
 }
 
 /**
- * Parse CSV and apply filtering + mapping
+ * Parse CSV and filter instruments based on the allowed raw_name set.
  */
-function parseAndFilterInstruments(csvText) {
+function parseAndFilterInstruments(csvText, allowedNames) {
   const lines = csvText.trim().split('\n');
   const headers = lines[0].split(',').map(h => h.trim());
   
   console.log('📋 CSV Headers:', headers.slice(0, 12).join(', '));
   
   const instruments = [];
-  const unmappedIndices = [];
   const stats = {
     total: 0,
     filtered: 0,
@@ -189,8 +203,9 @@ function parseAndFilterInstruments(csvText) {
 
     stats.total++;
 
-    // Apply filter
-    if (!shouldIncludeInstrument(instrument)) {
+    // Filter: only keep instruments whose name matches the allowed list
+    const instName = (instrument.name || '').toUpperCase().trim();
+    if (!allowedNames.has(instName)) {
       stats.filtered++;
       continue;
     }
@@ -198,7 +213,7 @@ function parseAndFilterInstruments(csvText) {
     // Store raw name before mapping
     instrument.raw_name = instrument.name;
     
-    // Override lot_size for MCX instruments (Zerodha CSV has lot_size=1 for all MCX)
+    // Override lot_size for MCX instruments
     if (instrument.exchange === 'MCX') {
       const correctLotSize = getMcxLotSize(instrument.name);
       if (correctLotSize !== null) {
@@ -209,47 +224,34 @@ function parseAndFilterInstruments(csvText) {
     // Generate display name
     instrument.display_name = generateDisplayName(instrument);
     
-    // Track unmapped indices
-    if (instrument.segment === 'INDICES' && instrument.display_name === instrument.raw_name) {
-      if (!GLOBAL_INDICES_MAP[instrument.name] && !GLOBAL_INDICES_MAP[instrument.tradingsymbol]) {
-        unmappedIndices.push({ name: instrument.name, symbol: instrument.tradingsymbol });
-      }
-    }
-    
-    // Set is_active flag (all newly fetched instruments are active)
+    // Set is_active flag
     instrument.is_active = true;
     instrument.updated_at = new Date();
 
     // Update stats
     if (instrument.segment === 'INDICES') {
       stats.indices++;
-    } else if (ALLOWED_INSTRUMENT_TYPES.includes(instrument.instrument_type)) {
-      stats.derivatives[instrument.instrument_type]++;
+    } else if (['FUT', 'CE', 'PE'].includes(instrument.instrument_type)) {
+      stats.derivatives[instrument.instrument_type] = (stats.derivatives[instrument.instrument_type] || 0) + 1;
     }
     
     const exch = instrument.exchange;
     if (!stats.byExchange[exch]) {
-      stats.byExchange[exch] = { FUT: 0, CE: 0, PE: 0, INDICES: 0, total: 0 };
+      stats.byExchange[exch] = { FUT: 0, CE: 0, PE: 0, INDICES: 0, OTHER: 0, total: 0 };
     }
     stats.byExchange[exch].total++;
     if (instrument.segment === 'INDICES') {
       stats.byExchange[exch].INDICES++;
-    } else {
+    } else if (stats.byExchange[exch][instrument.instrument_type] !== undefined) {
       stats.byExchange[exch][instrument.instrument_type]++;
+    } else {
+      stats.byExchange[exch].OTHER++;
     }
 
     instruments.push(instrument);
   }
 
-  // Log unmapped indices for manual review
-  if (unmappedIndices.length > 0) {
-    console.log('\n⚠️  Unmapped Global Indices (need to add to GLOBAL_INDICES_MAP):');
-    unmappedIndices.forEach(idx => {
-      console.log(`   - "${idx.name}": "${idx.name}", // ${idx.symbol}`);
-    });
-  }
-
-  return { instruments, stats, unmappedIndices };
+  return { instruments, stats };
 }
 
 /**
@@ -274,6 +276,53 @@ function deduplicateByToken(instruments) {
   return Array.from(seen.values());
 }
 
+/**
+ * Keep only the nearest (closest future) expiry for each instrument group.
+ * Matches the same logic used by instrumentSearchService on the backend:
+ *   - FUT: key = raw_name|FUT → nearest expiry
+ *   - CE/PE: key = raw_name|CE|strike or raw_name|PE|strike → nearest expiry per strike
+ *   - INDICES / no expiry: always included
+ *
+ * Expired instruments (expiry < today) are excluded entirely.
+ */
+function filterNearestExpiry(instruments) {
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+
+  const nearestMap = new Map();
+
+  for (const inst of instruments) {
+    // Non-expiring instruments (indices, etc.) — always include
+    if (!inst.expiry || inst.segment === 'INDICES') {
+      nearestMap.set(inst.instrument_token, inst);
+      continue;
+    }
+
+    // Skip expired instruments
+    const expiryDate = new Date(inst.expiry);
+    if (expiryDate < today) continue;
+
+    const rawName = (inst.raw_name || inst.name || '').toUpperCase();
+    const type = (inst.instrument_type || '').toUpperCase();
+    const exchange = (inst.exchange || '').toUpperCase();
+    const strikeKey = (type === 'CE' || type === 'PE') ? `|${inst.strike}` : '';
+    const key = `${rawName}|${exchange}|${type}${strikeKey}`;
+
+    const existing = nearestMap.get(key);
+    if (!existing) {
+      nearestMap.set(key, inst);
+    } else {
+      const existingExpiry = new Date(existing.expiry).getTime();
+      const newExpiry = expiryDate.getTime();
+      if (newExpiry < existingExpiry) {
+        nearestMap.set(key, inst);
+      }
+    }
+  }
+
+  return [...nearestMap.values()];
+}
+
 // ══════════════════════════════════════════════════════════════════════════════
 // MAIN FUNCTION
 // ══════════════════════════════════════════════════════════════════════════════
@@ -282,12 +331,13 @@ async function fetchInstruments() {
   try {
     console.log('═══════════════════════════════════════════════════════════════');
     console.log('  INSTRUMENT FETCH & SYNC');
-    console.log('  Filtering: FUT, CE, PE from BFO, NFO, MCX + Global Indices');
+    console.log('  Filtering based on: active_instruments (UPDATED).csv');
     console.log('═══════════════════════════════════════════════════════════════\n');
 
-    console.log('🔌 Connecting to MongoDB...');
-    console.log('   URI:', process.env.MONGO_URI ? 'Found' : 'NOT FOUND');
+    // Load allowed instrument names from CSV
+    const allowedNames = loadAllowedRawNames();
 
+    console.log('🔌 Connecting to MongoDB...');
     if (!process.env.MONGO_URI) {
       throw new Error('MONGO_URI not found in environment variables');
     }
@@ -299,13 +349,11 @@ async function fetchInstruments() {
     const downloadsDir = path.join(__dirname, 'downloads');
     if (!fs.existsSync(downloadsDir)) {
       fs.mkdirSync(downloadsDir, { recursive: true });
-      console.log('📁 Created downloads directory');
     }
 
     console.log('📊 Fetching ALL instruments from Kite API...');
     console.log('   This may take a few minutes...\n');
 
-    // Fetch all instruments
     const csvData = await kiteService.fetchInstrumentsFromKite();
     
     // Save raw CSV for reference
@@ -315,18 +363,23 @@ async function fetchInstruments() {
     fs.writeFileSync(rawFilepath, csvData, 'utf8');
     console.log(`💾 Saved raw CSV: ${rawFilename}`);
 
-    // Parse and filter instruments
+    // Parse and filter instruments using the allowed names list
     console.log('\n🔍 Parsing and filtering instruments...');
-    const { instruments, stats, unmappedIndices } = parseAndFilterInstruments(csvData);
+    const { instruments, stats } = parseAndFilterInstruments(csvData, allowedNames);
     
+    // Keep only nearest expiry per instrument group (same as search service)
+    console.log('\n📅 Filtering to nearest expiry per instrument...');
+    const nearestExpiry = filterNearestExpiry(instruments);
+    console.log(`   Before: ${instruments.length} → After: ${nearestExpiry.length} (nearest expiry only)`);
+
     // Deduplicate by token
-    const uniqueInstruments = deduplicateByToken(instruments);
+    const uniqueInstruments = deduplicateByToken(nearestExpiry);
     
     console.log('\n📊 Filter Results:');
     console.log(`   Total in CSV: ${stats.total}`);
     console.log(`   Filtered out: ${stats.filtered}`);
     console.log(`   Kept: ${uniqueInstruments.length}`);
-    console.log(`   - Derivatives: FUT=${stats.derivatives.FUT}, CE=${stats.derivatives.CE}, PE=${stats.derivatives.PE}`);
+    console.log(`   - Derivatives: FUT=${stats.derivatives.FUT || 0}, CE=${stats.derivatives.CE || 0}, PE=${stats.derivatives.PE || 0}`);
     console.log(`   - Indices: ${stats.indices}`);
 
     // Save filtered CSV
@@ -341,8 +394,7 @@ async function fetchInstruments() {
     fs.writeFileSync(filteredFilepath, [filteredHeaders, ...filteredRows].join('\n'), 'utf8');
     console.log(`💾 Saved filtered CSV: ${filteredFilename}`);
 
-    // Upsert instruments — preserve existing _id for known tokens, insert new ones
-    // This ensures instrument_token stays the stable key and _id never changes.
+    // Upsert instruments
     console.log(`\n💾 Upserting ${uniqueInstruments.length} instruments (preserving existing IDs)...`);
 
     const BATCH_SIZE = 500;
@@ -355,11 +407,7 @@ async function fetchInstruments() {
         const { instrument_token, lot_size, ...rest } = inst;
         const setFields = { ...rest };
 
-        // For new inserts: always set instrument_token + lot_size via $setOnInsert
-        // For existing docs: only overwrite lot_size if incoming value > 1
-        //   (preserves patched MCX lot sizes when Zerodha sends 1)
         if (lot_size > 1) {
-          // Real lot size — put in $set so it updates existing docs too
           setFields.lot_size = lot_size;
           return {
             updateOne: {
@@ -372,7 +420,6 @@ async function fetchInstruments() {
             }
           };
         } else {
-          // Default lot_size=1 from Zerodha — only set on new inserts, don't overwrite existing
           return {
             updateOne: {
               filter: { instrument_token },
@@ -396,7 +443,7 @@ async function fetchInstruments() {
     }
 
     // Mark instruments no longer in Kite's feed as inactive
-    // Exclude synthetic tokens (9999xxx) and GLOBAL exchange instruments (manually seeded)
+    // Exclude synthetic tokens (9999xxx) and GLOBAL/SGX exchange instruments (manually seeded)
     const activeTokens = uniqueInstruments.map(i => i.instrument_token);
     const deactivated = await KiteInstrument.updateMany(
       { instrument_token: { $nin: activeTokens, $not: /^9999/ }, exchange: { $nin: ['GLOBAL', 'SGX'] }, is_active: true },
@@ -417,16 +464,10 @@ async function fetchInstruments() {
     for (const [exchange, breakdown] of Object.entries(stats.byExchange)) {
       console.log(`   ${exchange}:`);
       console.log(`      Total: ${breakdown.total}`);
-      if (breakdown.INDICES > 0) {
-        console.log(`      Indices: ${breakdown.INDICES}`);
-      }
+      if (breakdown.INDICES > 0) console.log(`      Indices: ${breakdown.INDICES}`);
       if (breakdown.FUT > 0 || breakdown.CE > 0 || breakdown.PE > 0) {
         console.log(`      FUT: ${breakdown.FUT}, CE: ${breakdown.CE}, PE: ${breakdown.PE}`);
       }
-    }
-
-    if (unmappedIndices.length > 0) {
-      console.log(`\n⚠️  ${unmappedIndices.length} unmapped indices need manual mapping`);
     }
 
     await mongoose.connection.close();

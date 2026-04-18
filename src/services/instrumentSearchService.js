@@ -156,9 +156,10 @@ const _buildAndSetCache = async () => {
     }
     const rawName = inst.raw_name || inst.name || '';
     const type = inst.instrument_type || '';
+    const exchange = inst.exchange || '';
     // For options, include strike in the key so each strike is separate
     const strikeKey = (type === 'CE' || type === 'PE') ? `|${inst.strike}` : '';
-    const key = `${rawName}|${type}${strikeKey}`;
+    const key = `${rawName}|${exchange}|${type}${strikeKey}`;
     const existing = nearestMap.get(key);
     if (!existing) {
       nearestMap.set(key, inst);

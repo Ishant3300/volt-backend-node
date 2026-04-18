@@ -600,7 +600,6 @@ class LivePriceService {
               return { tokenStr, closePrice, open: lastCandle.open, high: lastCandle.high, low: lastCandle.low };
             })
           );
-
           for (const result of results) {
             if (result.status !== 'fulfilled' || !result.value) {
               if (result.status === 'rejected') failed++;

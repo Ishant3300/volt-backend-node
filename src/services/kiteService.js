@@ -652,21 +652,20 @@ class KiteService {
    * @param {string} fromDate - Start date (YYYY-MM-DD)
    * @param {string} toDate - End date (YYYY-MM-DD)
    */
-  async getHistoricalData(instrumentToken, interval, fromDate, toDate) {
+  async getHistoricalData(instrumentToken, interval, fromDate, toDate, { silent = false } = {}) {
     try {
       const accessToken = await this.getStoredAccessToken();
       if (!accessToken) {
         throw new Error('Not authenticated with Kite');
       }
 
-      // Kite API expects the format: /instruments/historical/{instrument_token}/{interval}
-      // Query params: from, to, continuous (optional), oi (optional)
       const url = `${this.baseUrl}/instruments/historical/${instrumentToken}/${interval}`;
       
-      console.log(`📊 Fetching historical data from Kite API`);
-      console.log(`   URL: ${url}`);
-      console.log(`   From: ${fromDate}, To: ${toDate}`);
-      console.log(`   Access Token: ${accessToken.substring(0, 20)}...`);
+      if (!silent) {
+        console.log(`📊 Fetching historical data from Kite API`);
+        console.log(`   URL: ${url}`);
+        console.log(`   From: ${fromDate}, To: ${toDate}`);
+      }
 
       const response = await axios.get(url, {
         params: {
@@ -694,16 +693,18 @@ class KiteService {
           oi: candle[6] || 0
         }));
 
-        console.log(`✅ Fetched ${transformedCandles.length} candles from Kite`);
+        if (!silent) console.log(`✅ Fetched ${transformedCandles.length} candles from Kite`);
         return transformedCandles;
       }
 
       return [];
     } catch (error) {
-      console.error('❌ Error fetching historical data:', error.message);
-      if (error.response) {
-        console.error('   Response status:', error.response.status);
-        console.error('   Response data:', JSON.stringify(error.response.data, null, 2));
+      if (!silent) {
+        console.error('❌ Error fetching historical data:', error.message);
+        if (error.response) {
+          console.error('   Response status:', error.response.status);
+          console.error('   Response data:', JSON.stringify(error.response.data, null, 2));
+        }
       }
       throw error;
     }

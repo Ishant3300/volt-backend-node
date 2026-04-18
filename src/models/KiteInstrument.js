@@ -89,7 +89,6 @@ kiteInstrumentSchema.set('toJSON', {
 // ══════════════════════════════════════════════════════════════════════════════
 
 // Primary lookup indexes
-kiteInstrumentSchema.index({ instrument_token: 1 }, { unique: true });
 kiteInstrumentSchema.index({ exchange_token: 1 });
 kiteInstrumentSchema.index({ tradingsymbol: 1 });
 kiteInstrumentSchema.index({ name: 1 });

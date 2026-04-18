@@ -21,7 +21,7 @@ class CronService {
 
         // Fetch & sync instruments from Kite every day at 8:00 AM
         // Runs fetchInstruments.js in a child process (it calls process.exit internally)
-        const fetchInstrumentsJob = cron.schedule('0 8 * * *', () => {
+        const fetchInstrumentsJob = cron.schedule('30 7 * * *', () => {
             console.log('📡 [CRON] Starting daily instrument fetch...');
             const scriptPath = path.join(__dirname, '../../scripts/fetchInstruments.js');
             const child = fork(scriptPath, [], { silent: true });
@@ -77,6 +77,35 @@ class CronService {
 
         this.jobs.push(limitOrderCheck);
 
+        // ── Kite Token Refresh ─────────────────────────────────────────
+        // Check every hour if the Kite access token is still valid.
+        // If expired or expiring soon, perform automated login (same as server startup).
+        const kiteTokenRefresh = cron.schedule('0 * * * *', async () => {
+            try {
+                const kiteAuthService = require('./kiteAuthService');
+                const status = await kiteAuthService.checkTokenStatus();
+
+                if (status.valid) {
+                    console.log(`🔐 [CRON] Kite token OK (valid for ${status.hoursLeft} hours).`);
+                    return;
+                }
+
+                console.log(`⚠️  [CRON] Kite token not valid: ${status.reason}. Attempting auto-login...`);
+                const loginResult = await kiteAuthService.performAutomatedLogin();
+
+                if (loginResult.success) {
+                    console.log('✅ [CRON] Kite auto-login successful! Reconnecting WebSocket...');
+                    // Reconnect the Kite WebSocket with the fresh token
+                    try { livePriceService._connectToKite(); } catch (_) {}
+                } else {
+                    console.error('❌ [CRON] Kite auto-login failed:', loginResult.error);
+                }
+            } catch (error) {
+                console.error('❌ [CRON] Error during Kite token refresh:', error.message);
+            }
+        });
+        this.jobs.push(kiteTokenRefresh);
+
         // ── Settlement Price Refresh Schedule ────────────────────────────
         //
         // NSE: settlement available in Kite Historical API by ~6 PM same day
@@ -115,7 +144,7 @@ class CronService {
         // Saturday 9:00 AM IST — after all markets close (MCX closes ~11:30 PM Friday)
         // 1. Cancels all pending orders (limit/SL expired)
         // 2. Carries forward open positions at Friday's close price (ATP reset)
-        const weekendCarryForward = cron.schedule('0 9 * * 6', async () => {
+        const weekendCarryForward = cron.schedule('0 18 * * *', async () => {
             console.log('🔄 [CRON] Starting Weekend Carry Forward...');
             try {
                 const { runWeekendCarryForward } = require('./weekendCarryForwardService');
