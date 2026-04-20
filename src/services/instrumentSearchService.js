@@ -130,9 +130,11 @@ const _buildAndSetCache = async () => {
   const today = new Date();
   today.setHours(0, 0, 0, 0);
 
-  // Single optimized query: only active, non-expired derivatives + indices + global
+  // Single optimized query: only active, enabled, non-expired derivatives + indices + global
   const rawInstruments = await KiteInstrument.find({
     is_active: true,
+    enabled: { $ne: false },
+    deleted_at: null,
     $or: [
       // Derivatives: only non-expired
       { instrument_type: { $in: ['FUT', 'CE', 'PE'] }, expiry: { $gte: today } },
@@ -433,5 +435,6 @@ const smartSearch = async (query, category = 'ALL', limit = 10, page = 1) => {
 
 const getCategories = () => Object.keys(CATEGORIES);
 const clearCache = () => { instrumentList = null; cacheTimestamp = null; };
+const invalidateCache = () => { instrumentList = null; cacheTimestamp = null; _buildAndSetCache().catch(() => {}); };
 
-module.exports = { smartSearch, loadInstrumentCache, clearCache, getCategories, groupResults };
+module.exports = { smartSearch, loadInstrumentCache, clearCache, invalidateCache, getCategories, groupResults };

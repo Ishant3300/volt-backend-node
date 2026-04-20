@@ -65,6 +65,16 @@ const kiteInstrumentSchema = new mongoose.Schema({
   is_active: {
     type: Boolean,
     default: true
+  },
+  // Admin can disable an instrument to prevent new positions (existing positions unaffected)
+  enabled: {
+    type: Boolean,
+    default: true
+  },
+  // Soft delete timestamp (admin can soft-delete instruments)
+  deleted_at: {
+    type: Date,
+    default: null
   }
 }, {
   timestamps: true

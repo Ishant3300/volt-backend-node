@@ -140,6 +140,31 @@ class CronService {
         }, { timezone: 'Asia/Kolkata' });
         this.jobs.push(morningSettlementRefresh);
 
+        // ── Expiry Auto Square-Off ───────────────────────────────────────
+        // 3:35 PM IST (after NSE close) + 11:32 PM IST (after MCX close at 11:30 PM)
+        // Checks for instruments that expired today and auto-squares-off open positions
+        const expirySquareOffNSE = cron.schedule('35 15 * * 1-5', async () => {
+            console.log('📊 [CRON] Expiry auto square-off check (NSE close)...');
+            try {
+                await this.autoSquareOffExpiredPositions();
+                console.log('✅ [CRON] NSE expiry auto square-off completed.');
+            } catch (error) {
+                console.error('❌ [CRON] Error during NSE expiry auto square-off:', error);
+            }
+        }, { timezone: 'Asia/Kolkata' });
+        this.jobs.push(expirySquareOffNSE);
+
+        const expirySquareOffMCX = cron.schedule('32 23 * * 1-5', async () => {
+            console.log('📊 [CRON] Expiry auto square-off check (MCX close)...');
+            try {
+                await this.autoSquareOffExpiredPositions();
+                console.log('✅ [CRON] MCX expiry auto square-off completed.');
+            } catch (error) {
+                console.error('❌ [CRON] Error during MCX expiry auto square-off:', error);
+            }
+        }, { timezone: 'Asia/Kolkata' });
+        this.jobs.push(expirySquareOffMCX);
+
         // ── Weekend Carry Forward ────────────────────────────────────────
         // Saturday 9:00 AM IST — after all markets close (MCX closes ~11:30 PM Friday)
         // 1. Cancels all pending orders (limit/SL expired)
@@ -178,6 +203,102 @@ class CronService {
             { $set: { equity: '$credits' } }
         ]);
         console.log(`📊 [CRON] Reset balances for ${userUpdateResult.modifiedCount} Users.`);
+    }
+
+    /**
+     * Auto square-off positions on instruments that expired today.
+     * Uses LTP (not bid/ask) for the closing price.
+     */
+    async autoSquareOffExpiredPositions() {
+        const Trade = require('../models/Trade');
+        const KiteInstrument = require('../models/KiteInstrument');
+        const metricsEngine = require('./metricsEngine');
+
+        const today = new Date();
+        today.setHours(0, 0, 0, 0);
+        const tomorrow = new Date(today);
+        tomorrow.setDate(tomorrow.getDate() + 1);
+
+        // Find instruments that expire today
+        const expiredInstruments = await KiteInstrument.find({
+            expiry: { $gte: today, $lt: tomorrow },
+            deleted_at: null,
+        }).select('instrument_token tradingsymbol exchange last_price').lean();
+
+        if (expiredInstruments.length === 0) {
+            console.log('   No instruments expiring today.');
+            return;
+        }
+
+        const expiredTokens = expiredInstruments.map(i => i.instrument_token.toString());
+        const priceMap = {};
+        for (const inst of expiredInstruments) {
+            // Use LTP from metricsEngine if available, else DB last_price
+            const ltp = metricsEngine._ltpMap?.get(inst.instrument_token.toString()) || inst.last_price;
+            priceMap[inst.instrument_token.toString()] = { price: ltp, symbol: inst.tradingsymbol, exchange: inst.exchange };
+        }
+
+        // Find all open positions on expired instruments
+        const openPositions = await Trade.aggregate([
+            { $match: { instrument_token: { $in: expiredTokens }, status: 'completed', deleted_at: null } },
+            { $group: {
+                _id: { user_id: '$user_id', instrument_token: '$instrument_token' },
+                net_qty: { $sum: { $cond: [{ $eq: ['$transaction_type', 'BUY'] }, '$executed_quantity', { $multiply: ['$executed_quantity', -1] }] } },
+            }},
+            { $match: { net_qty: { $ne: 0 } } },
+        ]);
+
+        if (openPositions.length === 0) {
+            console.log(`   ${expiredInstruments.length} instrument(s) expiring today, no open positions.`);
+            return;
+        }
+
+        console.log(`   Found ${openPositions.length} open position(s) on ${expiredInstruments.length} expiring instrument(s).`);
+
+        let squared = 0;
+        for (const pos of openPositions) {
+            const token = pos._id.instrument_token;
+            const userId = pos._id.user_id;
+            const instData = priceMap[token];
+            if (!instData || !instData.price || instData.price <= 0) continue;
+
+            const absQty = Math.abs(pos.net_qty);
+            const closeSide = pos.net_qty > 0 ? 'SELL' : 'BUY';
+
+            try {
+                const user = await User.findById(userId).select('master_id admin_id').lean();
+                if (!user) continue;
+
+                await Trade.create({
+                    user_id: userId,
+                    master_id: user.master_id,
+                    admin_id: user.admin_id || null,
+                    instrument_token: token,
+                    tradingsymbol: instData.symbol,
+                    exchange: instData.exchange,
+                    transaction_type: closeSide,
+                    quantity: absQty,
+                    price: instData.price,
+                    order_type: 'MARKET',
+                    placed_by: 'SYSTEM',
+                    trade_type: 'margin_square_off',
+                    status: 'completed',
+                    executed_at: new Date(),
+                    executed_price: instData.price,
+                    executed_quantity: absQty,
+                    pnl: 0,
+                    remarks: `Auto square-off: instrument expired (${instData.symbol})`,
+                });
+
+                await metricsEngine.onTradeExecuted(userId.toString());
+                squared++;
+                console.log(`   ✅ Squared off ${instData.symbol}: ${closeSide} ${absQty} @ ${instData.price} for user ${userId}`);
+            } catch (err) {
+                console.error(`   ❌ Failed to square off ${instData.symbol} for user ${userId}: ${err.message}`);
+            }
+        }
+
+        console.log(`   ✅ Auto squared off ${squared} position(s).`);
     }
 }
 

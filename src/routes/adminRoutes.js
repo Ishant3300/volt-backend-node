@@ -208,4 +208,121 @@ router.post('/totp/reset', authenticateAdmin, async (req, res) => {
   }
 });
 
+// ==================== INSTRUMENT MANAGEMENT ROUTES ====================
+const KiteInstrument = require('../models/KiteInstrument');
+
+// GET /admin/instruments/segments — get unique segments for filter dropdown
+router.get('/instruments/segments', authenticateAdmin, async (req, res) => {
+  try {
+    const segments = await KiteInstrument.distinct('segment', { deleted_at: null });
+    res.json({ success: true, data: segments.sort() });
+  } catch (e) {
+    res.status(500).json({ success: false, message: e.message, data: null });
+  }
+});
+
+// PUT /admin/instruments/bulk-toggle — enable/disable multiple instruments
+router.put('/instruments/bulk-toggle', authenticateAdmin, async (req, res) => {
+  try {
+    const { ids, enabled } = req.body;
+    if (!ids || !Array.isArray(ids) || enabled === undefined) {
+      return res.status(400).json({ success: false, message: 'ids array and enabled field required', data: null });
+    }
+    const result = await KiteInstrument.updateMany({ _id: { $in: ids } }, { $set: { enabled } });
+
+    try {
+      const searchService = require('../services/instrumentSearchService');
+      searchService.invalidateCache();
+    } catch (_) {}
+
+    res.json({ success: true, message: `${result.modifiedCount} instrument(s) ${enabled ? 'enabled' : 'disabled'}`, data: { modified: result.modifiedCount } });
+  } catch (e) {
+    res.status(500).json({ success: false, message: e.message, data: null });
+  }
+});
+
+// GET /admin/instruments — list instruments with filters (paginated)
+router.get('/instruments', authenticateAdmin, async (req, res) => {
+  try {
+    const { segment, raw_name, expiry, search, enabled, page = 1, limit = 50 } = req.query;
+    const filter = { deleted_at: null };
+
+    if (segment) filter.segment = segment;
+    if (raw_name) filter.raw_name = { $regex: raw_name, $options: 'i' };
+    if (expiry) {
+      const d = new Date(expiry);
+      const nextDay = new Date(d);
+      nextDay.setDate(nextDay.getDate() + 1);
+      filter.expiry = { $gte: d, $lt: nextDay };
+    }
+    if (enabled === 'true') filter.enabled = true;
+    if (enabled === 'false') filter.enabled = false;
+    if (search) {
+      filter.$or = [
+        { tradingsymbol: { $regex: search, $options: 'i' } },
+        { raw_name: { $regex: search, $options: 'i' } },
+        { display_name: { $regex: search, $options: 'i' } },
+      ];
+    }
+
+    const skip = (parseInt(page) - 1) * parseInt(limit);
+    const [instruments, total] = await Promise.all([
+      KiteInstrument.find(filter)
+        .select('instrument_token tradingsymbol raw_name display_name segment exchange instrument_type expiry strike lot_size enabled is_active last_price')
+        .sort({ raw_name: 1, instrument_type: 1, expiry: 1 })
+        .skip(skip)
+        .limit(parseInt(limit))
+        .lean(),
+      KiteInstrument.countDocuments(filter),
+    ]);
+
+    res.json({
+      success: true,
+      data: instruments,
+      pagination: { page: parseInt(page), limit: parseInt(limit), total, pages: Math.ceil(total / parseInt(limit)) },
+    });
+  } catch (e) {
+    res.status(500).json({ success: false, message: e.message, data: null });
+  }
+});
+
+// PUT /admin/instruments/:id/toggle — enable/disable an instrument
+router.put('/instruments/:id/toggle', authenticateAdmin, async (req, res) => {
+  try {
+    const { enabled } = req.body;
+    if (enabled === undefined) {
+      return res.status(400).json({ success: false, message: 'enabled field required', data: null });
+    }
+    const inst = await KiteInstrument.findByIdAndUpdate(req.params.id, { enabled }, { new: true });
+    if (!inst) return res.status(404).json({ success: false, message: 'Instrument not found', data: null });
+
+    // Refresh search cache so disabled instruments stop appearing
+    try {
+      const searchService = require('../services/instrumentSearchService');
+      searchService.invalidateCache();
+    } catch (_) {}
+
+    res.json({ success: true, message: `Instrument ${enabled ? 'enabled' : 'disabled'}`, data: inst });
+  } catch (e) {
+    res.status(500).json({ success: false, message: e.message, data: null });
+  }
+});
+
+// DELETE /admin/instruments/:id — soft delete an instrument
+router.delete('/instruments/:id', authenticateAdmin, async (req, res) => {
+  try {
+    const inst = await KiteInstrument.findByIdAndUpdate(req.params.id, { deleted_at: new Date(), enabled: false }, { new: true });
+    if (!inst) return res.status(404).json({ success: false, message: 'Instrument not found', data: null });
+
+    try {
+      const searchService = require('../services/instrumentSearchService');
+      searchService.invalidateCache();
+    } catch (_) {}
+
+    res.json({ success: true, message: 'Instrument deleted', data: inst });
+  } catch (e) {
+    res.status(500).json({ success: false, message: e.message, data: null });
+  }
+});
+
 module.exports = router;

@@ -151,6 +151,40 @@ const placeTrade = async (req, res) => {
                 throw new Error('Trading is currently disabled for your account.');
             }
 
+            // ── Instrument enabled check: if instrument is disabled, only closing trades allowed ──
+            if (!req.admin) {
+                const instCheck = await KiteInstrument.findOne({ instrument_token }).select('enabled deleted_at').lean().session(session);
+                if (instCheck && (instCheck.enabled === false || instCheck.deleted_at)) {
+                    // Check if this trade is closing an existing position
+                    const posAggEnabled = await Trade.aggregate([
+                        { $match: { user_id: user._id, instrument_token, status: 'completed', deleted_at: null } },
+                        { $group: {
+                            _id: null,
+                            total_buy_qty: { $sum: { $cond: [{ $eq: ['$transaction_type', 'BUY'] }, '$executed_quantity', 0] } },
+                            total_sell_qty: { $sum: { $cond: [{ $eq: ['$transaction_type', 'SELL'] }, '$executed_quantity', 0] } }
+                        }}
+                    ]).session(session);
+
+                    const currentNetQtyEnabled = posAggEnabled.length > 0
+                        ? posAggEnabled[0].total_buy_qty - posAggEnabled[0].total_sell_qty
+                        : 0;
+
+                    const isClosingEnabled = (transaction_type === 'SELL' && currentNetQtyEnabled > 0) ||
+                                             (transaction_type === 'BUY' && currentNetQtyEnabled < 0);
+
+                    // Allow closing up to the net position qty, block anything beyond
+                    if (!isClosingEnabled) {
+                        throw new Error('This instrument has been disabled by admin. You cannot open new positions on this script.');
+                    }
+
+                    // If closing, check that quantity doesn't exceed net position (no new position beyond close)
+                    const absNetQtyEnabled = Math.abs(currentNetQtyEnabled);
+                    if (quantity > absNetQtyEnabled) {
+                        throw new Error(`This instrument is disabled. You can only close your existing ${absNetQtyEnabled} qty position. Cannot open new positions on this script.`);
+                    }
+                }
+            }
+
             // ── Close Only check: if close_only is ON, user can only close existing positions (not open new ones) ──
             // Admin placing on behalf of user bypasses this check
             if (!req.admin && user.close_only === true) {
@@ -451,15 +485,20 @@ const placeTrade = async (req, res) => {
                 });
 
                 if (fslLimit) {
-                    // Get live CMP from metricsEngine/livePriceService
+                    // Get live CMP from metricsEngine — use bid/ask (same as orders page P&L)
+                    // BUY position exits at bid, SELL position exits at ask
                     const metricsEngFSL = require('../services/metricsEngine');
                     const livePriceSvc = require('../services/livePriceService');
                     const tokenStr = instrument_token.toString();
                     const tokenInt = parseInt(instrument_token);
-                    const cmpFSL = metricsEngFSL._ltpMap?.get(tokenStr)
+                    const ltpFSL = metricsEngFSL._ltpMap?.get(tokenStr)
                         || livePriceSvc.latestPrices?.get(tokenStr)
                         || livePriceSvc.latestPrices?.get(tokenInt)
                         || null;
+                    const bidFSL = metricsEngFSL._bidMap?.get(tokenStr) || ltpFSL;
+                    const askFSL = metricsEngFSL._askMap?.get(tokenStr) || ltpFSL;
+                    // cmpFSL for price offset checks (uses LTP)
+                    const cmpFSL = ltpFSL;
 
                     // ── 1. MARKET orders: time restriction (always applies when FSL limit has time_minutes) ──
                     // Only restrict closing if the position is in PROFIT. Loss positions can close anytime.
@@ -482,22 +521,24 @@ const placeTrade = async (req, res) => {
                                               (transaction_type === 'BUY' && currentNetQty < 0);
 
                             if (isClosing) {
-                                // Check if position is in profit using CMP
+                                // Check if position is in profit using bid/ask (same as orders page)
+                                // BUY position: profit if bid > avg buy (exit = sell at bid)
+                                // SELL position: profit if ask < avg sell (exit = buy at ask)
                                 let positionInProfit = false;
-                                if (cmpFSL && cmpFSL > 0 && posAggFSL.length > 0) {
+                                if (posAggFSL.length > 0) {
                                     const avgBuy = posAggFSL[0].total_buy_qty > 0 ? posAggFSL[0].total_buy_value / posAggFSL[0].total_buy_qty : 0;
                                     const avgSell = posAggFSL[0].total_sell_qty > 0 ? posAggFSL[0].total_sell_value / posAggFSL[0].total_sell_qty : 0;
-                                    if (currentNetQty > 0) {
-                                        // Long position: profit if CMP > avg buy
-                                        positionInProfit = cmpFSL > avgBuy;
-                                    } else {
-                                        // Short position: profit if CMP < avg sell
-                                        positionInProfit = cmpFSL < avgSell;
+                                    if (currentNetQty > 0 && bidFSL && bidFSL > 0) {
+                                        // Long position: profit if bid > avg buy
+                                        positionInProfit = bidFSL > avgBuy;
+                                    } else if (currentNetQty < 0 && askFSL && askFSL > 0) {
+                                        // Short position: profit if ask < avg sell
+                                        positionInProfit = askFSL < avgSell;
                                     }
                                 }
 
                                 // Only apply time restriction if position is in profit
-                                console.log(`🔒 [FSL] netQty=${currentNetQty}, isClosing=${isClosing}, positionInProfit=${positionInProfit}, cmp=${cmpFSL}, avgBuy=${posAggFSL[0]?.total_buy_qty > 0 ? posAggFSL[0].total_buy_value / posAggFSL[0].total_buy_qty : 0}, avgSell=${posAggFSL[0]?.total_sell_qty > 0 ? posAggFSL[0].total_sell_value / posAggFSL[0].total_sell_qty : 0}`);
+                                console.log(`🔒 [FSL] netQty=${currentNetQty}, isClosing=${isClosing}, positionInProfit=${positionInProfit}, bid=${bidFSL}, ask=${askFSL}, ltp=${ltpFSL}, avgBuy=${posAggFSL[0]?.total_buy_qty > 0 ? posAggFSL[0].total_buy_value / posAggFSL[0].total_buy_qty : 0}, avgSell=${posAggFSL[0]?.total_sell_qty > 0 ? posAggFSL[0].total_sell_value / posAggFSL[0].total_sell_qty : 0}`);
                                 if (positionInProfit) {
                                     const oppositeType = transaction_type === 'SELL' ? 'BUY' : 'SELL';
                                     const lastOpeningTrade = await Trade.findOne({
@@ -795,14 +836,27 @@ const placeTrade = async (req, res) => {
 
                     // Check 2: Verify trade margin is configured for this instrument
                     const TradeMargin = require('../models/TradeMargin');
-                    const normalizedSegment = (segment || exchange || '').toUpperCase() === 'GLOBAL' ? 'INDICES' : (segment || exchange || '').toUpperCase();
+                    const rawSeg = (segment || exchange || '').toUpperCase();
+                    // GLOBAL and INDICES are the same segment — normalize to check both
+                    const normalizedSegment = (rawSeg === 'GLOBAL' || rawSeg === 'INDICES') ? 'GLOBAL' : rawSeg;
                     
                     let marginRule = null;
                     if (instrumentRawName) {
                         marginRule = await TradeMargin.findOne({ script_name: { $regex: new RegExp('^' + instrumentRawName + '$', 'i') }, exchange_name: normalizedSegment, deleted_at: null }).session(session);
                     }
+                    if (!marginRule && instrumentRawName) {
+                        // Try the alternate name (GLOBAL↔INDICES)
+                        const altSegment = normalizedSegment === 'GLOBAL' ? 'INDICES' : (normalizedSegment === 'INDICES' ? 'GLOBAL' : null);
+                        if (altSegment) {
+                            marginRule = await TradeMargin.findOne({ script_name: { $regex: new RegExp('^' + instrumentRawName + '$', 'i') }, exchange_name: altSegment, deleted_at: null }).session(session);
+                        }
+                    }
                     if (!marginRule) {
                         marginRule = await TradeMargin.findOne({ exchange_name: normalizedSegment, script_name: { $in: [null, ''] }, deleted_at: null }).session(session);
+                    }
+                    if (!marginRule && (normalizedSegment === 'GLOBAL' || normalizedSegment === 'INDICES')) {
+                        const altSegment = normalizedSegment === 'GLOBAL' ? 'INDICES' : 'GLOBAL';
+                        marginRule = await TradeMargin.findOne({ exchange_name: altSegment, script_name: { $in: [null, ''] }, deleted_at: null }).session(session);
                     }
                     if (!marginRule && normalizedSegment.includes('-')) {
                         const baseExchange = normalizedSegment.split('-')[0];
