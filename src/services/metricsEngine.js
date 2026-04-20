@@ -657,6 +657,25 @@ class MetricsEngine {
   }
 
   /**
+   * Reload margin/brokerage rules from DB and recompute all user metrics.
+   * Call this after admin updates trade margins or brokerage settings.
+   */
+  async reloadRules() {
+    if (!this._initialized) return;
+    console.log('📊 [MetricsEngine] Reloading rules (admin update)...');
+    await this._loadRules();
+    // Recompute metrics for all cached users with the new rules
+    for (const userId of this._userCache.keys()) {
+      const metrics = this._computeUserMetrics(userId);
+      if (metrics) {
+        this._metricsCache.set(userId, metrics);
+        this._broadcastUserMetrics(userId, metrics);
+      }
+    }
+    console.log(`📊 [MetricsEngine] Rules reloaded, ${this._userCache.size} user metrics recomputed.`);
+  }
+
+  /**
    * Schedule midnight audit — reload rules and rebuild caches.
    */
   scheduleMidnightAudit() {

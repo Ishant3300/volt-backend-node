@@ -887,6 +887,9 @@ const updateTradeMargin = async (req, res) => {
 
     await tradeMargin.save();
 
+    // Reload metricsEngine rules so margin calculations use the new values immediately
+    try { const me = require('../services/metricsEngine'); me.reloadRules(); } catch (_) {}
+
     res.status(200).json({
       success: true,
       message: 'Trade margin updated successfully',
@@ -918,6 +921,9 @@ const deleteTradeMargin = async (req, res) => {
 
     tradeMargin.deleted_at = new Date();
     await tradeMargin.save();
+
+    // Reload metricsEngine rules
+    try { const me = require('../services/metricsEngine'); me.reloadRules(); } catch (_) {}
 
     res.status(200).json({
       success: true,
@@ -1053,6 +1059,9 @@ const updateBrokerageSettings = async (req, res) => {
 
     await brokerageSettings.save();
 
+    // Reload metricsEngine rules so brokerage calculations use the new values immediately
+    try { const me = require('../services/metricsEngine'); me.reloadRules(); } catch (_) {}
+
     res.status(200).json({
       success: true,
       message: 'Brokerage settings updated successfully',
@@ -1084,6 +1093,9 @@ const deleteBrokerageSettings = async (req, res) => {
 
     brokerageSettings.deleted_at = new Date();
     await brokerageSettings.save();
+
+    // Reload metricsEngine rules
+    try { const me = require('../services/metricsEngine'); me.reloadRules(); } catch (_) {}
 
     res.status(200).json({
       success: true,

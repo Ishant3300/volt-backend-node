@@ -85,6 +85,10 @@ router.put('/trade-margins/bulk-update', authenticateAdminOrMaster, async (req, 
     const updateFields = { trade_margin };
     if (amount_type) updateFields.amount_type = amount_type;
     const result = await TradeMargin.updateMany({ _id: { $in: ids }, deleted_at: null }, { $set: updateFields });
+
+    // Reload metricsEngine rules so margin calculations use the new values immediately
+    try { const me = require('../services/metricsEngine'); me.reloadRules(); } catch (_) {}
+
     res.json({ success: true, message: `Updated ${result.modifiedCount} trade margin(s)`, data: { modified: result.modifiedCount } });
   } catch (e) {
     res.status(500).json({ success: false, message: e.message, data: null });
@@ -110,6 +114,10 @@ router.put('/brokerage-settings/bulk-update', authenticateAdminOrMaster, async (
     const updateFields = { brk_value };
     if (type) updateFields.type = type;
     const result = await BrokerageSettings.updateMany({ _id: { $in: ids }, deleted_at: null }, { $set: updateFields });
+
+    // Reload metricsEngine rules so brokerage calculations use the new values immediately
+    try { const me = require('../services/metricsEngine'); me.reloadRules(); } catch (_) {}
+
     res.json({ success: true, message: `Updated ${result.modifiedCount} brokerage setting(s)`, data: { modified: result.modifiedCount } });
   } catch (e) {
     res.status(500).json({ success: false, message: e.message, data: null });
