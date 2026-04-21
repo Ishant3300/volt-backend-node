@@ -357,7 +357,7 @@ const placeTrade = async (req, res) => {
                         );
                     }
 
-                    if (transaction_type === 'BUY' && limitValue !== null && limitValue > 0) {
+                    if (limitValue !== null && limitValue > 0) {
                         const posAgg = await Trade.aggregate([
                             { $match: { user_id: user._id, instrument_token, status: 'completed', deleted_at: null } },
                             { $group: {
@@ -368,38 +368,46 @@ const placeTrade = async (req, res) => {
                         ]).session(session);
 
                         const currentNetQty = posAgg.length > 0 ? posAgg[0].total_buy_qty - posAgg[0].total_sell_qty : 0;
-                        const remainingQty = Math.max(0, limitValue - currentNetQty);
+                        // Calculate what net position would be after this trade
+                        const afterNetQty = transaction_type === 'BUY' ? currentNetQty + quantity : currentNetQty - quantity;
+                        const absAfter = Math.abs(afterNetQty);
+                        const absCurrent = Math.abs(currentNetQty);
 
-                        // VALIDATION 2: max position check
-                        if (quantity > remainingQty) {
+                        // Only block if the trade is INCREASING the position size beyond the limit
+                        // Closing/reducing trades are always allowed
+                        if (absAfter > absCurrent && absAfter > limitValue) {
+                            const remainingQty = Math.max(0, limitValue - absCurrent);
                             throw new Error(
-                                `Order exceeds maximum position limit. Max: ${limitValue} qty, Current: ${currentNetQty} qty, Remaining: ${remainingQty} qty, Requested: ${quantity} qty.`
+                                `Order exceeds maximum position limit. Max: ${limitValue} qty, Current: ${absCurrent} qty, Remaining: ${remainingQty} qty, Requested: ${quantity} qty.`
                             );
                         }
 
-                        // VALIDATION 3: balance / margin check
-                        let priceForMargin = price;
-                        if (!priceForMargin || priceForMargin <= 0) {
-                            const ltpMapForMargin = await _getLivePricesFromKite([parseInt(instrument_token)]);
-                            priceForMargin = ltpMapForMargin.get(parseInt(instrument_token)) || ltpMapForMargin.get(instrument_token.toString());
-                        }
-                        if (!priceForMargin || priceForMargin <= 0) {
-                            throw new Error('Could not determine price for margin calculation');
-                        }
+                        // VALIDATION 3: balance / margin check (only for opening trades)
+                        if (absAfter > absCurrent) {
+                            const remainingQty = Math.max(0, limitValue - absCurrent);
+                            let priceForMargin = price;
+                            if (!priceForMargin || priceForMargin <= 0) {
+                                const ltpMapForMargin = await _getLivePricesFromKite([parseInt(instrument_token)]);
+                                priceForMargin = ltpMapForMargin.get(parseInt(instrument_token)) || ltpMapForMargin.get(instrument_token.toString());
+                            }
+                            if (!priceForMargin || priceForMargin <= 0) {
+                                throw new Error('Could not determine price for margin calculation');
+                            }
 
-                        const marginPerUnit = await calculateMargin(normalizedExchange, 1, priceForMargin, { rawName: instrumentRawName, instrumentToken: instrument_token, tradingsymbol });
-                        const availableBalance = liveFreeMargin;
-                        const maxAffordableQty = marginPerUnit > 0 ? Math.floor(availableBalance / marginPerUnit) : remainingQty;
-                        const effectiveMaxQty = Math.min(remainingQty, maxAffordableQty);
+                            const marginPerUnit = await calculateMargin(normalizedExchange, 1, priceForMargin, { rawName: instrumentRawName, instrumentToken: instrument_token, tradingsymbol });
+                            const availableBalance = liveFreeMargin;
+                            const maxAffordableQty = marginPerUnit > 0 ? Math.floor(availableBalance / marginPerUnit) : remainingQty;
+                            const effectiveMaxQty = Math.min(remainingQty, maxAffordableQty);
 
-                        if (quantity > effectiveMaxQty) {
-                            const requiredMargin = quantity * marginPerUnit;
-                            if (maxAffordableQty === 0) {
-                                throw new Error(`Insufficient margin to place even 1 unit. Available: ₹${availableBalance.toFixed(2)}, Required per unit: ₹${marginPerUnit.toFixed(2)}.`);
-                            } else {
-                                throw new Error(
-                                    `Insufficient balance for ${quantity} qty. Available: ₹${availableBalance.toFixed(2)}, Required: ₹${requiredMargin.toFixed(2)}. Max affordable: ${maxAffordableQty} qty.`
-                                );
+                            if (quantity > effectiveMaxQty) {
+                                const requiredMargin = quantity * marginPerUnit;
+                                if (maxAffordableQty === 0) {
+                                    throw new Error(`Insufficient margin to place even 1 unit. Available: ₹${availableBalance.toFixed(2)}, Required per unit: ₹${marginPerUnit.toFixed(2)}.`);
+                                } else {
+                                    throw new Error(
+                                        `Insufficient balance for ${quantity} qty. Available: ₹${availableBalance.toFixed(2)}, Required: ₹${requiredMargin.toFixed(2)}. Max affordable: ${maxAffordableQty} qty.`
+                                    );
+                                }
                             }
                         }
                     }
@@ -415,7 +423,7 @@ const placeTrade = async (req, res) => {
                         );
                     }
 
-                    if (transaction_type === 'BUY' && limitValue !== null && limitValue > 0) {
+                    if (limitValue !== null && limitValue > 0) {
                         const posAgg = await Trade.aggregate([
                             { $match: { user_id: user._id, instrument_token, status: 'completed', deleted_at: null } },
                             { $group: {
@@ -427,38 +435,45 @@ const placeTrade = async (req, res) => {
 
                         const currentNetQty = posAgg.length > 0 ? posAgg[0].total_buy_qty - posAgg[0].total_sell_qty : 0;
                         const currentLots = Math.floor(Math.abs(currentNetQty) / lotSize);
-                        const remainingLots = Math.max(0, limitValue - currentLots);
+                        // Calculate what net position would be after this trade
+                        const afterNetQty = transaction_type === 'BUY' ? currentNetQty + quantity : currentNetQty - quantity;
+                        const afterLots = Math.ceil(Math.abs(afterNetQty) / lotSize);
 
-                        // VALIDATION 2: max position check (in lots)
-                        if (requestedLots > remainingLots) {
+                        // Only block if the trade is INCREASING the position size beyond the limit
+                        // Closing/reducing trades are always allowed
+                        if (afterLots > currentLots && afterLots > limitValue) {
+                            const remainingLots = Math.max(0, limitValue - currentLots);
                             throw new Error(
                                 `Order exceeds maximum position limit. Max: ${limitValue} lot(s), Current: ${currentLots} lot(s), Remaining: ${remainingLots} lot(s), Requested: ${requestedLots} lot(s).`
                             );
                         }
 
-                        // VALIDATION 3: balance / margin check
-                        let priceForMargin = price;
-                        if (!priceForMargin || priceForMargin <= 0) {
-                            const ltpMapForMargin = await _getLivePricesFromKite([parseInt(instrument_token)]);
-                            priceForMargin = ltpMapForMargin.get(parseInt(instrument_token)) || ltpMapForMargin.get(instrument_token.toString());
-                        }
-                        if (!priceForMargin || priceForMargin <= 0) {
-                            throw new Error('Could not determine price for margin calculation');
-                        }
+                        // VALIDATION 3: balance / margin check (only for opening trades)
+                        if (Math.abs(afterNetQty) > Math.abs(currentNetQty)) {
+                            const remainingLots = Math.max(0, limitValue - currentLots);
+                            let priceForMargin = price;
+                            if (!priceForMargin || priceForMargin <= 0) {
+                                const ltpMapForMargin = await _getLivePricesFromKite([parseInt(instrument_token)]);
+                                priceForMargin = ltpMapForMargin.get(parseInt(instrument_token)) || ltpMapForMargin.get(instrument_token.toString());
+                            }
+                            if (!priceForMargin || priceForMargin <= 0) {
+                                throw new Error('Could not determine price for margin calculation');
+                            }
 
-                        const marginPerLot = await calculateMargin(normalizedExchange, lotSize, priceForMargin, { rawName: instrumentRawName, instrumentToken: instrument_token, tradingsymbol });
-                        const availableBalance = liveFreeMargin;
-                        const maxAffordableLots = marginPerLot > 0 ? Math.floor(availableBalance / marginPerLot) : remainingLots;
-                        const effectiveMaxLots = Math.min(remainingLots, maxAffordableLots);
+                            const marginPerLot = await calculateMargin(normalizedExchange, lotSize, priceForMargin, { rawName: instrumentRawName, instrumentToken: instrument_token, tradingsymbol });
+                            const availableBalance = liveFreeMargin;
+                            const maxAffordableLots = marginPerLot > 0 ? Math.floor(availableBalance / marginPerLot) : remainingLots;
+                            const effectiveMaxLots = Math.min(remainingLots, maxAffordableLots);
 
-                        if (requestedLots > effectiveMaxLots) {
-                            const requiredMargin = requestedLots * marginPerLot;
-                            if (maxAffordableLots === 0) {
-                                throw new Error(`Insufficient margin to place even 1 lot. Available: ₹${availableBalance.toFixed(2)}, Required per lot: ₹${marginPerLot.toFixed(2)}.`);
-                            } else {
-                                throw new Error(
-                                    `Insufficient balance for ${requestedLots} lot(s). Available: ₹${availableBalance.toFixed(2)}, Required: ₹${requiredMargin.toFixed(2)}. Max affordable: ${maxAffordableLots} lot(s).`
-                                );
+                            if (requestedLots > effectiveMaxLots) {
+                                const requiredMargin = requestedLots * marginPerLot;
+                                if (maxAffordableLots === 0) {
+                                    throw new Error(`Insufficient margin to place even 1 lot. Available: ₹${availableBalance.toFixed(2)}, Required per lot: ₹${marginPerLot.toFixed(2)}.`);
+                                } else {
+                                    throw new Error(
+                                        `Insufficient balance for ${requestedLots} lot(s). Available: ₹${availableBalance.toFixed(2)}, Required: ₹${requiredMargin.toFixed(2)}. Max affordable: ${maxAffordableLots} lot(s).`
+                                    );
+                                }
                             }
                         }
                     }
