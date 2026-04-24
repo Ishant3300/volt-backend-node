@@ -740,11 +740,10 @@ const getUserPosition = async (req, res) => {
   try {
     const { id } = req.params;
 
-    const user = await User.findOne({
-      _id: id,
-      master_id: req.master.id,
-      deleted_at: null
-    });
+    const filterPos = { _id: id, deleted_at: null };
+    if (req.master) filterPos.master_id = req.master.id;
+
+    const user = await User.findOne(filterPos);
 
     if (!user) {
       return res.status(404).json({
@@ -814,11 +813,10 @@ const sendMessageToUser = async (req, res) => {
       });
     }
 
-    const user = await User.findOne({
-      _id: id,
-      master_id: req.master.id,
-      deleted_at: null
-    });
+    const filterMsg = { _id: id, deleted_at: null };
+    if (req.master) filterMsg.master_id = req.master.id;
+
+    const user = await User.findOne(filterMsg);
 
     if (!user) {
       return res.status(404).json({
@@ -828,9 +826,12 @@ const sendMessageToUser = async (req, res) => {
       });
     }
 
+    const senderId = req.master?.id || req.admin?.id;
+    const senderType = req.master ? 'Master' : 'Admin';
+
     const newMessage = await Message.create({
-      sender_id: req.master.id,
-      sender_type: 'Master',
+      sender_id: senderId,
+      sender_type: senderType,
       recipient_id: user._id,
       recipient_type: 'User',
       subject: subject || '',
@@ -856,11 +857,10 @@ const deleteUser = async (req, res) => {
   try {
     const { id } = req.params;
 
-    const user = await User.findOne({
-      _id: id,
-      master_id: req.master.id,
-      deleted_at: null
-    });
+    const filterDel = { _id: id, deleted_at: null };
+    if (req.master) filterDel.master_id = req.master.id;
+
+    const user = await User.findOne(filterDel);
 
     if (!user) {
       return res.status(404).json({
@@ -894,11 +894,13 @@ const updateUserIntradaySquareoff = async (req, res) => {
     const { id } = req.params;
     const { intraday_squareoff } = req.body;
 
-    const user = await User.findOne({
-      _id: id,
-      master_id: req.master.id,
-      deleted_at: null
-    });
+    // Admin can update any user, master can only update their own users
+    const filter = { _id: id, deleted_at: null };
+    if (req.master) {
+      filter.master_id = req.master.id;
+    }
+
+    const user = await User.findOne(filter);
 
     if (!user) {
       return res.status(404).json({
@@ -977,11 +979,10 @@ const updateUserMarginSquareoffPercentage = async (req, res) => {
       });
     }
 
-    const user = await User.findOne({
-      _id: id,
-      master_id: req.master.id,
-      deleted_at: null
-    });
+    const filterMSO = { _id: id, deleted_at: null };
+    if (req.master) filterMSO.master_id = req.master.id;
+
+    const user = await User.findOne(filterMSO);
 
     if (!user) {
       return res.status(404).json({
