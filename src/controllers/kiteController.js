@@ -319,7 +319,8 @@ const browseInstruments = async (req, res) => {
     }
 
     // Only non-expired for FUT/OPT, no expiry filter for indices
-    const filter = { ...catFilter, is_active: true };
+    // Exclude disabled and soft-deleted instruments
+    const filter = { ...catFilter, is_active: true, enabled: { $ne: false }, deleted_at: null };
     if (category !== 'GLOBAL') {
       filter.expiry = { $gte: today };
     }

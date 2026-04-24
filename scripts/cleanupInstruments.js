@@ -89,36 +89,24 @@ function parseAndFilter(csvText, allowedNames) {
   return instruments;
 }
 
-// ── Nearest expiry filter ───────────────────────────────────────────────────
+// ── 3-month expiry filter ────────────────────────────────────────────────────
 function filterNearestExpiry(instruments) {
   const today = new Date();
   today.setHours(0, 0, 0, 0);
-  const nearestMap = new Map();
+  const threeMonthsLater = new Date(today);
+  threeMonthsLater.setMonth(threeMonthsLater.getMonth() + 3);
 
+  const result = [];
   for (const inst of instruments) {
     if (!inst.expiry || inst.segment === 'INDICES') {
-      nearestMap.set(inst.instrument_token, inst);
+      result.push(inst);
       continue;
     }
     const expiryDate = new Date(inst.expiry);
     if (expiryDate < today) continue;
-
-    const rawName = (inst.raw_name || inst.name || '').toUpperCase();
-    const type = (inst.instrument_type || '').toUpperCase();
-    const exchange = (inst.exchange || '').toUpperCase();
-    const strikeKey = (type === 'CE' || type === 'PE') ? `|${inst.strike}` : '';
-    const key = `${rawName}|${exchange}|${type}${strikeKey}`;
-
-    const existing = nearestMap.get(key);
-    if (!existing) {
-      nearestMap.set(key, inst);
-    } else {
-      if (expiryDate.getTime() < new Date(existing.expiry).getTime()) {
-        nearestMap.set(key, inst);
-      }
-    }
+    if (expiryDate <= threeMonthsLater) result.push(inst);
   }
-  return [...nearestMap.values()];
+  return result;
 }
 
 // ── Main ────────────────────────────────────────────────────────────────────

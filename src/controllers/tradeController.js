@@ -152,9 +152,13 @@ const placeTrade = async (req, res) => {
             }
 
             // ── Instrument enabled check: if instrument is disabled, only closing trades allowed ──
+            // ── Instrument deleted check: if instrument is deleted, block ALL trades ──
             if (!req.admin) {
                 const instCheck = await KiteInstrument.findOne({ instrument_token }).select('enabled deleted_at').lean().session(session);
-                if (instCheck && (instCheck.enabled === false || instCheck.deleted_at)) {
+                if (instCheck && instCheck.deleted_at) {
+                    throw new Error('Admin has deactivated this script. Trading is not allowed.');
+                }
+                if (instCheck && instCheck.enabled === false) {
                     // Check if this trade is closing an existing position
                     const posAggEnabled = await Trade.aggregate([
                         { $match: { user_id: user._id, instrument_token, status: 'completed', deleted_at: null } },
@@ -698,8 +702,70 @@ const placeTrade = async (req, res) => {
             }
 
             if (order_type === 'MARKET') {
-                // For MARKET orders, use the frontend-provided price; fall back to live price
-                if (!executedPrice) {
+                // For MARKET orders closing a position, use bid/ask (matching orders page CMP)
+                // BUY to close short → use ask price; SELL to close long → use bid price
+                // This ensures the execution price matches what the user sees on the orders page.
+                // For opening trades, use the frontend-provided price (LTP).
+                const tokenStrBidAsk = instrument_token.toString();
+                const livePriceSvcBA = require('../services/livePriceService');
+
+                // Fetch fresh bid/ask from Kite full quote API (not from cache)
+                let freshBid = null;
+                let freshAsk = null;
+                try {
+                    const kiteInstBA = await KiteInstrument.findOne({ instrument_token }).select('exchange tradingsymbol').lean();
+                    if (kiteInstBA) {
+                        const quoteKeyBA = `${kiteInstBA.exchange}:${kiteInstBA.tradingsymbol}`;
+                        const fullQuote = await kiteService.getMarketQuotes([quoteKeyBA], 'full');
+                        const q = fullQuote?.[quoteKeyBA];
+                        if (q) {
+                            // Kite full quote has depth.buy[0].price (best bid) and depth.sell[0].price (best ask)
+                            freshBid = q.depth?.buy?.[0]?.price || q.last_price;
+                            freshAsk = q.depth?.sell?.[0]?.price || q.last_price;
+                            // Update livePriceService maps so subsequent reads are fresh too
+                            if (freshBid > 0) livePriceSvcBA.latestPrices.set(tokenStrBidAsk, q.last_price || freshBid);
+                        }
+                    }
+                } catch (_) {}
+
+                // Fall back to metricsEngine bid/ask if Kite API call failed
+                if (!freshBid || freshBid <= 0) {
+                    const meBA = require('../services/metricsEngine');
+                    freshBid = meBA._bidMap?.get(tokenStrBidAsk) || null;
+                    freshAsk = meBA._askMap?.get(tokenStrBidAsk) || null;
+                }
+
+                // Determine if this is a closing trade
+                const posAggForPrice = await Trade.aggregate([
+                    { $match: { user_id: user._id, instrument_token, status: 'completed', deleted_at: null } },
+                    { $group: {
+                        _id: null,
+                        total_buy_qty: { $sum: { $cond: [{ $eq: ['$transaction_type', 'BUY'] }, '$executed_quantity', 0] } },
+                        total_sell_qty: { $sum: { $cond: [{ $eq: ['$transaction_type', 'SELL'] }, '$executed_quantity', 0] } }
+                    }}
+                ]).session(session);
+                const netQtyForPrice = posAggForPrice.length > 0 ? posAggForPrice[0].total_buy_qty - posAggForPrice[0].total_sell_qty : 0;
+                const isClosingForPrice = (transaction_type === 'SELL' && netQtyForPrice > 0) ||
+                                          (transaction_type === 'BUY' && netQtyForPrice < 0);
+
+                if (isClosingForPrice) {
+                    // Closing: SELL uses bid, BUY uses ask (same as orders page CMP)
+                    if (transaction_type === 'SELL' && freshBid && freshBid > 0) {
+                        executedPrice = freshBid;
+                    } else if (transaction_type === 'BUY' && freshAsk && freshAsk > 0) {
+                        executedPrice = freshAsk;
+                    }
+                } else {
+                    // Opening: BUY uses ask, SELL uses bid (user enters at the worse side of spread)
+                    if (transaction_type === 'BUY' && freshAsk && freshAsk > 0) {
+                        executedPrice = freshAsk;
+                    } else if (transaction_type === 'SELL' && freshBid && freshBid > 0) {
+                        executedPrice = freshBid;
+                    }
+                }
+
+                // Final fallback — only if bid/ask completely unavailable
+                if (!executedPrice || executedPrice <= 0) {
                     executedPrice = livePrice;
                 }
                 if (!executedPrice) {

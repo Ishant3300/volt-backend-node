@@ -82,7 +82,7 @@ const getWeeklyAdminReport = async (req, res) => {
           admin_brk: r2(adminBrk),
           total_pnl: r2(-totalPnl),
           admin_profit: r2(-adminProfit),
-          total_admin: r2(-adminProfit + adminBrk),
+          total_admin: r2(-adminProfit),
         });
       }
     }
@@ -139,7 +139,7 @@ async function _getAggregatedEntry(masterId, masterDoc, metricsEngine, callerPnl
     admin_brk: r2(adminBrk),
     total_pnl: r2(-totalPnl),
     admin_profit: r2(-adminProfit),
-    total_admin: r2(-adminProfit + adminBrk),
+    total_admin: r2(-adminProfit),
   };
 }
 

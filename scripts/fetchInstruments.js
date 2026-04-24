@@ -277,11 +277,10 @@ function deduplicateByToken(instruments) {
 }
 
 /**
- * Keep only the nearest (closest future) expiry for each instrument group.
- * Matches the same logic used by instrumentSearchService on the backend:
- *   - FUT: key = raw_name|FUT → nearest expiry
- *   - CE/PE: key = raw_name|CE|strike or raw_name|PE|strike → nearest expiry per strike
- *   - INDICES / no expiry: always included
+ * Keep instruments with expiry within the next 3 months for each instrument group.
+ * For FUT: key = raw_name|exchange|FUT → keep all expiries within 3 months
+ * For CE/PE: key = raw_name|exchange|CE|strike → keep all expiries within 3 months
+ * INDICES / no expiry: always included
  *
  * Expired instruments (expiry < today) are excluded entirely.
  */
@@ -289,12 +288,16 @@ function filterNearestExpiry(instruments) {
   const today = new Date();
   today.setHours(0, 0, 0, 0);
 
-  const nearestMap = new Map();
+  // 3 months from today
+  const threeMonthsLater = new Date(today);
+  threeMonthsLater.setMonth(threeMonthsLater.getMonth() + 3);
+
+  const result = [];
 
   for (const inst of instruments) {
     // Non-expiring instruments (indices, etc.) — always include
     if (!inst.expiry || inst.segment === 'INDICES') {
-      nearestMap.set(inst.instrument_token, inst);
+      result.push(inst);
       continue;
     }
 
@@ -302,25 +305,13 @@ function filterNearestExpiry(instruments) {
     const expiryDate = new Date(inst.expiry);
     if (expiryDate < today) continue;
 
-    const rawName = (inst.raw_name || inst.name || '').toUpperCase();
-    const type = (inst.instrument_type || '').toUpperCase();
-    const exchange = (inst.exchange || '').toUpperCase();
-    const strikeKey = (type === 'CE' || type === 'PE') ? `|${inst.strike}` : '';
-    const key = `${rawName}|${exchange}|${type}${strikeKey}`;
-
-    const existing = nearestMap.get(key);
-    if (!existing) {
-      nearestMap.set(key, inst);
-    } else {
-      const existingExpiry = new Date(existing.expiry).getTime();
-      const newExpiry = expiryDate.getTime();
-      if (newExpiry < existingExpiry) {
-        nearestMap.set(key, inst);
-      }
+    // Keep if expiry is within 3 months
+    if (expiryDate <= threeMonthsLater) {
+      result.push(inst);
     }
   }
 
-  return [...nearestMap.values()];
+  return result;
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -367,10 +358,10 @@ async function fetchInstruments() {
     console.log('\n🔍 Parsing and filtering instruments...');
     const { instruments, stats } = parseAndFilterInstruments(csvData, allowedNames);
     
-    // Keep only nearest expiry per instrument group (same as search service)
-    console.log('\n📅 Filtering to nearest expiry per instrument...');
+    // Keep instruments with expiry within next 3 months (same window as manage instruments)
+    console.log('\n📅 Filtering to next 3 months expiry...');
     const nearestExpiry = filterNearestExpiry(instruments);
-    console.log(`   Before: ${instruments.length} → After: ${nearestExpiry.length} (nearest expiry only)`);
+    console.log(`   Before: ${instruments.length} → After: ${nearestExpiry.length} (3-month window)`);
 
     // Deduplicate by token
     const uniqueInstruments = deduplicateByToken(nearestExpiry);

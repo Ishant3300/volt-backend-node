@@ -250,10 +250,11 @@ router.put('/instruments/bulk-toggle', authenticateAdmin, async (req, res) => {
 });
 
 // GET /admin/instruments — list instruments with filters (paginated)
+// Shows ALL instruments including soft-deleted ones (admin needs to see them to restore)
 router.get('/instruments', authenticateAdmin, async (req, res) => {
   try {
     const { segment, raw_name, expiry, search, enabled, page = 1, limit = 50 } = req.query;
-    const filter = { deleted_at: null };
+    const filter = {};
 
     if (segment) filter.segment = segment;
     if (raw_name) filter.raw_name = { $regex: raw_name, $options: 'i' };
@@ -276,7 +277,7 @@ router.get('/instruments', authenticateAdmin, async (req, res) => {
     const skip = (parseInt(page) - 1) * parseInt(limit);
     const [instruments, total] = await Promise.all([
       KiteInstrument.find(filter)
-        .select('instrument_token tradingsymbol raw_name display_name segment exchange instrument_type expiry strike lot_size enabled is_active last_price')
+        .select('instrument_token tradingsymbol raw_name display_name segment exchange instrument_type expiry strike lot_size enabled is_active last_price deleted_at')
         .sort({ raw_name: 1, instrument_type: 1, expiry: 1 })
         .skip(skip)
         .limit(parseInt(limit))
@@ -328,6 +329,23 @@ router.delete('/instruments/:id', authenticateAdmin, async (req, res) => {
     } catch (_) {}
 
     res.json({ success: true, message: 'Instrument deleted', data: inst });
+  } catch (e) {
+    res.status(500).json({ success: false, message: e.message, data: null });
+  }
+});
+
+// PUT /admin/instruments/:id/restore — restore a soft-deleted instrument
+router.put('/instruments/:id/restore', authenticateAdmin, async (req, res) => {
+  try {
+    const inst = await KiteInstrument.findByIdAndUpdate(req.params.id, { deleted_at: null, enabled: true }, { new: true });
+    if (!inst) return res.status(404).json({ success: false, message: 'Instrument not found', data: null });
+
+    try {
+      const searchService = require('../services/instrumentSearchService');
+      searchService.invalidateCache();
+    } catch (_) {}
+
+    res.json({ success: true, message: 'Instrument restored', data: inst });
   } catch (e) {
     res.status(500).json({ success: false, message: e.message, data: null });
   }
