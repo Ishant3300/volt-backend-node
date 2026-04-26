@@ -166,10 +166,10 @@ class CronService {
         this.jobs.push(expirySquareOffMCX);
 
         // ── Weekend Carry Forward ────────────────────────────────────────
-        // Saturday 9:00 AM IST — after all markets close (MCX closes ~11:30 PM Friday)
+        // Sunday 1:00 PM IST — fetches closing prices and carries forward open positions
         // 1. Cancels all pending orders (limit/SL expired)
         // 2. Carries forward open positions at Friday's close price (ATP reset)
-        const weekendCarryForward = cron.schedule('0 18 * * *', async () => {
+        const weekendCarryForward = cron.schedule('55 11 * * 0', async () => {
             console.log('🔄 [CRON] Starting Weekend Carry Forward...');
             try {
                 const { runWeekendCarryForward } = require('./weekendCarryForwardService');
