@@ -32,6 +32,10 @@ async function runWeekendCarryForward() {
   try {
     await cancelAllPendingOrders();
     await overwriteAtpWithClosePrice();
+
+    // Broadcast settlement ticks so watchlist shows close price as LTP/bid/ask
+    await broadcastSettlementTicks();
+
     console.log('✅ [WeekendCF] Weekend carry forward completed.');
   } catch (err) {
     console.error('❌ [WeekendCF] Error:', err.message);
@@ -82,8 +86,16 @@ async function cancelAllPendingOrders() {
 async function overwriteAtpWithClosePrice() {
   console.log('🔄 [WeekendCF] Overwriting ATP with close prices...');
 
-  // ── Refresh close prices for ALL active instruments via Historical API ──
-  const closePriceMap = await refreshAllClosePricesViaHistorical();
+  // ── Refresh close prices via NSE Bhavcopy + MCX Kite API fallback ──
+  const { fetchAndApplyBhavcopy } = require('./bhavcopyService');
+  const bhavResult = await fetchAndApplyBhavcopy();
+  let closePriceMap = bhavResult.closePriceMap;
+
+  // If bhavcopy failed entirely, fall back to the old per-instrument Historical API
+  if (bhavResult.error || Object.keys(closePriceMap).length === 0) {
+    console.log('   ⚠️ Bhavcopy failed, falling back to Kite Historical API...');
+    closePriceMap = await refreshAllClosePricesViaHistorical();
+  }
 
   // Get ALL user+instrument positions (including flat ones)
   const allPositions = await Trade.aggregate([
@@ -288,13 +300,22 @@ async function refreshAllClosePricesViaHistorical() {
         if (candles && candles.length > 0) {
           const lastCandle = candles[candles.length - 1];
           const closePrice = lastCandle.close;
+          const openPrice = lastCandle.open || 0;
+          const highPrice = lastCandle.high || 0;
+          const lowPrice = lastCandle.low || 0;
 
           if (closePrice && closePrice > 0) {
             closePriceMap[tokenStr] = closePrice;
             bulkOps.push({
               updateOne: {
                 filter: { instrument_token: tokenStr },
-                update: { $set: { last_price: closePrice } },
+                update: { $set: {
+                  last_price: closePrice,
+                  ohlc_open: openPrice,
+                  ohlc_high: highPrice,
+                  ohlc_low: lowPrice,
+                  ohlc_close: closePrice,
+                } },
               }
             });
             fetched++;
@@ -329,4 +350,58 @@ async function refreshAllClosePricesViaHistorical() {
   return closePriceMap;
 }
 
-module.exports = { runWeekendCarryForward, cancelAllPendingOrders, overwriteAtpWithClosePrice, refreshAllClosePricesViaHistorical };
+/**
+ * Broadcast settlement ticks to all connected WebSocket clients.
+ * After carry forward, this sends each instrument's close price as LTP, bid, ask
+ * so the watchlist shows correct prices even when the market is closed.
+ * Also includes OHLC data for the trade card view.
+ */
+async function broadcastSettlementTicks() {
+  console.log('📡 [WeekendCF] Broadcasting settlement ticks to connected clients...');
+
+  try {
+    const livePriceService = require('./livePriceService');
+
+    // Get all instruments that have OHLC data
+    const instruments = await KiteInstrument.find({
+      is_active: true,
+      ohlc_close: { $gt: 0 },
+    }).select('instrument_token last_price ohlc_open ohlc_high ohlc_low ohlc_close').lean();
+
+    if (instruments.length === 0) {
+      console.log('   No instruments with OHLC data to broadcast.');
+      return;
+    }
+
+    // Build ticks array — close price as LTP, bid, ask; include OHLC
+    const ticks = instruments.map(inst => {
+      const close = inst.ohlc_close;
+      const spread = close * 0.0005; // 0.05% spread
+      return {
+        instrument_token: inst.instrument_token.toString(),
+        last_price: close,
+        bid_price: close > 0 ? close - spread : close,
+        ask_price: close > 0 ? close + spread : close,
+        open: inst.ohlc_open,
+        high: inst.ohlc_high,
+        low: inst.ohlc_low,
+        close: inst.ohlc_close,
+        change: 0,
+        change_percent: 0,
+      };
+    });
+
+    // Broadcast in batches to avoid overwhelming clients
+    const BATCH = 100;
+    for (let i = 0; i < ticks.length; i += BATCH) {
+      const batch = ticks.slice(i, i + BATCH);
+      livePriceService._broadcastToClients({ type: 'ticks', data: batch });
+    }
+
+    console.log(`   ✅ Broadcast settlement ticks for ${ticks.length} instrument(s).`);
+  } catch (err) {
+    console.warn(`   ⚠️ Settlement tick broadcast error: ${err.message}`);
+  }
+}
+
+module.exports = { runWeekendCarryForward, cancelAllPendingOrders, overwriteAtpWithClosePrice, refreshAllClosePricesViaHistorical, broadcastSettlementTicks };

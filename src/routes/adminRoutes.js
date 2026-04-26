@@ -351,4 +351,9 @@ router.put('/instruments/:id/restore', authenticateAdmin, async (req, res) => {
   }
 });
 
+// Settlement
+const { startSettlement, getSettlementStatus } = require('../controllers/settlementController');
+router.post('/settlement/start', authenticateAdmin, startSettlement);
+router.get('/settlement/status', authenticateAdmin, getSettlementStatus);
+
 module.exports = router;

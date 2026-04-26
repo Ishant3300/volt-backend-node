@@ -33,6 +33,11 @@ const kiteInstrumentSchema = new mongoose.Schema({
     type: Number,
     default: 0
   },
+  // OHLC from last trading day (populated by weekend carry forward / settlement cron)
+  ohlc_open: { type: Number, default: 0 },
+  ohlc_high: { type: Number, default: 0 },
+  ohlc_low: { type: Number, default: 0 },
+  ohlc_close: { type: Number, default: 0 },
   expiry: {
     type: Date,
     default: null

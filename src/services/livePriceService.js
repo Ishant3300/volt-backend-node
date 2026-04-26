@@ -630,7 +630,13 @@ class LivePriceService {
             instrumentOps.push({
               updateOne: {
                 filter: { instrument_token: tokenStr },
-                update: { $set: { last_price: closePrice } }
+                update: { $set: {
+                  last_price: closePrice,
+                  ohlc_open: open || 0,
+                  ohlc_high: high || 0,
+                  ohlc_low: low || 0,
+                  ohlc_close: closePrice,
+                } }
               }
             });
           }
@@ -780,7 +786,13 @@ class LivePriceService {
         bulkOps.push({
           updateOne: {
             filter: { instrument_token: tokenStr },
-            update: { $set: { last_price: settlementPrice } },
+            update: { $set: {
+              last_price: settlementPrice,
+              ohlc_open: ohlc.open || 0,
+              ohlc_high: ohlc.high || 0,
+              ohlc_low: ohlc.low || 0,
+              ohlc_close: settlementPrice,
+            } },
           }
         });
       }
