@@ -328,21 +328,9 @@ const browseInstruments = async (req, res) => {
     const pageNum = parseInt(page);
     const limitNum = parseInt(limit);
 
-    // Use aggregation to pick nearest expiry per underlying in the DB
-    // This avoids loading all instruments into memory
-    const isOptions = category.toUpperCase().includes('OPT');
-    const groupId = isOptions
-      ? { raw_name: '$raw_name', instrument_type: '$instrument_type', strike: '$strike' }
-      : { raw_name: '$raw_name', instrument_type: '$instrument_type' };
-
+    // Simple paginated query — DB already has 3-month instruments from fetchInstruments
     const pipeline = [
       { $match: filter },
-      { $sort: { expiry: 1 } },
-      { $group: {
-        _id: groupId,
-        doc: { $first: '$$ROOT' },
-      }},
-      { $replaceRoot: { newRoot: '$doc' } },
       { $sort: { raw_name: 1, expiry: 1, strike: 1 } },
       { $facet: {
         data: [{ $skip: (pageNum - 1) * limitNum }, { $limit: limitNum }],
