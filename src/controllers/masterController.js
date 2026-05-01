@@ -1042,63 +1042,96 @@ const updateMasterIntradaySquareoff = async (req, res) => {
     const { id } = req.params;
     const { intraday_squareoff } = req.body;
 
-    const master = await Master.findOne({
-      _id: id,
-      deleted_at: null
-    });
-
+    const master = await Master.findOne({ _id: id, deleted_at: null });
     if (!master) {
-      return res.status(404).json({
-        success: false,
-        message: 'Master not found',
-        data: null
-      });
+      return res.status(404).json({ success: false, message: 'Master not found', data: null });
     }
 
-    // Validate that all exchanges in intraday_squareoff are in exchanges_allowed
     if (intraday_squareoff && Array.isArray(intraday_squareoff)) {
-      // Convert exchange names to uppercase for consistency
-      const normalizedSettings = intraday_squareoff.map(setting => ({
-        exchange_name: setting.exchange_name.toUpperCase(),
-        enabled: setting.enabled
+      const normalizedSettings = intraday_squareoff.map(s => ({
+        exchange_name: s.exchange_name.toUpperCase(),
+        enabled: s.enabled
       }));
 
       for (const setting of normalizedSettings) {
-        const masterExchangesUpper = master.exchanges_allowed.map(ex => ex.toUpperCase());
-        if (!masterExchangesUpper.includes(setting.exchange_name)) {
-          return res.status(400).json({
-            success: false,
-            message: `Exchange ${setting.exchange_name} is not allowed for this master`,
-            data: null
-          });
+        if (!master.exchanges_allowed.map(e => e.toUpperCase()).includes(setting.exchange_name)) {
+          return res.status(400).json({ success: false, message: `Exchange ${setting.exchange_name} is not allowed for this master`, data: null });
         }
       }
+
       master.intraday_squareoff = normalizedSettings;
+      master.exchanges_allowed = master.exchanges_allowed.map(ex => {
+        const name = ex.toUpperCase();
+        return name === 'GLOBAL' ? 'INDICES' : name;
+      });
+      master.trade_limit = master.trade_limit.map(ex => {
+        const name = ex.toUpperCase();
+        return name === 'GLOBAL' ? 'INDICES' : name;
+      });
+      await master.save();
+
+      // Cascade settings to all sub-masters and users in the hierarchy
+      // (only for segments that are enabled — propagate the ON state down)
+      const enabledSegments = normalizedSettings.filter(s => s.enabled).map(s => s.exchange_name);
+      const disabledSegments = normalizedSettings.filter(s => !s.enabled).map(s => s.exchange_name);
+
+      if (enabledSegments.length > 0 || disabledSegments.length > 0) {
+        try {
+          const { getAllSubMasterIds } = require('../services/masterHierarchyService');
+          const allMasterIds = await getAllSubMasterIds(id);
+
+          // Update sub-masters
+          for (const mid of allMasterIds) {
+            if (mid === id) continue;
+            const subMaster = await Master.findOne({ _id: mid, deleted_at: null });
+            if (!subMaster) continue;
+            const subSettings = subMaster.intraday_squareoff || [];
+            for (const seg of enabledSegments) {
+              if (subMaster.exchanges_allowed.map(e => e.toUpperCase()).includes(seg)) {
+                const existing = subSettings.find(s => s.exchange_name === seg);
+                if (existing) existing.enabled = true;
+                else subSettings.push({ exchange_name: seg, enabled: true });
+              }
+            }
+            for (const seg of disabledSegments) {
+              const existing = subSettings.find(s => s.exchange_name === seg);
+              if (existing) existing.enabled = false;
+            }
+            subMaster.intraday_squareoff = subSettings;
+            await subMaster.save();
+          }
+
+          // Update users
+          const User = require('../models/User');
+          const users = await User.find({ master_id: { $in: allMasterIds }, deleted_at: null }).select('_id exchanges_allowed intraday_squareoff');
+          for (const u of users) {
+            const userAllowed = (u.exchanges_allowed || []).map(e => e.exchange_name?.toUpperCase());
+            const userSettings = u.intraday_squareoff || [];
+            for (const seg of enabledSegments) {
+              if (userAllowed.includes(seg)) {
+                const existing = userSettings.find(s => s.exchange_name === seg);
+                if (existing) existing.enabled = true;
+                else userSettings.push({ exchange_name: seg, enabled: true });
+              }
+            }
+            for (const seg of disabledSegments) {
+              const existing = userSettings.find(s => s.exchange_name === seg);
+              if (existing) existing.enabled = false;
+            }
+            u.intraday_squareoff = userSettings;
+            await u.save();
+          }
+
+          console.log(`🔄 [IntradaySquareoff] Master ${master.username}: cascaded to ${allMasterIds.length - 1} sub-masters, ${users.length} users`);
+        } catch (e) {
+          console.error(`⚠️ [IntradaySquareoff] Cascade error: ${e.message}`);
+        }
+      }
     }
 
-    // Normalize existing exchange data to uppercase before saving
-    master.exchanges_allowed = master.exchanges_allowed.map(ex => {
-      const name = ex.toUpperCase();
-      return name === 'GLOBAL' ? 'INDICES' : name;
-    });
-    master.trade_limit = master.trade_limit.map(ex => {
-      const name = ex.toUpperCase();
-      return name === 'GLOBAL' ? 'INDICES' : name;
-    });
-
-    await master.save();
-
-    res.status(200).json({
-      success: true,
-      message: 'Intraday squareoff settings updated successfully',
-      data: master.toJSON()
-    });
+    res.status(200).json({ success: true, message: 'Intraday squareoff settings updated successfully', data: master.toJSON() });
   } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: error.message,
-      data: null
-    });
+    res.status(500).json({ success: false, message: error.message, data: null });
   }
 };
 

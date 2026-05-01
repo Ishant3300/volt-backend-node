@@ -7,6 +7,81 @@ const Transaction = require('../models/Transaction');
 const Message = require('../models/Message');
 const Trade = require('../models/Trade');
 const CreditTransaction = require('../models/CreditTransaction');
+const KiteInstrument = require('../models/KiteInstrument');
+
+/**
+ * Square off all open positions for a user in the given segments.
+ * Uses bid/ask from metricsEngine (same as orders page CMP).
+ * Returns the number of positions squared off.
+ */
+async function _squareOffUserSegments(userId, segments) {
+  const metricsEngine = require('../services/metricsEngine');
+  const metrics = await metricsEngine.getFreshMetrics(userId);
+  if (!metrics || !metrics.positions || metrics.positions.length === 0) return 0;
+
+  const segmentsUpper = segments.map(s => s.toUpperCase());
+  let squaredOff = 0;
+
+  for (const pos of metrics.positions) {
+    if (pos.net_qty === 0) continue;
+
+    // Check if this position's segment matches any of the enabled segments
+    const posSeg = (pos.segment || '').toUpperCase();
+    const posExchange = (pos.exchange || '').toUpperCase();
+    const matches = segmentsUpper.some(s =>
+      s === posSeg || s === posExchange ||
+      (s === 'INDICES' && (posSeg === 'INDICES' || posExchange === 'GLOBAL')) ||
+      (s === 'GLOBAL' && (posSeg === 'INDICES' || posExchange === 'GLOBAL'))
+    );
+    if (!matches) continue;
+
+    const closeSide = pos.net_qty > 0 ? 'SELL' : 'BUY';
+    const absQty = Math.abs(pos.net_qty);
+    // Use bid for SELL (closing long), ask for BUY (closing short) — same as orders page
+    const closePrice = closeSide === 'SELL'
+      ? (metricsEngine._bidMap?.get(pos.instrument_token) || pos.ltp || pos.cmp)
+      : (metricsEngine._askMap?.get(pos.instrument_token) || pos.ltp || pos.cmp);
+
+    if (!closePrice || closePrice <= 0) continue;
+
+    try {
+      const user = await User.findById(userId).select('master_id admin_id').lean();
+      if (!user) continue;
+
+      await Trade.create({
+        user_id: userId,
+        master_id: user.master_id,
+        admin_id: user.admin_id || null,
+        instrument_token: pos.instrument_token,
+        tradingsymbol: pos.tradingsymbol,
+        exchange: pos.exchange,
+        transaction_type: closeSide,
+        quantity: absQty,
+        price: closePrice,
+        order_type: 'MARKET',
+        placed_by: 'SYSTEM',
+        trade_type: 'margin_square_off',
+        status: 'completed',
+        executed_at: new Date(),
+        executed_price: closePrice,
+        executed_quantity: absQty,
+        pnl: 0,
+        remarks: `Intraday square-off: ${pos.segment} segment closed by admin`,
+      });
+
+      squaredOff++;
+    } catch (e) {
+      console.error(`⚠️ [IntradaySquareoff] Error closing ${pos.tradingsymbol} for user ${userId}: ${e.message}`);
+    }
+  }
+
+  // Rebuild metrics after all square-offs
+  if (squaredOff > 0) {
+    await metricsEngine.onTradeExecuted(userId);
+  }
+
+  return squaredOff;
+}
 
 // Create User
 const createUser = async (req, res) => {
@@ -894,66 +969,37 @@ const updateUserIntradaySquareoff = async (req, res) => {
     const { id } = req.params;
     const { intraday_squareoff } = req.body;
 
-    // Admin can update any user, master can only update their own users
     const filter = { _id: id, deleted_at: null };
-    if (req.master) {
-      filter.master_id = req.master.id;
-    }
+    if (req.master) filter.master_id = req.master.id;
 
     const user = await User.findOne(filter);
-
     if (!user) {
-      return res.status(404).json({
-        success: false,
-        message: 'User not found',
-        data: null
-      });
+      return res.status(404).json({ success: false, message: 'User not found', data: null });
     }
 
-    // Get allowed exchanges from user's exchanges_allowed array
     const allowedExchanges = user.exchanges_allowed.map(ex => ex.exchange_name);
 
-    // Validate that all exchanges in intraday_squareoff are in exchanges_allowed
     if (intraday_squareoff && Array.isArray(intraday_squareoff)) {
-      // Convert exchange names to uppercase for consistency
-      const normalizedSettings = intraday_squareoff.map(setting => ({
-        exchange_name: setting.exchange_name.toUpperCase(),
-        enabled: setting.enabled
+      const normalizedSettings = intraday_squareoff.map(s => ({
+        exchange_name: s.exchange_name.toUpperCase(),
+        enabled: s.enabled
       }));
 
       for (const setting of normalizedSettings) {
-        const allowedExchangesUpper = allowedExchanges.map(ex => ex.toUpperCase());
-        if (!allowedExchangesUpper.includes(setting.exchange_name)) {
-          return res.status(400).json({
-            success: false,
-            message: `Exchange ${setting.exchange_name} is not allowed for this user`,
-            data: null
-          });
+        if (!allowedExchanges.map(e => e.toUpperCase()).includes(setting.exchange_name)) {
+          return res.status(400).json({ success: false, message: `Exchange ${setting.exchange_name} is not allowed for this user`, data: null });
         }
       }
+
       user.intraday_squareoff = normalizedSettings;
+      user.exchanges_allowed = user.exchanges_allowed.map(ex => ({ ...ex, exchange_name: ex.exchange_name.toUpperCase() }));
+      user.trade_limit = user.trade_limit.map(ex => ex.toUpperCase());
+      await user.save();
     }
 
-    // Normalize existing exchange data to uppercase before saving
-    user.exchanges_allowed = user.exchanges_allowed.map(ex => ({
-      ...ex,
-      exchange_name: ex.exchange_name.toUpperCase()
-    }));
-    user.trade_limit = user.trade_limit.map(ex => ex.toUpperCase());
-
-    await user.save();
-
-    res.status(200).json({
-      success: true,
-      message: 'Intraday squareoff settings updated successfully',
-      data: user.toJSON()
-    });
+    res.status(200).json({ success: true, message: 'Intraday squareoff settings updated successfully', data: user.toJSON() });
   } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: error.message,
-      data: null
-    });
+    res.status(500).json({ success: false, message: error.message, data: null });
   }
 };
 
@@ -1020,5 +1066,6 @@ module.exports = {
   debitUser,
   getUserPosition,
   sendMessageToUser,
-  deleteUser
+  deleteUser,
+  _squareOffUserSegments
 };

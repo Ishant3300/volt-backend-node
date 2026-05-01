@@ -145,6 +145,12 @@ const placeTrade = async (req, res) => {
                 liveFreeMargin = user.credits || 0;
             }
 
+            // ── Early free margin warning for LIMIT orders ──
+            // Inform user gracefully before any other validation
+            if (!req.admin && order_type === 'LIMIT' && liveFreeMargin < 0) {
+                throw new Error(`Your free margin is negative (₹${liveFreeMargin.toFixed(2)}). Please close existing positions or add funds before placing limit orders.`);
+            }
+
             // ── BET check: if bet is OFF, user cannot trade at all (BUY or SELL) ──
             // Admin placing on behalf of user bypasses this check
             if (!req.admin && user.bet === false) {
@@ -899,19 +905,20 @@ const placeTrade = async (req, res) => {
             }
 
             // ── Free Margin & Trade Margin validation (opening trades only) ──
-            // Determine if this is an opening trade (adding to position or new position)
+            // Checks for MARKET and SL orders (execute immediately).
+            // LIMIT orders skip this — margin is checked when the pending order triggers.
             if (shouldExecuteNow && !req.admin) {
-                // Get net position from the aggregate we already computed
-                const aggData = existingAgg.length > 0 ? existingAgg[0] : null;
-                const currentNetQty = aggData ? aggData.total_buy_qty - aggData.total_sell_qty : 0;
-                const isOpening = (transaction_type === 'BUY' && currentNetQty >= 0) ||
-                                  (transaction_type === 'SELL' && currentNetQty <= 0);
+                // Determine if this is an opening trade
+                const aggDataFM = existingAgg.length > 0 ? existingAgg[0] : null;
+                const currentNetQtyFM = aggDataFM ? aggDataFM.total_buy_qty - aggDataFM.total_sell_qty : 0;
+                const afterNetQtyFM = transaction_type === 'BUY' ? currentNetQtyFM + quantity : currentNetQtyFM - quantity;
+                const isOpeningFM = Math.abs(afterNetQtyFM) > Math.abs(currentNetQtyFM);
 
-                if (isOpening) {
-                    // Check 1: Get user's current metrics from metricsEngine
+                if (isOpeningFM) {
+                    // Check 1: Free margin must not be negative (use fresh metrics, not cached)
                     const metricsEngine = require('../services/metricsEngine');
-                    const currentMetrics = metricsEngine.getCachedMetrics(user._id.toString());
-                    if (currentMetrics && currentMetrics.free_margin < 0) {
+                    const freshMetricsFM = await metricsEngine.getFreshMetrics(user._id.toString());
+                    if (freshMetricsFM && freshMetricsFM.free_margin < 0) {
                         throw new Error('Insufficient free margin. Your free margin is negative. Please close existing positions or add funds.');
                     }
 

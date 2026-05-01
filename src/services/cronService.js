@@ -140,6 +140,68 @@ class CronService {
         }, { timezone: 'Asia/Kolkata' });
         this.jobs.push(morningSettlementRefresh);
 
+        // ── Bhavcopy Settlement Price Fetch ──────────────────────────────
+        // NSE/BFO/BSE: 5 PM IST (Mon-Fri), retries 6 PM, 7 PM, 8 PM — uses TODAY's date
+        // MCX: 12:30 AM IST (Tue-Sat), retries 1:30 AM, 2:30 AM, 3:30 AM — uses YESTERDAY's date
+        this._nseSettlementDone = false;
+        this._mcxSettlementDone = false;
+
+        // NSE/BFO/BSE: 5 PM, 6 PM, 7 PM, 8 PM (Mon-Fri)
+        for (const hour of [17, 18, 19, 20]) {
+            const nseJob = cron.schedule(`0 ${hour} * * 1-5`, async () => {
+                if (this._nseSettlementDone) return;
+                console.log(`📊 [CRON] Bhavcopy NSE/BFO/BSE attempt (${hour}:00 IST)...`);
+                try {
+                    const { fetchAndApplyBhavcopy } = require('./bhavcopyService');
+                    const now = new Date();
+                    const ist = new Date(now.getTime() + (5.5 * 3600000 - now.getTimezoneOffset() * 60000));
+                    const today = new Date(ist.getFullYear(), ist.getMonth(), ist.getDate());
+                    const result = await fetchAndApplyBhavcopy(today);
+                    if (result.matched > 0 || result.bseMatched > 0) {
+                        this._nseSettlementDone = true;
+                        console.log(`✅ [CRON] Bhavcopy NSE/BSE done: NSE=${result.matched}, BSE=${result.bseMatched}`);
+                    } else {
+                        console.log(`⚠️ [CRON] Bhavcopy NSE/BSE: 0 matched. Retry next hour.`);
+                    }
+                } catch (error) {
+                    console.error(`❌ [CRON] Bhavcopy NSE/BSE error: ${error.message}`);
+                }
+            }, { timezone: 'Asia/Kolkata' });
+            this.jobs.push(nseJob);
+        }
+
+        // MCX: 12:30 AM, 1:30 AM, 2:30 AM, 3:30 AM (Tue-Sat) — uses YESTERDAY
+        for (const hour of [0, 1, 2, 3]) {
+            const mcxJob = cron.schedule(`30 ${hour} * * 2-6`, async () => {
+                if (this._mcxSettlementDone) return;
+                console.log(`📊 [CRON] Bhavcopy MCX attempt (${hour}:30 IST)...`);
+                try {
+                    const { fetchAndApplyBhavcopy } = require('./bhavcopyService');
+                    const now = new Date();
+                    const ist = new Date(now.getTime() + (5.5 * 3600000 - now.getTimezoneOffset() * 60000));
+                    const yesterday = new Date(ist.getFullYear(), ist.getMonth(), ist.getDate() - 1);
+                    const result = await fetchAndApplyBhavcopy(yesterday);
+                    if (result.mcxFallback > 0) {
+                        this._mcxSettlementDone = true;
+                        console.log(`✅ [CRON] Bhavcopy MCX done: ${result.mcxFallback} matched.`);
+                    } else {
+                        console.log(`⚠️ [CRON] Bhavcopy MCX: 0 matched. Retry next hour.`);
+                    }
+                } catch (error) {
+                    console.error(`❌ [CRON] Bhavcopy MCX error: ${error.message}`);
+                }
+            }, { timezone: 'Asia/Kolkata' });
+            this.jobs.push(mcxJob);
+        }
+
+        // Reset flags so next day's fetches run fresh
+        // NSE flags reset at 4 PM (before 5 PM first attempt)
+        // MCX flags reset at 11 PM (before 12:30 AM first attempt)
+        const resetNseFlags = cron.schedule('0 16 * * 1-5', () => { this._nseSettlementDone = false; }, { timezone: 'Asia/Kolkata' });
+        const resetMcxFlags = cron.schedule('0 23 * * 1-5', () => { this._mcxSettlementDone = false; }, { timezone: 'Asia/Kolkata' });
+        this.jobs.push(resetNseFlags);
+        this.jobs.push(resetMcxFlags);
+
         // ── Expiry Auto Square-Off ───────────────────────────────────────
         // 3:35 PM IST (after NSE close) + 11:32 PM IST (after MCX close at 11:30 PM)
         // Checks for instruments that expired today and auto-squares-off open positions
@@ -165,27 +227,99 @@ class CronService {
         }, { timezone: 'Asia/Kolkata' });
         this.jobs.push(expirySquareOffMCX);
 
-        // ── Weekend Carry Forward ────────────────────────────────────────
-        // Sunday 1:00 PM IST — fetches closing prices and carries forward open positions
-        // 1. Cancels all pending orders (limit/SL expired)
-        // 2. Carries forward open positions at Friday's close price (ATP reset)
-        const weekendCarryForward = cron.schedule('55 11 * * 0', async () => {
-            console.log('🔄 [CRON] Starting Weekend Carry Forward...');
+        // ── Intraday Square-Off at Market Close ──────────────────────────
+        // Squares off positions for users who have intraday_squareoff enabled for the segment.
+        // NSE/NFO: 3:30 PM IST
+        const intradaySquareOffNSE = cron.schedule('30 15 * * 1-5', async () => {
+            console.log('🔄 [CRON] Intraday square-off (NSE/NFO close)...');
             try {
-                const { runWeekendCarryForward } = require('./weekendCarryForwardService');
-                await runWeekendCarryForward();
-                console.log('✅ [CRON] Weekend Carry Forward completed.');
+                await this.runIntradaySquareOff(['NFO-FUT', 'NFO-OPT']);
+                console.log('✅ [CRON] NSE/NFO intraday square-off completed.');
             } catch (error) {
-                console.error('❌ [CRON] Error during Weekend Carry Forward:', error);
+                console.error('❌ [CRON] Error during NSE intraday square-off:', error);
             }
         }, { timezone: 'Asia/Kolkata' });
-        this.jobs.push(weekendCarryForward);
+        this.jobs.push(intradaySquareOffNSE);
+
+        // MCX: 11:30 PM IST
+        const intradaySquareOffMCX = cron.schedule('30 23 * * 1-5', async () => {
+            console.log('🔄 [CRON] Intraday square-off (MCX close)...');
+            try {
+                await this.runIntradaySquareOff(['MCX-FUT', 'MCX-OPT']);
+                console.log('✅ [CRON] MCX intraday square-off completed.');
+            } catch (error) {
+                console.error('❌ [CRON] Error during MCX intraday square-off:', error);
+            }
+        }, { timezone: 'Asia/Kolkata' });
+        this.jobs.push(intradaySquareOffMCX);
+
+        // GLOBAL/INDICES: no fixed close — skip for now (24hr market)
+
+        // ── Weekend Carry Forward (DISABLED — admin triggers manually via Settlement UI) ──
+        // const weekendCarryForward = cron.schedule('55 11 * * 0', async () => {
+        //     console.log('🔄 [CRON] Starting Weekend Carry Forward...');
+        //     try {
+        //         const { runWeekendCarryForward } = require('./weekendCarryForwardService');
+        //         await runWeekendCarryForward();
+        //         console.log('✅ [CRON] Weekend Carry Forward completed.');
+        //     } catch (error) {
+        //         console.error('❌ [CRON] Error during Weekend Carry Forward:', error);
+        //     }
+        // }, { timezone: 'Asia/Kolkata' });
+        // this.jobs.push(weekendCarryForward);
 
         const engineMode = redisService.isAvailable()
             ? 'Redis + BullMQ (cron fallback standby)'
             : 'DB polling every 10s (Redis unavailable)';
 
         console.log(`✅ Cron Scheduler activated (limit engine: ${engineMode}).`);
+    }
+
+    /**
+     * Run intraday square-off for the given segments.
+     * Finds all users who have intraday_squareoff enabled for any of the segments,
+     * then squares off their open positions in those segments using bid/ask CMP.
+     */
+    async runIntradaySquareOff(segments) {
+        const Trade = require('../models/Trade');
+        const metricsEngine = require('./metricsEngine');
+        const { _squareOffUserSegments } = require('../controllers/masterUserController');
+
+        // Find all users who have intraday_squareoff enabled for any of these segments
+        const users = await User.find({
+            deleted_at: null,
+            'intraday_squareoff.enabled': true,
+            'intraday_squareoff.exchange_name': { $in: segments.map(s => s.toUpperCase()) },
+        }).select('_id username intraday_squareoff').lean();
+
+        if (users.length === 0) {
+            console.log(`   No users with intraday square-off enabled for ${segments.join(', ')}.`);
+            return;
+        }
+
+        console.log(`   Found ${users.length} user(s) with intraday square-off enabled.`);
+
+        let totalSquaredOff = 0;
+        for (const u of users) {
+            // Get only the segments that are enabled for this user AND match the closing segments
+            const userEnabledSegments = (u.intraday_squareoff || [])
+                .filter(s => s.enabled && segments.map(seg => seg.toUpperCase()).includes(s.exchange_name.toUpperCase()))
+                .map(s => s.exchange_name);
+
+            if (userEnabledSegments.length === 0) continue;
+
+            try {
+                const count = await _squareOffUserSegments(u._id.toString(), userEnabledSegments);
+                if (count > 0) {
+                    totalSquaredOff += count;
+                    console.log(`   ✅ ${u.username}: squared off ${count} position(s) in ${userEnabledSegments.join(', ')}`);
+                }
+            } catch (e) {
+                console.error(`   ❌ ${u.username}: square-off error: ${e.message}`);
+            }
+        }
+
+        console.log(`   ✅ Total: ${totalSquaredOff} position(s) squared off for ${users.length} user(s).`);
     }
 
     /**

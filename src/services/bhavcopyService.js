@@ -9,7 +9,6 @@
  * Main entry: fetchAndApplyBhavcopy(targetDate?)
  */
 
-const { execSync } = require('child_process');
 const https = require('https');
 const fs = require('fs');
 const path = require('path');
@@ -52,16 +51,46 @@ function getLastFriday() {
 // DOWNLOAD HELPERS
 // ═══════════════════════════════════════════════════════════════════════════
 
-/** Download via PowerShell (for NSE — Node can't resolve NSE DNS in some envs). */
-function downloadViaPowershell(url, outPath) {
-  try {
-    execSync(`powershell -Command "Invoke-WebRequest -Uri '${url}' -OutFile '${outPath}' -UserAgent 'Mozilla/5.0' -TimeoutSec 30"`, { stdio: 'pipe', timeout: 45000 });
-    if (fs.existsSync(outPath)) return fs.readFileSync(outPath);
-  } catch (_) {}
-  return null;
+/** Download a URL using Node.js https (cross-platform, no PowerShell). */
+function downloadUrl(url, headers = {}) {
+  return new Promise((resolve) => {
+    const defaultHeaders = {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+      ...headers,
+    };
+    const parsedUrl = new URL(url);
+    const options = {
+      hostname: parsedUrl.hostname,
+      path: parsedUrl.pathname + parsedUrl.search,
+      headers: defaultHeaders,
+      timeout: 30000,
+    };
+    https.get(options, (res) => {
+      if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+        return downloadUrl(res.headers.location, headers).then(resolve);
+      }
+      const chunks = [];
+      res.on('data', (chunk) => chunks.push(chunk));
+      res.on('end', () => resolve(Buffer.concat(chunks)));
+      res.on('error', () => resolve(null));
+    }).on('error', () => resolve(null));
+  });
 }
 
-/** Download from Samco using PowerShell WebSession (datacopy links need a session). */
+/** Download NSE bhavcopy zip (direct HTTPS). */
+async function downloadNseZip(url) {
+  console.log(`   [NSE] Downloading via HTTPS...`);
+  const buf = await downloadUrl(url);
+  if (!buf || buf.length < 100) return null;
+  // Check if it's a valid zip (PK header)
+  if (buf.slice(0, 4).toString('hex') !== '504b0304') {
+    console.warn(`   [NSE] Response is not a zip (${buf.length} bytes, starts with: ${buf.slice(0, 20).toString('utf8').substring(0, 50)})`);
+    return null;
+  }
+  return buf;
+}
+
+/** Download from Samco using PowerShell Core (pwsh) — cross-platform. */
 async function downloadFromSamco(date, type) {
   ensureTmpDir();
   const yyyymmdd = dateToYYYYMMDD(date);
@@ -69,10 +98,21 @@ async function downloadFromSamco(date, type) {
   const filePath = `/var/www/html/samco/public_html/Downloads/bhavcopy_data/${dd}/${yyyymmdd}_${type}.csv`;
   const b64 = Buffer.from(filePath).toString('base64').replace(/=+$/, '');
   const outPath = path.join(TMP_DIR, `samco_${type}_${yyyymmdd}.csv`);
-
-  // Write URL to a temp file to avoid PowerShell line-wrapping long base64 strings
-  const urlFile = path.join(TMP_DIR, `samco_url_${type}_${Date.now()}.txt`);
   const dataUrl = `https://www.samco.in/bse_nse_mcx/datacopy/${b64}`;
+
+  console.log(`   [${type}] Samco download via pwsh...`);
+
+  // Detect pwsh vs powershell
+  const { execSync } = require('child_process');
+  let shell = 'pwsh';
+  try { execSync('pwsh -Version', { stdio: 'pipe', timeout: 5000 }); } catch (_) {
+    try { execSync('powershell -Version', { stdio: 'pipe', timeout: 5000 }); shell = 'powershell'; } catch (__) {
+      console.warn(`   [${type}] Neither pwsh nor powershell found. Skipping Samco.`);
+      return null;
+    }
+  }
+
+  const urlFile = path.join(TMP_DIR, `samco_url_${type}_${Date.now()}.txt`);
   fs.writeFileSync(urlFile, dataUrl, 'utf8');
 
   const psScript = path.join(TMP_DIR, `samco_dl_${type}_${Date.now()}.ps1`);
@@ -85,16 +125,22 @@ async function downloadFromSamco(date, type) {
 
   try {
     fs.writeFileSync(psScript, ps, 'utf8');
-    execSync(`powershell -ExecutionPolicy Bypass -File "${psScript}"`, { stdio: 'pipe', timeout: 60000 });
-  } catch (_) {}
+    execSync(`${shell} -ExecutionPolicy Bypass -File "${psScript}"`, { stdio: 'pipe', timeout: 60000 });
+  } catch (e) {
+    console.warn(`   [${type}] pwsh script error: ${e.message?.substring(0, 100)}`);
+  }
   try { fs.unlinkSync(psScript); } catch (_) {}
   try { fs.unlinkSync(urlFile); } catch (_) {}
 
   if (fs.existsSync(outPath)) {
     const buf = fs.readFileSync(outPath);
     try { fs.unlinkSync(outPath); } catch (_) {}
-    if (buf.length > 100) return buf;
+    if (buf.length > 100) {
+      console.log(`   [${type}] Downloaded ${buf.length} bytes via ${shell}.`);
+      return buf;
+    }
   }
+  console.warn(`   [${type}] Samco download failed via ${shell}.`);
   return null;
 }
 
@@ -122,12 +168,10 @@ async function fetchNseBhavcopy(date, instruments, closePriceMap) {
   console.log(`   [NSE] URL: ${url}`);
 
   ensureTmpDir();
-  const zipPath = path.join(TMP_DIR, `nse_fo_${yyyymmdd}.zip`);
-  const zipBuf = downloadViaPowershell(url, zipPath);
+  const zipBuf = await downloadNseZip(url);
 
-  if (!zipBuf || zipBuf.length < 100 || zipBuf.slice(0, 4).toString('hex') !== '504b0304') {
-    console.warn(`   [NSE] ⚠️ Download failed or not a zip.`);
-    try { fs.unlinkSync(zipPath); } catch (_) {}
+  if (!zipBuf) {
+    console.warn(`   [NSE] ⚠️ Download failed.`);
     return { matched: 0, unmatched: 0 };
   }
 
@@ -140,10 +184,8 @@ async function fetchNseBhavcopy(date, instruments, closePriceMap) {
     csvText = entry.getData().toString('utf8');
   } catch (err) {
     console.error(`   [NSE] ❌ Extract failed: ${err.message}`);
-    try { fs.unlinkSync(zipPath); } catch (_) {}
     return { matched: 0, unmatched: 0 };
   }
-  try { fs.unlinkSync(zipPath); } catch (_) {}
 
   // Parse UDiFF CSV → lookup map
   const bhavMap = parseNseUdiffCSV(csvText);
@@ -216,38 +258,79 @@ async function fetchMcxBhavcopy(date, instruments, closePriceMap) {
   console.log(`   [MCX] Fetching from Samco...`);
 
   const csvBuf = await downloadFromSamco(date, 'MCX');
-  if (!csvBuf || csvBuf.length < 100) {
-    console.warn(`   [MCX] ⚠️ Download failed (${csvBuf ? csvBuf.length : 0} bytes).`);
-    return { matched: 0 };
+  
+  // If Samco download succeeded, parse the CSV
+  if (csvBuf && csvBuf.length > 100) {
+    const csvText = csvBuf.toString('utf8');
+    if (!csvText.startsWith('<!') && !csvText.startsWith('<html') && !csvText.includes('No file available')) {
+      const mcxMap = parseSamcoMcxCSV(csvText);
+      console.log(`   [MCX] Parsed ${mcxMap.size} entries from Samco.`);
+
+      const mcxInstruments = instruments.filter(i => i.exchange === 'MCX');
+      const bulkOps = [];
+      let matched = 0;
+
+      for (const inst of mcxInstruments) {
+        const key = buildMatchKey(inst);
+        if (!key) continue;
+        const data = mcxMap.get(key);
+        if (data) {
+          const t = inst.instrument_token.toString();
+          closePriceMap[t] = data.settle_pr;
+          bulkOps.push({ updateOne: { filter: { instrument_token: t }, update: { $set: { last_price: data.settle_pr, ohlc_open: data.open, ohlc_high: data.high, ohlc_low: data.low, ohlc_close: data.settle_pr } } } });
+          matched++;
+        }
+      }
+
+      if (bulkOps.length > 0) await KiteInstrument.bulkWrite(bulkOps, { ordered: false });
+      console.log(`   [MCX] ✅ ${matched} matched out of ${mcxInstruments.length} via Samco.`);
+      return { matched };
+    }
   }
 
-  const csvText = csvBuf.toString('utf8');
-  if (csvText.startsWith('<!') || csvText.startsWith('<html') || csvText.includes('No file available')) {
-    console.warn(`   [MCX] ⚠️ Got HTML or no-data response.`);
-    return { matched: 0 };
-  }
-
-  const mcxMap = parseSamcoMcxCSV(csvText);
-  console.log(`   [MCX] Parsed ${mcxMap.size} entries.`);
-
+  // Fallback: use Kite OHLC API for MCX instruments (same approach as BSE)
+  console.log(`   [MCX] Samco failed — falling back to Kite OHLC API...`);
   const mcxInstruments = instruments.filter(i => i.exchange === 'MCX');
+  if (mcxInstruments.length === 0) return { matched: 0 };
+
+  const kiteService = require('./kiteService');
+  const instDocs = await KiteInstrument.find({
+    instrument_token: { $in: mcxInstruments.map(i => i.instrument_token.toString()) },
+    is_active: true,
+  }).select('instrument_token tradingsymbol exchange').lean();
+
+  const keyToToken = new Map();
+  const keys = instDocs.map(i => {
+    const key = `${i.exchange}:${i.tradingsymbol.trim()}`;
+    keyToToken.set(key, i.instrument_token.toString());
+    return key;
+  });
+
   const bulkOps = [];
   let matched = 0;
+  const BATCH = 200;
 
-  for (const inst of mcxInstruments) {
-    const key = buildMatchKey(inst);
-    if (!key) continue;
-    const data = mcxMap.get(key);
-    if (data) {
-      const t = inst.instrument_token.toString();
-      closePriceMap[t] = data.settle_pr;
-      bulkOps.push({ updateOne: { filter: { instrument_token: t }, update: { $set: { last_price: data.settle_pr, ohlc_open: data.open, ohlc_high: data.high, ohlc_low: data.low, ohlc_close: data.settle_pr } } } });
-      matched++;
+  for (let i = 0; i < keys.length; i += BATCH) {
+    const batch = keys.slice(i, i + BATCH);
+    try {
+      const data = await kiteService.getMarketQuotes(batch, 'ohlc');
+      for (const [instKey, quote] of Object.entries(data || {})) {
+        const tokenStr = keyToToken.get(instKey);
+        if (!tokenStr || !quote) continue;
+        const ohlc = quote.ohlc || {};
+        const close = ohlc.close;
+        if (!close || close <= 0) continue;
+        closePriceMap[tokenStr] = close;
+        bulkOps.push({ updateOne: { filter: { instrument_token: tokenStr }, update: { $set: { last_price: close, ohlc_open: ohlc.open || 0, ohlc_high: ohlc.high || 0, ohlc_low: ohlc.low || 0, ohlc_close: close } } } });
+        matched++;
+      }
+    } catch (err) {
+      console.warn(`      MCX OHLC batch error: ${err.message}`);
     }
   }
 
   if (bulkOps.length > 0) await KiteInstrument.bulkWrite(bulkOps, { ordered: false });
-  console.log(`   [MCX] ✅ ${matched} matched out of ${mcxInstruments.length}.`);
+  console.log(`   [MCX] ✅ ${matched} matched out of ${mcxInstruments.length} via Kite OHLC fallback.`);
   return { matched };
 }
 
@@ -410,6 +493,43 @@ async function fetchAndApplyBhavcopy(targetDate) {
 
   const total = Object.keys(closePriceMap).length;
   console.log(`   ✅ Total: ${total} prices (NSE: ${nseResult.matched}, MCX: ${mcxResult.matched}, BSE: ${bseResult.matched})`);
+
+  // Broadcast settlement prices to all connected Flutter clients via WebSocket
+  // During closed market hours, this makes watchlist show the close price as bid/ask
+  if (total > 0) {
+    try {
+      const livePriceService = require('./livePriceService');
+      const metricsEngine = require('./metricsEngine');
+
+      const ticks = [];
+      for (const [tokenStr, closePrice] of Object.entries(closePriceMap)) {
+        // Update in-memory price maps so metricsEngine uses settlement prices
+        livePriceService.latestPrices.set(tokenStr, closePrice);
+        livePriceService.latestPrices.set(parseInt(tokenStr), closePrice);
+
+        // Update metricsEngine LTP, bid, ask maps with settlement price
+        metricsEngine._ltpMap?.set(tokenStr, closePrice);
+        metricsEngine._bidMap?.set(tokenStr, closePrice);
+        metricsEngine._askMap?.set(tokenStr, closePrice);
+
+        ticks.push({
+          instrument_token: tokenStr,
+          last_price: closePrice,
+          bid_price: closePrice,
+          ask_price: closePrice,
+          close: closePrice,
+        });
+      }
+
+      // Broadcast to all Flutter clients
+      if (ticks.length > 0) {
+        livePriceService._broadcastToClients({ type: 'ticks', data: ticks });
+        console.log(`   📡 Broadcast ${ticks.length} settlement prices to Flutter clients.`);
+      }
+    } catch (e) {
+      console.warn(`   ⚠️ Broadcast error: ${e.message}`);
+    }
+  }
 
   return {
     closePriceMap,

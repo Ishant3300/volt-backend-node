@@ -476,7 +476,15 @@ const getScriptQuantityByExchange = async (req, res) => {
   try {
     const { exchange_name } = req.params;
     const { page = 1, limit = 500 } = req.query;
-    const filter = { exchange_name: exchange_name.toUpperCase(), deleted_at: null };
+    const upperName = exchange_name.toUpperCase();
+    // Map GLOBAL → INDICES (same segment naming as brokerage/trade margin)
+    const mappedName = upperName === 'GLOBAL' ? 'INDICES' : upperName;
+    // Try exact match first, then base exchange (e.g. MCX-FUT → MCX)
+    const baseExchange = mappedName.includes('-') ? mappedName.split('-')[0] : null;
+    const exchangeFilter = baseExchange
+      ? { $in: [mappedName, baseExchange] }
+      : mappedName;
+    const filter = { exchange_name: exchangeFilter, deleted_at: null };
     const items = await ScriptQuantity.find(filter)
       .limit(parseInt(limit)).skip((parseInt(page) - 1) * parseInt(limit)).sort({ script_name: 1 });
     const count = await ScriptQuantity.countDocuments(filter);

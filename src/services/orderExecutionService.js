@@ -146,6 +146,42 @@ const processPendingOrders = async () => {
                             }
                         }
 
+                        // ── Free margin check for opening LIMIT orders ──
+                        const prevNetQtyCheck = existingAgg.length > 0 ? existingAgg[0].total_buy_qty - existingAgg[0].total_sell_qty : 0;
+                        const afterNetQtyCheck = freshTrade.transaction_type === 'BUY' ? prevNetQtyCheck + freshTrade.quantity : prevNetQtyCheck - freshTrade.quantity;
+                        const isOpeningLimitTrade = Math.abs(afterNetQtyCheck) > Math.abs(prevNetQtyCheck);
+
+                        if (isOpeningLimitTrade) {
+                            const metricsEngine = require('./metricsEngine');
+                            const freshMetrics = await metricsEngine.getFreshMetrics(freshTrade.user_id.toString());
+                            if (freshMetrics && freshMetrics.free_margin < 0) {
+                                freshTrade.status = 'cancelled';
+                                freshTrade.remarks = 'Insufficient free margin when limit order triggered';
+                                await freshTrade.save({ session });
+
+                                // Save rejection log
+                                try {
+                                    await Trade.create([{
+                                        user_id: freshTrade.user_id,
+                                        master_id: freshTrade.master_id,
+                                        admin_id: freshTrade.admin_id || null,
+                                        instrument_token: freshTrade.instrument_token,
+                                        tradingsymbol: freshTrade.tradingsymbol,
+                                        exchange: freshTrade.exchange,
+                                        transaction_type: freshTrade.transaction_type,
+                                        quantity: freshTrade.quantity,
+                                        price: freshTrade.price,
+                                        order_type: freshTrade.order_type,
+                                        status: 'rejected',
+                                        remarks: `Insufficient free margin (₹${freshMetrics.free_margin.toFixed(2)}). Limit order cancelled.`,
+                                    }], { session });
+                                } catch (_) {}
+
+                                console.log(`⚠️ [OrderExecution] Cancelled ${freshTrade.tradingsymbol} LIMIT — insufficient free margin (₹${freshMetrics.free_margin.toFixed(2)})`);
+                                return;
+                            }
+                        }
+
                         // Execute the trade
                         freshTrade.status = 'completed';
                         freshTrade.executed_at = new Date();

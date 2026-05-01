@@ -164,6 +164,57 @@ const _processJob = async (job) => {
         }
       }
 
+      // ── Free margin check for opening LIMIT orders ──
+      // Check if this is an opening trade and if user has sufficient margin
+      const prevNetQtyCheck = existingAgg.length > 0 ? existingAgg[0].total_buy_qty - existingAgg[0].total_sell_qty : 0;
+      const afterNetQtyCheck = trade.transaction_type === 'BUY' ? prevNetQtyCheck + trade.quantity : prevNetQtyCheck - trade.quantity;
+      const isOpeningLimitTrade = Math.abs(afterNetQtyCheck) > Math.abs(prevNetQtyCheck);
+
+      if (isOpeningLimitTrade) {
+        const freshMetrics = await metricsEngine.getFreshMetrics(trade.user_id.toString());
+        if (freshMetrics && freshMetrics.free_margin < 0) {
+          // Cancel the order — insufficient margin
+          trade.status = 'cancelled';
+          trade.remarks = 'Insufficient free margin when limit order triggered';
+          await trade.save();
+
+          // Save rejection log
+          try {
+            const RejectionLog = require('../models/Trade');
+            await RejectionLog.create({
+              user_id: trade.user_id,
+              master_id: trade.master_id,
+              admin_id: trade.admin_id || null,
+              instrument_token: trade.instrument_token,
+              tradingsymbol: trade.tradingsymbol,
+              exchange: trade.exchange,
+              transaction_type: trade.transaction_type,
+              quantity: trade.quantity,
+              price: trade.price,
+              order_type: trade.order_type,
+              status: 'rejected',
+              remarks: `Insufficient free margin (₹${freshMetrics.free_margin.toFixed(2)}). Limit order cancelled.`,
+            });
+          } catch (_) {}
+
+          console.log(`⚠️ [PriceQueue] Cancelled ${trade.tradingsymbol} LIMIT — insufficient free margin (₹${freshMetrics.free_margin.toFixed(2)})`);
+
+          if (match.side === 'BUY') executedBuys.push(match.id);
+          else executedSells.push(match.id);
+
+          // Notify user
+          const livePriceService = require('./livePriceService');
+          livePriceService.broadcastToUser(trade.user_id.toString(), {
+            type: 'trade_rejected',
+            trade_id: trade._id.toString(),
+            tradingsymbol: trade.tradingsymbol,
+            message: 'Insufficient free margin. Limit order cancelled.',
+          });
+
+          continue;
+        }
+      }
+
       // Execute the trade
       trade.status = 'completed';
       trade.executed_at = new Date();

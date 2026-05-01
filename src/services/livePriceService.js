@@ -94,6 +94,26 @@ class LivePriceService {
             }
           });
           this._updateKiteSubscription();
+
+          // Send cached prices immediately for newly subscribed tokens
+          // (covers settlement prices from bhavcopy that were broadcast before this client subscribed)
+          const cachedTicks = [];
+          for (const token of data.tokens) {
+            const tokenStr = token.toString();
+            const price = this.latestPrices.get(tokenStr) || this.latestPrices.get(parseInt(tokenStr));
+            if (price && price > 0) {
+              cachedTicks.push({
+                instrument_token: tokenStr,
+                last_price: price,
+                bid_price: price,
+                ask_price: price,
+                close: price,
+              });
+            }
+          }
+          if (cachedTicks.length > 0 && ws.readyState === 1) {
+            ws.send(JSON.stringify({ type: 'ticks', data: cachedTicks }));
+          }
         }
         break;
 
