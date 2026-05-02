@@ -1354,7 +1354,14 @@ getPositions = async (req, res) => {
             targetUserId = req.query.user_id;
         }
 
-        const trades = await Trade.find({ user_id: targetUserId, deleted_at: null }).sort({ executed_at: -1 });
+        const trades = await Trade.find({
+            user_id: targetUserId,
+            $or: [
+                { deleted_at: null },
+                // Include settlement closing trades (soft-deleted but should show in history)
+                { remarks: 'Settlement: position closed at settlement price' },
+            ],
+        }).sort({ executed_at: -1 });
 
         // Enrich trades with lot_size from KiteInstrument so Flutter can display lots vs qty
         const KiteInstrument = require('../models/KiteInstrument');

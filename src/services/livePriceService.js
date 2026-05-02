@@ -67,8 +67,44 @@ class LivePriceService {
       }));
     });
 
+    // Pre-load settlement prices from DB so reconnecting clients get correct prices
+    this._preloadSettlementPrices();
+
     // Connect to Kite WebSocket
     this._connectToKite();
+  }
+
+  /**
+   * Pre-load last_price from KiteInstrument DB into _settlementPrices map.
+   * This ensures that when a Flutter client subscribes (or reconnects),
+   * it gets the correct settlement/close price even if the server was restarted
+   * and the in-memory maps are empty.
+   * Live ticks from Kite will clear these as they arrive.
+   */
+  async _preloadSettlementPrices() {
+    try {
+      if (!this._settlementPrices) this._settlementPrices = new Map();
+
+      const instruments = await KiteInstrument.find({
+        is_active: true,
+        last_price: { $gt: 0 },
+        deleted_at: null,
+      }).select('instrument_token last_price').lean();
+
+      let loaded = 0;
+      for (const inst of instruments) {
+        const tokenStr = inst.instrument_token.toString();
+        this._settlementPrices.set(tokenStr, inst.last_price);
+        // Also populate latestPrices so other lookups work
+        this.latestPrices.set(tokenStr, inst.last_price);
+        this.latestPrices.set(parseInt(tokenStr), inst.last_price);
+        loaded++;
+      }
+
+      console.log(`📊 [Settlement] Pre-loaded ${loaded} settlement prices from DB into memory.`);
+    } catch (e) {
+      console.error(`❌ [Settlement] Error pre-loading prices from DB: ${e.message}`);
+    }
   }
 
   /**
@@ -96,18 +132,23 @@ class LivePriceService {
           this._updateKiteSubscription();
 
           // Send cached prices immediately for newly subscribed tokens
-          // (covers settlement prices from bhavcopy that were broadcast before this client subscribed)
+          // Uses settlement prices (from bhavcopy) when available — these show during closed market hours
+          // Live ticks from Kite will override these when market opens
           const cachedTicks = [];
           for (const token of data.tokens) {
             const tokenStr = token.toString();
-            const price = this.latestPrices.get(tokenStr) || this.latestPrices.get(parseInt(tokenStr));
+            // Prefer settlement price (from bhavcopy), fall back to latest live price
+            const settlementPrice = this._settlementPrices?.get(tokenStr);
+            const livePrice = this.latestPrices.get(tokenStr) || this.latestPrices.get(parseInt(tokenStr));
+            const price = settlementPrice || livePrice;
             if (price && price > 0) {
               cachedTicks.push({
                 instrument_token: tokenStr,
                 last_price: price,
                 bid_price: price,
                 ask_price: price,
-                close: price,
+                close: settlementPrice || price,
+                is_settlement: !!settlementPrice,
               });
             }
           }
@@ -319,6 +360,11 @@ class LivePriceService {
           if (t && t.instrument_token && t.last_price) {
             this.latestPrices.set(t.instrument_token.toString(), t.last_price);
             this.latestPrices.set(parseInt(t.instrument_token), t.last_price);
+
+            // Clear settlement price for this token — live tick takes over
+            if (this._settlementPrices) {
+              this._settlementPrices.delete(t.instrument_token.toString());
+            }
 
             // Publish price update to BullMQ for order matching
             priceQueueService.publishPriceUpdate(t.instrument_token.toString(), t.last_price);

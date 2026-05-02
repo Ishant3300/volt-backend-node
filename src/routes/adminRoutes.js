@@ -256,9 +256,25 @@ router.get('/instruments', authenticateAdmin, async (req, res) => {
     const { segment, raw_name, expiry, search, enabled, page = 1, limit = 50 } = req.query;
     const filter = {};
 
+    // Default: only show non-expired instruments (indices have no expiry)
+    if (!expiry) {
+      const today = new Date();
+      today.setHours(0, 0, 0, 0);
+      filter.$or = filter.$or || [];
+      // Will be merged with search $or below if needed
+      filter.expiry = { $gte: today };
+      // Also include instruments with no expiry (indices)
+      delete filter.expiry;
+      filter.$and = [
+        { $or: [{ expiry: { $gte: today } }, { expiry: null }] }
+      ];
+    }
+
     if (segment) filter.segment = segment;
     if (raw_name) filter.raw_name = { $regex: raw_name, $options: 'i' };
     if (expiry) {
+      // Override default expiry filter with specific date
+      delete filter.$and;
       const d = new Date(expiry);
       const nextDay = new Date(d);
       nextDay.setDate(nextDay.getDate() + 1);
@@ -267,11 +283,16 @@ router.get('/instruments', authenticateAdmin, async (req, res) => {
     if (enabled === 'true') filter.enabled = true;
     if (enabled === 'false') filter.enabled = false;
     if (search) {
-      filter.$or = [
+      const searchOr = [
         { tradingsymbol: { $regex: search, $options: 'i' } },
         { raw_name: { $regex: search, $options: 'i' } },
         { display_name: { $regex: search, $options: 'i' } },
       ];
+      if (filter.$and) {
+        filter.$and.push({ $or: searchOr });
+      } else {
+        filter.$or = searchOr;
+      }
     }
 
     const skip = (parseInt(page) - 1) * parseInt(limit);
@@ -348,6 +369,19 @@ router.put('/instruments/:id/restore', authenticateAdmin, async (req, res) => {
     res.json({ success: true, message: 'Instrument restored', data: inst });
   } catch (e) {
     res.status(500).json({ success: false, message: e.message, data: null });
+  }
+});
+
+// Trigger bhavcopy settlement price fetch (admin-only)
+router.post('/bhavcopy/fetch', authenticateAdmin, async (req, res) => {
+  try {
+    const { date } = req.body; // optional: YYYY-MM-DD string
+    const { fetchAndApplyBhavcopy } = require('../services/bhavcopyService');
+    const targetDate = date ? new Date(date) : undefined;
+    const result = await fetchAndApplyBhavcopy(targetDate);
+    res.json({ success: true, message: 'Bhavcopy fetch completed', data: { nse: result.matched, mcx: result.mcxFallback, bse: result.bseMatched, total: Object.keys(result.closePriceMap).length } });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
   }
 });
 

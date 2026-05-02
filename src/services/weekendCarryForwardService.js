@@ -232,9 +232,17 @@ async function overwriteAtpWithClosePrice() {
     console.log(`   ✅ Updated ${updated} opening trade(s), soft-deleted ${closingSideDeleted} closing/excess trade(s), skipped ${skipped} (no close price).`);
   }
 
-  // ── 3. Rebuild metricsEngine for ALL affected users ───────────────
+  // ── 3. Update metricsEngine price maps + rebuild for ALL affected users ──
   try {
     const metricsEngine = require('./metricsEngine');
+
+    // Update LTP/bid/ask maps with settlement prices so CMP = ATP
+    for (const [tokenStr, price] of Object.entries(closePriceMap)) {
+      metricsEngine._ltpMap.set(tokenStr, price);
+      metricsEngine._bidMap.set(tokenStr, price);
+      metricsEngine._askMap.set(tokenStr, price);
+    }
+
     for (const uid of allAffectedUsers) {
       await metricsEngine.onTradeExecuted(uid);
     }
@@ -373,19 +381,19 @@ async function broadcastSettlementTicks() {
       return;
     }
 
-    // Build ticks array — close price as LTP, bid, ask; include OHLC
+    // Build ticks array — close price as LTP, bid, ask (no fake spread)
     const ticks = instruments.map(inst => {
       const close = inst.ohlc_close;
-      const spread = close * 0.0005; // 0.05% spread
       return {
         instrument_token: inst.instrument_token.toString(),
         last_price: close,
-        bid_price: close > 0 ? close - spread : close,
-        ask_price: close > 0 ? close + spread : close,
+        bid_price: close,
+        ask_price: close,
         open: inst.ohlc_open,
         high: inst.ohlc_high,
         low: inst.ohlc_low,
         close: inst.ohlc_close,
+        is_settlement: true,
         change: 0,
         change_percent: 0,
       };

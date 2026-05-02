@@ -106,39 +106,7 @@ class CronService {
         });
         this.jobs.push(kiteTokenRefresh);
 
-        // ── Settlement Price Refresh Schedule ────────────────────────────
-        //
-        // NSE: settlement available in Kite Historical API by ~6 PM same day
-        // MCX: settlement available in Kite OHLC API ohlc.close by ~8-9 AM next morning
-        //
-        // Strategy:
-        // 1. 6:00 PM — NSE/NFO provisional close via Historical API (has settlement by then)
-        // 2. 8:30 AM — Full settlement refresh via OHLC API (covers MCX + validates NSE)
-
-        // NSE/NFO: Historical API has settlement price by 6 PM same day
-        const nseCloseRefresh = cron.schedule('0 18 * * 1-5', async () => {
-            console.log('📊 [CRON] Refreshing NSE/NFO settlement prices (Historical API)...');
-            try {
-                await livePriceService.refreshClosePrices();
-                console.log('✅ [CRON] NSE/NFO settlement refresh completed.');
-            } catch (error) {
-                console.error('❌ [CRON] Error during NSE/NFO settlement refresh:', error);
-            }
-        }, { timezone: 'Asia/Kolkata' });
-        this.jobs.push(nseCloseRefresh);
-
-        // Morning full settlement refresh — OHLC API ohlc.close has all settlements by 8:30 AM
-        // This covers MCX (previous night) + validates NSE
-        const morningSettlementRefresh = cron.schedule('30 8 * * 1-6', async () => {
-            console.log('📊 [CRON] Morning settlement price refresh (OHLC API)...');
-            try {
-                await livePriceService.refreshSettlementPrices();
-                console.log('✅ [CRON] Morning settlement price refresh completed.');
-            } catch (error) {
-                console.error('❌ [CRON] Error during morning settlement refresh:', error);
-            }
-        }, { timezone: 'Asia/Kolkata' });
-        this.jobs.push(morningSettlementRefresh);
+        // ── Settlement prices are now fetched via bhavcopy crons below (no OHLC) ──
 
         // ── Bhavcopy Settlement Price Fetch ──────────────────────────────
         // NSE/BFO/BSE: 5 PM IST (Mon-Fri), retries 6 PM, 7 PM, 8 PM — uses TODAY's date

@@ -74,19 +74,28 @@ async function _executeSettlement() {
   const metricsEngine = require('./metricsEngine');
   const livePriceService = require('./livePriceService');
 
-  // ── Phase 1: Fetch close prices ──────────────────────────────────
+  // ── Phase 1: Load close prices from DB (already fetched via "Fetch Settlement Prices") ──
   _settlementState.phase = 'fetching_prices';
   broadcastProgress();
-  console.log('📊 [Settlement] Phase 1: Fetching close prices...');
+  console.log('📊 [Settlement] Phase 1: Loading close prices from DB...');
 
-  const { fetchAndApplyBhavcopy } = require('./bhavcopyService');
-  const bhavResult = await fetchAndApplyBhavcopy();
-  const closePriceMap = bhavResult.closePriceMap;
+  const closePriceMap = {};
+  const allInstruments = await KiteInstrument.find({
+    is_active: true,
+    last_price: { $gt: 0 },
+    deleted_at: null,
+  }).select('instrument_token last_price').lean();
+
+  for (const inst of allInstruments) {
+    closePriceMap[inst.instrument_token.toString()] = inst.last_price;
+  }
+
   _settlementState.pricesFetched = Object.keys(closePriceMap).length;
   broadcastProgress();
+  console.log(`   📊 Loaded ${Object.keys(closePriceMap).length} close prices from DB.`);
 
   if (Object.keys(closePriceMap).length === 0) {
-    throw new Error('No close prices fetched — cannot proceed');
+    throw new Error('No close prices in DB — run "Fetch Settlement Prices" first');
   }
 
   // ── Phase 2: Cancel all pending orders ───────────────────────────
@@ -108,7 +117,7 @@ async function _executeSettlement() {
     }
   } catch (_) {}
 
-  // ── Phase 3: Get all open positions BEFORE soft-deleting ─────────
+  // ── Phase 3: Get all open positions with avg entry price BEFORE soft-deleting ─
   _settlementState.phase = 'processing';
   broadcastProgress();
   console.log('📊 [Settlement] Phase 3: Collecting open positions...');
@@ -118,6 +127,10 @@ async function _executeSettlement() {
     { $group: {
       _id: { user_id: '$user_id', instrument_token: '$instrument_token' },
       net_qty: { $sum: { $cond: [{ $eq: ['$transaction_type', 'BUY'] }, '$executed_quantity', { $multiply: ['$executed_quantity', -1] }] } },
+      total_buy_qty: { $sum: { $cond: [{ $eq: ['$transaction_type', 'BUY'] }, '$executed_quantity', 0] } },
+      total_buy_value: { $sum: { $cond: [{ $eq: ['$transaction_type', 'BUY'] }, { $multiply: ['$executed_quantity', '$executed_price'] }, 0] } },
+      total_sell_qty: { $sum: { $cond: [{ $eq: ['$transaction_type', 'SELL'] }, '$executed_quantity', 0] } },
+      total_sell_value: { $sum: { $cond: [{ $eq: ['$transaction_type', 'SELL'] }, { $multiply: ['$executed_quantity', '$executed_price'] }, 0] } },
       tradingsymbol: { $first: '$tradingsymbol' },
       exchange: { $first: '$exchange' },
       master_id: { $first: '$master_id' },
@@ -148,10 +161,14 @@ async function _executeSettlement() {
   );
   console.log(`   Soft-deleted ${deleteResult.modifiedCount} old trade(s).`);
 
-  // ── Phase 5: Create re-opening trades at close price ─────────────
-  console.log('📊 [Settlement] Phase 5: Creating re-opening trades...');
+  // ── Phase 5: Create closing + re-opening trades at settlement price ──
+  // For each open position:
+  //   1. CLOSING trade (opposite side) at settlement price — shows deals/P&L in history
+  //   2. RE-OPENING trade (same side) at settlement price — fresh position for new week
+  console.log('📊 [Settlement] Phase 5: Creating closing + re-opening trades...');
 
   const affectedUsers = new Set();
+  let closedCount = 0;
   let reopenedCount = 0;
 
   for (let i = 0; i < openPositions.length; i++) {
@@ -173,10 +190,48 @@ async function _executeSettlement() {
     }
 
     const absQty = Math.abs(pos.net_qty);
-    const openSide = pos.net_qty > 0 ? 'BUY' : 'SELL';
+    const isLong = pos.net_qty > 0;
+    const openSide = isLong ? 'BUY' : 'SELL';
+    const closeSide = isLong ? 'SELL' : 'BUY';
+
+    // Calculate avg entry price for P&L on the closing trade
+    const avgEntryPrice = isLong
+      ? (pos.total_buy_qty > 0 ? pos.total_buy_value / pos.total_buy_qty : 0)
+      : (pos.total_sell_qty > 0 ? pos.total_sell_value / pos.total_sell_qty : 0);
+
+    // P&L for the closing trade: (exit - entry) × qty for longs, (entry - exit) × qty for shorts
+    const closingPnl = isLong
+      ? (closePrice - avgEntryPrice) * absQty
+      : (avgEntryPrice - closePrice) * absQty;
 
     try {
-      // Create ONLY the re-opening trade (old trades already soft-deleted)
+      // 1. CLOSING trade — opposite side at settlement price
+      // Soft-deleted immediately so metricsEngine ignores it (only reopening trade counts).
+      // History page includes settlement trades via special query.
+      await Trade.create({
+        user_id: userId,
+        master_id: pos.master_id,
+        admin_id: pos.admin_id || null,
+        instrument_token: tokenStr,
+        tradingsymbol: pos.tradingsymbol,
+        exchange: pos.exchange,
+        transaction_type: closeSide,
+        quantity: absQty,
+        price: closePrice,
+        order_type: 'MARKET',
+        placed_by: 'SYSTEM',
+        trade_type: 'carry_forward',
+        status: 'completed',
+        executed_at: new Date(),
+        executed_price: closePrice,
+        executed_quantity: absQty,
+        pnl: 0,
+        deleted_at: new Date(),
+        remarks: 'Settlement: position closed at settlement price',
+      });
+      closedCount++;
+
+      // 2. RE-OPENING trade — same side at settlement price (fresh position for new week)
       await Trade.create({
         user_id: userId,
         master_id: pos.master_id,
@@ -204,16 +259,25 @@ async function _executeSettlement() {
     }
   }
 
-  console.log(`   Created ${reopenedCount} re-opening trade(s) for ${affectedUsers.size} user(s).`);
+  console.log(`   Created ${closedCount} closing + ${reopenedCount} re-opening trade(s) for ${affectedUsers.size} user(s).`);
 
-  // ── Phase 6: Rebuild metrics for all affected users ──────────────
+  // ── Phase 6: Update metricsEngine price maps + full rebuild ─────
   console.log('📊 [Settlement] Phase 6: Rebuilding metrics...');
   _settlementState.currentInstrument = 'Rebuilding metrics...';
   broadcastProgress();
 
-  for (const uid of affectedUsers) {
-    try { await metricsEngine.onTradeExecuted(uid); } catch (_) {}
+  // Update metricsEngine's LTP/bid/ask maps with settlement prices
+  // so CMP = ATP = settlement price (position P&L = 0)
+  for (const [tokenStr, price] of Object.entries(closePriceMap)) {
+    metricsEngine._ltpMap.set(tokenStr, price);
+    metricsEngine._bidMap.set(tokenStr, price);
+    metricsEngine._askMap.set(tokenStr, price);
   }
+
+  // Full rebuild of ALL user caches — not just affected users.
+  // This ensures users with fully closed positions also get their metrics reset to 0.
+  // After settlement, only carry_forward trades exist → brokerage = 0, fifoPnl = 0.
+  await metricsEngine._rebuildAllUserCaches();
 
   // ── Phase 7: Broadcast settlement ticks (close price as LTP/bid/ask) ──
   console.log('📊 [Settlement] Phase 7: Broadcasting settlement ticks...');
@@ -221,21 +285,25 @@ async function _executeSettlement() {
   broadcastProgress();
 
   // Broadcast close prices for ALL instruments in closePriceMap
-  const ticks = Object.entries(closePriceMap).map(([token, price]) => {
-    const spread = price * 0.0005;
-    return {
-      instrument_token: token,
-      last_price: price,
-      bid_price: price > 0 ? price - spread : price,
-      ask_price: price > 0 ? price + spread : price,
-      open: price,
-      high: price,
-      low: price,
-      close: price,
-      change: 0,
-      change_percent: 0,
-    };
-  });
+  // bid = ask = close price (no fake spread — settlement price is exact)
+  const ticks = Object.entries(closePriceMap).map(([token, price]) => ({
+    instrument_token: token,
+    last_price: price,
+    bid_price: price,
+    ask_price: price,
+    close: price,
+    is_settlement: true,
+    change: 0,
+    change_percent: 0,
+  }));
+
+  // Store in settlement prices map for new subscribers
+  if (!livePriceService._settlementPrices) livePriceService._settlementPrices = new Map();
+  for (const [token, price] of Object.entries(closePriceMap)) {
+    livePriceService._settlementPrices.set(token, price);
+    livePriceService.latestPrices.set(token, price);
+    livePriceService.latestPrices.set(parseInt(token), price);
+  }
 
   // Broadcast in batches
   const BATCH = 100;
@@ -250,12 +318,12 @@ async function _executeSettlement() {
   _settlementState.currentInstrument = '';
   _settlementState.completedAt = new Date();
   _settlementState.running = false;
-  _settlementState.closedTrades = deleteResult.modifiedCount;
+  _settlementState.closedTrades = closedCount;
   _settlementState.reopenedTrades = reopenedCount;
   _settlementState.usersAffected = affectedUsers.size;
   broadcastProgress();
 
-  console.log(`✅ [Settlement] Complete: ${deleteResult.modifiedCount} old trades deleted, ${reopenedCount} re-opened, ${affectedUsers.size} users.`);
+  console.log(`✅ [Settlement] Complete: ${deleteResult.modifiedCount} old trades deleted, ${closedCount} closed, ${reopenedCount} re-opened, ${affectedUsers.size} users.`);
 }
 
 module.exports = { runSettlement, getState, resetState };
