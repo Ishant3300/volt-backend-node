@@ -44,6 +44,12 @@ async function _squareOffUserSegments(userId, segments) {
 
     if (!closePrice || closePrice <= 0) continue;
 
+    // Calculate P&L: (exit - entry) × qty for longs, (entry - exit) × qty for shorts
+    const avgEntry = pos.net_qty > 0 ? pos.avg_buy_price : pos.avg_sell_price;
+    const closingPnl = pos.net_qty > 0
+      ? (closePrice - avgEntry) * absQty
+      : (avgEntry - closePrice) * absQty;
+
     try {
       const user = await User.findById(userId).select('master_id admin_id').lean();
       if (!user) continue;
@@ -65,7 +71,7 @@ async function _squareOffUserSegments(userId, segments) {
         executed_at: new Date(),
         executed_price: closePrice,
         executed_quantity: absQty,
-        pnl: 0,
+        pnl: Math.round(closingPnl * 100) / 100,
         remarks: `Intraday square-off: ${pos.segment} segment closed by admin`,
       });
 

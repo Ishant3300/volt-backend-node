@@ -15,7 +15,7 @@ const mongoose = require('mongoose');
  */
 const getRejectionLog = async (req, res) => {
   try {
-    const { page = 1, limit = 50, search } = req.query;
+    const { page = 1, limit = 50, search, user_id } = req.query;
     const skip = (parseInt(page) - 1) * parseInt(limit);
 
     const role = req.admin ? 'admin' : req.master ? 'master' : 'user';
@@ -29,13 +29,16 @@ const getRejectionLog = async (req, res) => {
       ],
     };
 
-    if (role === 'user') {
+    // If a specific user_id is requested (from username_view), filter to that user
+    if (user_id && (role === 'admin' || role === 'master')) {
+      filter.user_id = new mongoose.Types.ObjectId(user_id);
+    } else if (role === 'user') {
       filter.user_id = new mongoose.Types.ObjectId(callerId);
     } else if (role === 'master') {
       const childIds = await User.find({ master_id: callerId, deleted_at: null }).distinct('_id');
       filter.user_id = { $in: childIds };
     }
-    // admin: no user filter — sees all
+    // admin without user_id: no user filter — sees all
 
     if (search) {
       filter.tradingsymbol = { $regex: search, $options: 'i' };

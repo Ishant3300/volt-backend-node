@@ -155,6 +155,28 @@ const _squareOffAllPositions = async (user, positions) => {
         type: 'margin_square_off',
         message: `Your positions have been auto-squared off. Equity dropped below ${user.margin_square_off_percentage}% of your credit.`
       });
+
+      // Also notify all admin and master connections viewing this user
+      // so their Position tab refreshes immediately
+      if (_livePriceService.wss) {
+        const squareOffMsg = JSON.stringify({
+          type: 'trade_executed',
+          user_id: user._id.toString(),
+          tradingsymbol: 'ALL',
+          transaction_type: 'SQUARE_OFF',
+          quantity: 0,
+          status: 'completed',
+          message: `Margin square-off: all positions closed for ${user.username}`,
+        });
+        _livePriceService.wss.clients.forEach(client => {
+          if (client.readyState === 1) {
+            // Send to admin clients and any connection authenticated as this user
+            if (client.isAdmin || client.userId === user._id.toString() || client.userId === user.master_id?.toString()) {
+              client.send(squareOffMsg);
+            }
+          }
+        });
+      }
     }
 
     // Notify via FCM

@@ -360,8 +360,23 @@ const placeTrade = async (req, res) => {
 
                 if (isTurnover) {
                     // ── TURNOVER MODE: all limits are in raw quantity ──────────────────
-                    // VALIDATION 1: break_qty per single order
-                    if (breakValue > 0 && quantity > breakValue) {
+
+                    // Determine if this is a closing trade (square-off) — closing trades bypass breakup limit
+                    let isClosingForBreakup = false;
+                    {
+                        const posAggBrk = await Trade.aggregate([
+                            { $match: { user_id: user._id, instrument_token, status: 'completed', deleted_at: null } },
+                            { $group: { _id: null,
+                                total_buy_qty: { $sum: { $cond: [{ $eq: ['$transaction_type', 'BUY'] }, '$executed_quantity', 0] } },
+                                total_sell_qty: { $sum: { $cond: [{ $eq: ['$transaction_type', 'SELL'] }, '$executed_quantity', 0] } }
+                            }}
+                        ]).session(session);
+                        const netQtyBrk = posAggBrk.length > 0 ? posAggBrk[0].total_buy_qty - posAggBrk[0].total_sell_qty : 0;
+                        isClosingForBreakup = (transaction_type === 'SELL' && netQtyBrk > 0) || (transaction_type === 'BUY' && netQtyBrk < 0);
+                    }
+
+                    // VALIDATION 1: break_qty per single order (skip for closing/square-off trades)
+                    if (!isClosingForBreakup && breakValue > 0 && quantity > breakValue) {
                         throw new Error(
                             `Order size exceeds breakup limit. Max qty per order: ${breakValue}, Requested: ${quantity}. Please split your order.`
                         );
@@ -426,8 +441,22 @@ const placeTrade = async (req, res) => {
                     // ── LOT MODE: all limits are in lots ──────────────────────────────
                     const requestedLots = Math.ceil(quantity / lotSize);
 
-                    // VALIDATION 1: break_qty per single order (in lots)
-                    if (breakValue > 0 && requestedLots > breakValue) {
+                    // Determine if this is a closing trade (square-off) — closing trades bypass breakup limit
+                    let isClosingForBreakupLot = false;
+                    {
+                        const posAggBrkLot = await Trade.aggregate([
+                            { $match: { user_id: user._id, instrument_token, status: 'completed', deleted_at: null } },
+                            { $group: { _id: null,
+                                total_buy_qty: { $sum: { $cond: [{ $eq: ['$transaction_type', 'BUY'] }, '$executed_quantity', 0] } },
+                                total_sell_qty: { $sum: { $cond: [{ $eq: ['$transaction_type', 'SELL'] }, '$executed_quantity', 0] } }
+                            }}
+                        ]).session(session);
+                        const netQtyBrkLot = posAggBrkLot.length > 0 ? posAggBrkLot[0].total_buy_qty - posAggBrkLot[0].total_sell_qty : 0;
+                        isClosingForBreakupLot = (transaction_type === 'SELL' && netQtyBrkLot > 0) || (transaction_type === 'BUY' && netQtyBrkLot < 0);
+                    }
+
+                    // VALIDATION 1: break_qty per single order in lots (skip for closing/square-off trades)
+                    if (!isClosingForBreakupLot && breakValue > 0 && requestedLots > breakValue) {
                         throw new Error(
                             `Order size exceeds breakup limit. Max lots per order: ${breakValue}, Requested: ${requestedLots} lot(s). Please split your order.`
                         );
