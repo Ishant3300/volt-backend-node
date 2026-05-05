@@ -53,8 +53,20 @@ const checkUser = async (userId, metrics) => {
       console.log(`🛡️  [MarginSquareOff] User ${user.username}: equity=₹${equity.toFixed(2)} < threshold=₹${threshold.toFixed(2)} (${percentage}% of ₹${credit}), squaring off`);
       _squaringOff.add(userId);
 
+      // Capture prices at the moment the condition triggered (before any async delay)
+      const priceSnapshot = {};
+      for (const pos of metrics.positions) {
+        if (pos.net_qty !== 0) {
+          priceSnapshot[pos.instrument_token] = {
+            bid: pos.bid_price || pos.cmp || pos.ltp,
+            ask: pos.ask_price || pos.cmp || pos.ltp,
+            ltp: pos.ltp,
+          };
+        }
+      }
+
       try {
-        await _squareOffAllPositions(user, metrics.positions);
+        await _squareOffAllPositions(user, metrics.positions, priceSnapshot);
       } finally {
         _squaringOff.delete(userId);
       }
@@ -65,7 +77,7 @@ const checkUser = async (userId, metrics) => {
   }
 };
 
-const _squareOffAllPositions = async (user, positions) => {
+const _squareOffAllPositions = async (user, positions, priceSnapshot) => {
   const session = await mongoose.startSession();
   try {
     await session.withTransaction(async () => {
@@ -78,7 +90,15 @@ const _squareOffAllPositions = async (user, positions) => {
 
         const closeType = netQty > 0 ? 'SELL' : 'BUY';
         const closeQty = Math.abs(netQty);
-        const closePrice = pos.ltp || (netQty > 0 ? pos.avg_buy_price : pos.avg_sell_price);
+
+        // Use the price snapshot captured at detection time (not current live price)
+        const snapshot = priceSnapshot[pos.instrument_token] || {};
+        let closePrice;
+        if (closeType === 'SELL') {
+          closePrice = snapshot.bid || pos.ltp || (netQty > 0 ? pos.avg_buy_price : pos.avg_sell_price);
+        } else {
+          closePrice = snapshot.ask || pos.ltp || (netQty > 0 ? pos.avg_buy_price : pos.avg_sell_price);
+        }
 
         let pnl = 0;
         if (netQty > 0) pnl = (closePrice - pos.avg_buy_price) * closeQty;
