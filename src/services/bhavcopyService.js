@@ -2,9 +2,9 @@
  * Bhavcopy Service
  *
  * Fetches official settlement/close prices from exchange bhavcopy CSVs:
- *   1. NSE F&O  → nsearchives.nseindia.com (session-based, cookie jar)
- *   2. MCX      → mcxindia.com (session-based) → Playwright fallback → Samco pwsh fallback
- *   3. BSE F&O  → covered by NSE bhavcopy on trading days
+ *   1. NSE F&O  → nsearchives.nseindia.com (session-based, cookie jar + manual forwarding)
+ *   2. MCX      → mcxindia.com (ViewState POST) → Playwright fallback → Samco pwsh fallback
+ *   3. BSE F&O  → bseindia.com direct download
  *
  * Main entry: fetchAndApplyBhavcopy(targetDate?)
  */
@@ -19,6 +19,7 @@ const KiteInstrument = require('../models/KiteInstrument');
 
 const TMP_DIR = path.join(__dirname, '../../scripts/downloads');
 const BROWSER_UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
+const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
 // ═══════════════════════════════════════════════════════════════════════════
 // HELPERS
@@ -67,12 +68,8 @@ function getLastFriday() {
 
 
 // ═══════════════════════════════════════════════════════════════════════════
-// NSE SESSION-BASED DOWNLOAD
+// NSE — FIXED: cross-subdomain cookie forwarding + request delays
 // ═══════════════════════════════════════════════════════════════════════════
-// NSE requires:
-//   1. Visit nseindia.com  → sets nsit cookie
-//   2. Hit any API route   → upgrades session
-//   3. Download archive    → now accepted
 
 async function buildNSEClient() {
   const jar = new CookieJar();
@@ -84,47 +81,77 @@ async function buildNSEClient() {
       'User-Agent': BROWSER_UA,
       'Accept-Language': 'en-US,en;q=0.9',
       'Accept-Encoding': 'gzip, deflate, br',
+      'Connection': 'keep-alive',
     },
-    validateStatus: () => true, // Don't throw on 4xx
+    validateStatus: () => true,
   }));
 
   console.log('   [NSE] Establishing session...');
 
-  // Step 1: land on homepage — sets nsit + nseappid cookies
+  // Step 1: homepage — sets nsit + nseappid
   await client.get('https://www.nseindia.com/', {
-    headers: { Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8' },
+    headers: {
+      Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+      'Upgrade-Insecure-Requests': '1',
+    },
   });
 
-  // Step 2: hit a JSON API — NSE uses this to fingerprint legit sessions
+  // CRITICAL: NSE bot detection checks timing. Instant requests = bot flag.
+  await sleep(2000);
+
+  // Step 2: API call — upgrades session to "verified browser"
   await client.get('https://www.nseindia.com/api/marketStatus', {
-    headers: { Referer: 'https://www.nseindia.com/' },
+    headers: {
+      Accept: 'application/json, text/plain, */*',
+      Referer: 'https://www.nseindia.com/',
+      'X-Requested-With': 'XMLHttpRequest',
+    },
   });
+
+  await sleep(1000);
+
+  // Step 3: visit derivatives section — gets us closer to FO data permission
+  await client.get('https://www.nseindia.com/market-data/derivatives-market', {
+    headers: {
+      Accept: 'text/html,application/xhtml+xml,*/*;q=0.8',
+      Referer: 'https://www.nseindia.com/',
+    },
+  });
+
+  await sleep(1500);
 
   console.log('   [NSE] Session ready.');
-  return client;
+  return { client, jar };
 }
 
-/**
- * Download NSE F&O bhavcopy zip using session-based approach.
- * Tries both new (2024+) and old URL patterns.
- * @returns {Buffer|null} ZIP buffer or null
- */
 async function downloadNseSessionZip(date) {
   const { dd, yyyy, mon, yyyymmdd } = dateParts(date);
 
   const urls = [
-    // New format (2024+)
+    // New UDiFF format (2024+)
     `https://nsearchives.nseindia.com/content/fo/BhavCopy_NSE_FO_0_0_0_${yyyymmdd}_F_0000.csv.zip`,
-    // Old format (pre-2024 fallback)
+    // Legacy format (fallback)
     `https://nsearchives.nseindia.com/content/historical/DERIVATIVES/${yyyy}/${mon}/fo${dd}${mon}${yyyy}bhav.csv.zip`,
   ];
 
-  let client;
+  let client, jar;
   try {
-    client = await buildNSEClient();
+    ({ client, jar } = await buildNSEClient());
   } catch (e) {
     console.warn(`   [NSE] Session setup failed: ${e.message}`);
     return null;
+  }
+
+  // CRITICAL FIX: tough-cookie scopes cookies to www.nseindia.com.
+  // nsearchives.nseindia.com is a different subdomain — the jar sends NOTHING there.
+  // Solution: manually extract cookies and forward them in the request header.
+  let manualCookieHeader = '';
+  try {
+    const cookies = await jar.getCookies('https://www.nseindia.com/');
+    manualCookieHeader = cookies.map(c => `${c.key}=${c.value}`).join('; ');
+    console.log(`   [NSE] Forwarding ${cookies.length} session cookies to nsearchives subdomain.`);
+  } catch (e) {
+    console.warn(`   [NSE] Could not extract cookies: ${e.message}`);
   }
 
   for (const url of urls) {
@@ -135,13 +162,20 @@ async function downloadNseSessionZip(date) {
       const res = await client.get(url, {
         responseType: 'arraybuffer',
         headers: {
-          Accept: 'application/octet-stream,*/*',
-          Referer: 'https://www.nseindia.com/',
+          Accept: 'application/octet-stream, application/zip, */*',
+          Referer: 'https://www.nseindia.com/market-data/derivatives-market',
+          // Forward cookies manually across subdomain boundary
+          ...(manualCookieHeader ? { Cookie: manualCookieHeader } : {}),
         },
       });
 
       if (res.status === 404) {
-        console.log(`   [NSE] 404 — trying next URL pattern...`);
+        console.log(`   [NSE] 404 — trading holiday or URL pattern changed, trying next...`);
+        continue;
+      }
+      if (res.status === 403) {
+        console.warn(`   [NSE] 403 — session rejected (bot fingerprinted). Will retry with delay.`);
+        await sleep(3000);
         continue;
       }
       if (res.status !== 200) {
@@ -151,99 +185,159 @@ async function downloadNseSessionZip(date) {
 
       const buf = Buffer.from(res.data);
       if (buf.length < 100) {
-        console.log(`   [NSE] Response too small (${buf.length} bytes) — likely blocked.`);
+        console.log(`   [NSE] Response too small (${buf.length}B) — likely an HTML error page.`);
         continue;
       }
 
-      // Verify it's actually a ZIP (not HTML error page)
+      // Verify ZIP magic bytes: PK\x03\x04
       if (buf.slice(0, 4).toString('hex') !== '504b0304') {
-        const preview = buf.toString('utf8').substring(0, 50);
-        console.log(`   [NSE] Not a ZIP (${buf.length} bytes, starts with: ${preview.substring(0, 30)})`);
+        const preview = buf.toString('utf8', 0, 80).replace(/\n/g, ' ');
+        console.log(`   [NSE] Not a ZIP — got: "${preview.substring(0, 60)}..."`);
         continue;
       }
 
-      console.log(`   [NSE] ✅ Downloaded ${(buf.length / 1024).toFixed(1)} KB`);
+      console.log(`   [NSE] ✅ ${(buf.length / 1024).toFixed(1)} KB downloaded.`);
       return buf;
     } catch (e) {
-      console.warn(`   [NSE] Download error for ${filename}: ${e.message}`);
-      continue;
+      console.warn(`   [NSE] Error on ${filename}: ${e.message}`);
     }
   }
 
   return null;
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// MCX SESSION-BASED DOWNLOAD + FALLBACKS
-// ═══════════════════════════════════════════════════════════════════════════
-// mcxindia.com now needs JS cookies. Fallback chain:
-//   1. mcxindia.com with session (axios + cookie jar)
-//   2. mcxindia.com via Playwright (handles JS cookies)
-//   3. Samco via pwsh (legacy fallback)
 
-/**
- * Try MCX direct download with session cookies.
- * @returns {Buffer|null} CSV buffer or null
- */
+// ═══════════════════════════════════════════════════════════════════════════
+// MCX — FIXED: ViewState POST instead of blind GET
+// ═══════════════════════════════════════════════════════════════════════════
+
+/** Extract a hidden ASP.NET form field value from HTML. */
+function extractAspNetField(html, fieldName) {
+  const match = html.match(new RegExp(
+    `<input[^>]+id="${fieldName}"[^>]+value="([^"]*)"`, 'i'
+  )) || html.match(new RegExp(
+    `<input[^>]+name="${fieldName}"[^>]+value="([^"]*)"`, 'i'
+  ));
+  return match ? match[1] : null;
+}
+
 async function downloadMcxSession(date) {
-  const { ddmmyyyy } = dateParts(date);
+  const { ddmmyyyy, yyyymmdd } = dateParts(date);
 
   const jar = new CookieJar();
   const client = wrapper(axios.create({
     jar,
     withCredentials: true,
     timeout: 30000,
-    headers: { 'User-Agent': BROWSER_UA },
+    maxRedirects: 5,
+    headers: {
+      'User-Agent': BROWSER_UA,
+      'Accept-Language': 'en-US,en;q=0.9',
+    },
     validateStatus: () => true,
   }));
 
-  console.log('   [MCX] Establishing session on mcxindia.com...');
-
   try {
-    // Step 1: visit homepage
+    // Step 1: Homepage — get ASP.NET_SessionId cookie
+    console.log('   [MCX] Establishing session...');
     await client.get('https://www.mcxindia.com/', {
-      headers: { Accept: 'text/html,application/xhtml+xml,*/*' },
+      headers: { Accept: 'text/html,application/xhtml+xml,*/*;q=0.8' },
     });
+    await sleep(1000);
 
-    // Step 2: visit bhavcopy page to set session context
-    await client.get('https://www.mcxindia.com/market-data/bhavcopy', {
-      headers: { Referer: 'https://www.mcxindia.com/' },
-    });
-
-    const url = `https://www.mcxindia.com/BackPage.aspx?cat=bhavcopyarchive&date=${ddmmyyyy}`;
-    console.log(`   [MCX] Downloading: ${url}`);
-
-    const res = await client.get(url, {
-      responseType: 'arraybuffer',
+    // Step 2: Visit bhavcopy page — get ViewState tokens
+    // CRITICAL FIX: BackPage.aspx is ASP.NET WebForms.
+    // A blind GET returns empty body. You must POST with __VIEWSTATE + __EVENTVALIDATION.
+    console.log('   [MCX] Fetching ViewState from bhavcopy page...');
+    const pageRes = await client.get('https://www.mcxindia.com/market-data/bhavcopy', {
       headers: {
-        Referer: 'https://www.mcxindia.com/market-data/bhavcopy',
-        Accept: 'application/octet-stream,*/*',
+        Accept: 'text/html,application/xhtml+xml,*/*;q=0.8',
+        Referer: 'https://www.mcxindia.com/',
       },
     });
 
+    if (pageRes.status !== 200) {
+      console.warn(`   [MCX] Bhavcopy page returned ${pageRes.status}`);
+      return null;
+    }
+
+    const html = pageRes.data;
+    const viewState = extractAspNetField(html, '__VIEWSTATE');
+    const viewStateGenerator = extractAspNetField(html, '__VIEWSTATEGENERATOR');
+    const eventValidation = extractAspNetField(html, '__EVENTVALIDATION');
+
+    if (!viewState) {
+      console.warn('   [MCX] Could not extract __VIEWSTATE — page structure may have changed.');
+    }
+
+    console.log(`   [MCX] ViewState: ${viewState ? `${viewState.substring(0, 20)}...` : 'not found'}`);
+    await sleep(800);
+
+    const backPageUrl = `https://www.mcxindia.com/BackPage.aspx?cat=bhavcopyarchive&date=${ddmmyyyy}`;
+
+    let res;
+    if (viewState) {
+      // POST with ViewState — the correct ASP.NET WebForms approach
+      const formData = new URLSearchParams();
+      formData.append('__VIEWSTATE', viewState);
+      if (viewStateGenerator) formData.append('__VIEWSTATEGENERATOR', viewStateGenerator);
+      if (eventValidation) formData.append('__EVENTVALIDATION', eventValidation);
+      formData.append('cat', 'bhavcopyarchive');
+      formData.append('date', ddmmyyyy);
+
+      console.log(`   [MCX] POSTing to BackPage.aspx (date=${ddmmyyyy})...`);
+      res = await client.post(backPageUrl, formData.toString(), {
+        responseType: 'arraybuffer',
+        headers: {
+          'Content-Type': 'application/x-www-form-urlencoded',
+          Referer: 'https://www.mcxindia.com/market-data/bhavcopy',
+          Accept: 'application/octet-stream, application/zip, text/csv, */*',
+          Origin: 'https://www.mcxindia.com',
+        },
+      });
+    } else {
+      // ViewState missing — fall back to GET
+      console.log(`   [MCX] Trying GET fallback on BackPage.aspx...`);
+      res = await client.get(backPageUrl, {
+        responseType: 'arraybuffer',
+        headers: {
+          Referer: 'https://www.mcxindia.com/market-data/bhavcopy',
+          Accept: 'application/octet-stream, */*',
+        },
+      });
+    }
+
     if (res.status !== 200) {
-      console.warn(`   [MCX] Session download HTTP ${res.status}`);
+      console.warn(`   [MCX] BackPage.aspx returned HTTP ${res.status}`);
       return null;
     }
 
     const buf = Buffer.from(res.data);
-    if (buf.length < 500) {
-      console.warn(`   [MCX] Session download too small (${buf.length} bytes) — cookie not accepted.`);
+    if (buf.length < 200) {
+      console.warn(`   [MCX] Response too small (${buf.length}B) — ViewState approach didn't work.`);
       return null;
     }
 
-    // Extract CSV from ZIP if needed
-    return extractCsvFromBuffer(buf, 'MCX-Session');
+    // Check for HTML error response
+    const preview = buf.toString('utf8', 0, 50);
+    if (preview.startsWith('<!') || preview.startsWith('<html')) {
+      console.warn(`   [MCX] Got HTML instead of file — session/ViewState rejected.`);
+      return null;
+    }
+
+    const csvBuf = extractCsvFromBuffer(buf, 'MCX-Session');
+    if (csvBuf) {
+      console.log(`   [MCX] ✅ Session+ViewState POST: ${(csvBuf.length / 1024).toFixed(1)} KB`);
+    }
+    return csvBuf;
+
   } catch (e) {
     console.warn(`   [MCX] Session download failed: ${e.message}`);
     return null;
   }
 }
 
-/**
- * Try MCX download via Playwright (handles JS-set cookies).
- * @returns {Buffer|null} CSV buffer or null
- */
+// Playwright fallback — fixed download trigger
 async function downloadMcxPlaywright(date) {
   let chromium;
   try {
@@ -254,50 +348,63 @@ async function downloadMcxPlaywright(date) {
   }
 
   const { ddmmyyyy, yyyymmdd } = dateParts(date);
-  const url = `https://www.mcxindia.com/BackPage.aspx?cat=bhavcopyarchive&date=${ddmmyyyy}`;
+  const backPageUrl = `https://www.mcxindia.com/BackPage.aspx?cat=bhavcopyarchive&date=${ddmmyyyy}`;
   ensureTmpDir();
-  const zipPath = path.join(TMP_DIR, `MCX_${yyyymmdd}.zip`);
+  const zipPath = path.join(TMP_DIR, `MCX_${yyyymmdd}_pw.zip`);
 
   console.log('   [MCX] Trying Playwright...');
   let browser;
   try {
-    browser = await chromium.launch({ headless: true, args: ['--no-sandbox'] });
-    const context = await browser.newContext({ userAgent: BROWSER_UA });
+    browser = await chromium.launch({ headless: true, args: ['--no-sandbox', '--disable-setuid-sandbox'] });
+    const context = await browser.newContext({
+      userAgent: BROWSER_UA,
+      acceptDownloads: true,
+    });
     const page = await context.newPage();
 
+    // Establish session
     await page.goto('https://www.mcxindia.com/market-data/bhavcopy', {
-      waitUntil: 'networkidle', timeout: 30000,
+      waitUntil: 'networkidle',
+      timeout: 30000,
     });
+    await page.waitForTimeout(2000);
 
+    // FIX: Use evaluate to inject an anchor click — more reliable than page.goto for downloads
     const [download] = await Promise.all([
       page.waitForEvent('download', { timeout: 30000 }),
-      page.goto(url),
+      page.evaluate((url) => {
+        const a = document.createElement('a');
+        a.href = url;
+        a.style.display = 'none';
+        document.body.appendChild(a);
+        a.click();
+        setTimeout(() => document.body.removeChild(a), 100);
+      }, backPageUrl),
     ]);
 
     await download.saveAs(zipPath);
-    const stat = fs.statSync(zipPath);
-    if (stat.size < 500) {
-      console.warn(`   [MCX] Playwright download too small: ${stat.size} bytes`);
-      try { fs.unlinkSync(zipPath); } catch (_) {}
+    const { size } = fs.statSync(zipPath);
+
+    if (size < 200) {
+      console.warn(`   [MCX] Playwright download too small: ${size}B`);
       return null;
     }
 
-    console.log(`   [MCX] ✅ Playwright downloaded ${(stat.size / 1024).toFixed(1)} KB`);
+    console.log(`   [MCX] ✅ Playwright: ${(size / 1024).toFixed(1)} KB`);
     const buf = fs.readFileSync(zipPath);
-    try { fs.unlinkSync(zipPath); } catch (_) {}
     return extractCsvFromBuffer(buf, 'MCX-Playwright');
+
   } catch (e) {
     console.warn(`   [MCX] Playwright failed: ${e.message}`);
-    try { if (fs.existsSync(zipPath)) fs.unlinkSync(zipPath); } catch (_) {}
     return null;
   } finally {
     if (browser) await browser.close().catch(() => {});
+    try { if (fs.existsSync(zipPath)) fs.unlinkSync(zipPath); } catch (_) {}
   }
 }
 
 /**
  * Try MCX download via Samco pwsh (legacy fallback — works on Windows production).
- * @returns {Buffer|null} CSV buffer or null
  */
 async function downloadMcxSamcoPwsh(date) {
   ensureTmpDir();
@@ -351,18 +458,312 @@ async function downloadMcxSamcoPwsh(date) {
   return null;
 }
 
+
+// ═══════════════════════════════════════════════════════════════════════════
+// BSE — FIXED: actually implemented (was hardcoded to return 0)
+// ═══════════════════════════════════════════════════════════════════════════
+
+async function downloadBseFnO(date) {
+  const { dd, mm, yy, yyyy, yyyymmdd } = dateParts(date);
+
+  // ─── Attempt 1: BSE direct (works when Cloudflare isn't blocking) ──────
+  const directUrls = [
+    `https://www.bseindia.com/download/BhavCopy/F%26O/fo${dd}${mm}${yy}bhav.csv.zip`,
+    `https://www.bseindia.com/download/BhavCopy/F%26O/fo${dd}${mm}${yyyy}bhav.csv.zip`,
+  ];
+
+  for (const url of directUrls) {
+    const filename = url.split('/').pop();
+    console.log(`   [BSE] Trying direct: ${filename}`);
+    try {
+      const res = await axios.get(url, {
+        responseType: 'arraybuffer',
+        timeout: 20000,
+        validateStatus: () => true,
+        headers: {
+          'User-Agent': BROWSER_UA,
+          Referer: 'https://www.bseindia.com/markets/derivatives/DeriReports/BhavCopy.aspx',
+          Accept: 'application/octet-stream, application/zip, */*',
+        },
+      });
+
+      if (res.status !== 200) { console.log(`   [BSE] HTTP ${res.status} — trying next.`); continue; }
+
+      const buf = Buffer.from(res.data);
+      const preview = buf.toString('utf8', 0, 60);
+      if (preview.includes('<!') || preview.includes('<html') || preview.includes('cloudflare')) {
+        console.warn(`   [BSE] Cloudflare block on ${filename} — trying next.`);
+        continue;
+      }
+      const csvBuf = extractCsvFromBuffer(buf, 'BSE-FO');
+      if (csvBuf) return csvBuf;
+    } catch (e) {
+      console.warn(`   [BSE] Direct error: ${e.message}`);
+    }
+  }
+
+  // ─── Attempt 2: Samco pwsh with auto-discovered BSE path ──────────────
+  const { execSync } = require('child_process');
+  let shell = null;
+  try { execSync('pwsh -Version', { stdio: 'pipe', timeout: 5000 }); shell = 'pwsh'; } catch (_) {
+    try { execSync('powershell -Version', { stdio: 'pipe', timeout: 5000 }); shell = 'powershell'; } catch (__) {}
+  }
+
+  if (shell) {
+    ensureTmpDir();
+
+    const discoveryScript = path.join(TMP_DIR, `samco_discover_${Date.now()}.ps1`);
+    const discoveryOut = path.join(TMP_DIR, `samco_links_${Date.now()}.txt`);
+
+    // Step 1: scrape the Samco bhavcopy page to find the real BSE download link
+    const discoverPs = [
+      '$session = $null',
+      '$page = Invoke-WebRequest -Uri "https://www.samco.in/bhavcopy-nse-bse-mcx" -SessionVariable session -UserAgent "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" -TimeoutSec 15',
+      '$links = ($page.Links | Where-Object { $_.href -like "*/datacopy/*" } | Select-Object -ExpandProperty href)',
+      `$links | Out-File -FilePath "${discoveryOut}" -Encoding UTF8`,
+    ].join('\n');
+
+    let bseLinks = [];
+    try {
+      fs.writeFileSync(discoveryScript, discoverPs, 'utf8');
+      execSync(`${shell} -ExecutionPolicy Bypass -File "${discoveryScript}"`, { stdio: 'pipe', timeout: 30000 });
+      if (fs.existsSync(discoveryOut)) {
+        const raw = fs.readFileSync(discoveryOut, 'utf8');
+        bseLinks = raw.split('\n')
+          .map(l => l.trim())
+          .filter(l => l.includes('datacopy') && (
+            l.toUpperCase().includes('BSE') || l.toUpperCase().includes('BFO')
+          ));
+        console.log(`   [BSE] Samco discovered ${bseLinks.length} BSE link(s)`);
+      }
+    } catch (e) {
+      console.warn(`   [BSE] Samco link discovery failed: ${e.message}`);
+    }
+    try { fs.unlinkSync(discoveryScript); } catch (_) {}
+    try { if (fs.existsSync(discoveryOut)) fs.unlinkSync(discoveryOut); } catch (_) {}
+
+    // Step 2: download each discovered link using the same session
+    for (const link of bseLinks) {
+      const fullUrl = link.startsWith('http') ? link : `https://www.samco.in${link}`;
+      const outPath = path.join(TMP_DIR, `samco_BSE_${yyyymmdd}_${Date.now()}.csv`);
+
+      const dlScript = path.join(TMP_DIR, `samco_dl_BSE_${Date.now()}.ps1`);
+      const dlPs = [
+        '$session = $null',
+        '$null = Invoke-WebRequest -Uri "https://www.samco.in/bhavcopy-nse-bse-mcx" -SessionVariable session -UserAgent "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" -TimeoutSec 15',
+        `Invoke-WebRequest -Uri "${fullUrl}" -WebSession $session -UserAgent "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" -OutFile "${outPath}" -TimeoutSec 30`,
+      ].join('\n');
+
+      try {
+        fs.writeFileSync(dlScript, dlPs, 'utf8');
+        execSync(`${shell} -ExecutionPolicy Bypass -File "${dlScript}"`, { stdio: 'pipe', timeout: 60000 });
+      } catch (_) {}
+      try { fs.unlinkSync(dlScript); } catch (_) {}
+
+      if (fs.existsSync(outPath)) {
+        const buf = fs.readFileSync(outPath);
+        try { fs.unlinkSync(outPath); } catch (_) {}
+        if (buf.length > 500) {
+          const preview = buf.toString('utf8', 0, 60);
+          if (!preview.startsWith('<!') && !preview.startsWith('<html')) {
+            console.log(`   [BSE] ✅ Samco BSE: ${(buf.length / 1024).toFixed(1)} KB from ${fullUrl}`);
+            console.log(`   [BSE] 📌 Working Samco path: ${fullUrl}`);
+            return extractCsvFromBuffer(buf, 'BSE-Samco');
+          }
+        }
+        console.warn(`   [BSE] Samco returned ${buf.length}B for ${fullUrl}`);
+      }
+    }
+
+    // Fallback: if page scraping found nothing, try hardcoded path candidates
+    const samcoPathCandidates = [
+      `/var/www/html/samco/public_html/Downloads/bhavcopy_data/${dateToDashed(date)}/${yyyymmdd}_BSE.csv`,
+      `/var/www/html/samco/public_html/Downloads/bhavcopy_data/${dateToDashed(date)}/${yyyymmdd}_BSEFO.csv`,
+      `/var/www/html/samco/public_html/Downloads/bhavcopy_data/${dateToDashed(date)}/${yyyymmdd}_BFO.csv`,
+      `/var/www/html/samco/public_html/Downloads/bhavcopy_data/${dateToDashed(date)}/${yyyymmdd}_BSE_FO.csv`,
+    ];
+
+    for (const samcoPath of samcoPathCandidates) {
+      const b64 = Buffer.from(samcoPath).toString('base64').replace(/=+$/, '');
+      const dataUrl = `https://www.samco.in/bse_nse_mcx/datacopy/${b64}`;
+      const outPath = path.join(TMP_DIR, `samco_BSE_${yyyymmdd}_${Date.now()}.csv`);
+
+      console.log(`   [BSE] Trying Samco path: ${samcoPath.split('/').pop()}`);
+
+      const psScript = path.join(TMP_DIR, `samco_dl_BSE_${Date.now()}.ps1`);
+      const ps = [
+        '$session = $null',
+        '$null = Invoke-WebRequest -Uri "https://www.samco.in/bhavcopy-nse-bse-mcx" -SessionVariable session -UserAgent "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" -TimeoutSec 15',
+        `Invoke-WebRequest -Uri "${dataUrl}" -WebSession $session -UserAgent "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" -OutFile "${outPath}" -TimeoutSec 30`,
+      ].join('\n');
+
+      try {
+        fs.writeFileSync(psScript, ps, 'utf8');
+        execSync(`${shell} -ExecutionPolicy Bypass -File "${psScript}"`, { stdio: 'pipe', timeout: 60000 });
+      } catch (_) {}
+      try { fs.unlinkSync(psScript); } catch (_) {}
+
+      if (fs.existsSync(outPath)) {
+        const buf = fs.readFileSync(outPath);
+        try { fs.unlinkSync(outPath); } catch (_) {}
+        if (buf.length > 500) {
+          const preview = buf.toString('utf8', 0, 80);
+          if (!preview.startsWith('<!') && !preview.startsWith('<html')) {
+            console.log(`   [BSE] ✅ Samco ${shell}: ${(buf.length / 1024).toFixed(1)} KB`);
+            console.log(`   [BSE] 📌 Working path pattern: ${samcoPath.split('/').pop()}`);
+            return extractCsvFromBuffer(buf, 'BSE-Samco');
+          }
+        }
+      }
+    }
+
+    // Debug: log all datacopy links on the page so we can find the right BSE pattern
+    const debugScript = path.join(TMP_DIR, `samco_debug_${Date.now()}.ps1`);
+    const debugOut = path.join(TMP_DIR, `samco_alllinks_${Date.now()}.txt`);
+    const debugPs = [
+      '$session = $null',
+      '$page = Invoke-WebRequest -Uri "https://www.samco.in/bhavcopy-nse-bse-mcx" -SessionVariable session -UserAgent "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" -TimeoutSec 15',
+      '$allLinks = ($page.Links | Select-Object -ExpandProperty href)',
+      `$allLinks | Out-File -FilePath "${debugOut}" -Encoding UTF8`,
+    ].join('\n');
+    try {
+      fs.writeFileSync(debugScript, debugPs, 'utf8');
+      execSync(`${shell} -ExecutionPolicy Bypass -File "${debugScript}"`, { stdio: 'pipe', timeout: 30000 });
+      if (fs.existsSync(debugOut)) {
+        const allLinks = fs.readFileSync(debugOut, 'utf8');
+        const datacopyLinks = allLinks.split('\n').filter(l => l.includes('datacopy'));
+        console.log(`   [BSE] 🔍 All Samco datacopy links on page:\n${datacopyLinks.map(l => '      ' + l.trim()).join('\n')}`);
+        fs.unlinkSync(debugOut);
+      }
+    } catch (_) {}
+    try { fs.unlinkSync(debugScript); } catch (_) {}
+  } else {
+    console.log('   [BSE] No PowerShell available — skipping Samco fallback.');
+  }
+
+  return null;
+}
+
+async function fetchBseBhavcopy(date, instruments, closePriceMap, bfoAlreadyMatched = 0) {
+  const bfoInstruments = instruments.filter(i => i.exchange === 'BFO');
+  if (bfoInstruments.length === 0) {
+    console.log('   [BSE] No BFO instruments in DB — skipping.');
+    return { matched: 0 };
+  }
+
+  // Check which BFO instruments still don't have a price after NSE step
+  const uncoveredBfo = bfoInstruments.filter(i => !closePriceMap[i.instrument_token.toString()]);
+
+  if (uncoveredBfo.length === 0) {
+    console.log(`   [BSE] All ${bfoInstruments.length} BFO instruments already covered by NSE bhavcopy — skipping BSE download.`);
+    return { matched: bfoAlreadyMatched };
+  }
+
+  console.log(`   [BSE] ${uncoveredBfo.length}/${bfoInstruments.length} BFO instruments not yet covered — fetching BSE F&O bhavcopy...`);
+
+  const csvBuf = await downloadBseFnO(date);
+  if (!csvBuf) {
+    console.warn(`   [BSE] ⚠️ No BSE F&O data available. ${bfoAlreadyMatched} BFO instruments covered via NSE.`);
+    return { matched: bfoAlreadyMatched };
+  }
+
+  const csvText = csvBuf.toString('utf8');
+  const bseMap = parseBseCSV(csvText);
+  console.log(`   [BSE] Parsed ${bseMap.size} entries.`);
+
+  const bulkOps = [];
+  let matched = 0;
+
+  for (const inst of uncoveredBfo) {
+    const key = buildMatchKey(inst);
+    if (!key) continue;
+    const data = bseMap.get(key);
+    if (data) {
+      const t = inst.instrument_token.toString();
+      closePriceMap[t] = data.settle_pr;
+      bulkOps.push({
+        updateOne: {
+          filter: { instrument_token: t },
+          update: { $set: {
+            last_price: data.settle_pr,
+            ohlc_open: data.open,
+            ohlc_high: data.high,
+            ohlc_low: data.low,
+            ohlc_close: data.settle_pr,
+          }},
+        },
+      });
+      matched++;
+    }
+  }
+
+  if (bulkOps.length > 0) await KiteInstrument.bulkWrite(bulkOps, { ordered: false });
+  const total = matched + bfoAlreadyMatched;
+  console.log(`   [BSE] ✅ ${total} BFO matched (${bfoAlreadyMatched} via NSE + ${matched} via BSE direct).`);
+  return { matched: total };
+}
+
 /**
- * Extract CSV from a buffer that might be a ZIP or direct CSV.
- * @returns {Buffer|null}
+ * Parse BSE F&O bhavcopy CSV.
+ * BSE FO columns: SYMBOL, EXPIRY_DT, STRIKE_PR, OPTIONTYPE, OPEN, HIGH, LOW, CLOSE, SETTLE_PR, etc.
  */
+function parseBseCSV(csvText) {
+  const lines = csvText.trim().split('\n');
+  if (lines.length < 2) return new Map();
+
+  const headers = lines[0].split(',').map(h => h.trim().replace(/"/g, ''));
+  const col = {};
+  headers.forEach((h, i) => { col[h] = i; });
+
+  const map = new Map();
+
+  for (let i = 1; i < lines.length; i++) {
+    const c = parseCsvLine(lines[i]);
+    if (c.length < 8) continue;
+
+    const symbol = (c[col['SYMBOL']] || c[col['SC_CODE']] || '').trim().toUpperCase();
+    const expiryRaw = (c[col['EXPIRY_DT']] || '').trim();
+    const strikeRaw = parseFloat(c[col['STRIKE_PR']] || c[col['STRIKEPRICE']] || 0);
+    const optType = (c[col['OPTIONTYPE']] || c[col['CP_FLAG']] || '').trim();
+    const open = parseFloat(c[col['OPEN']] || 0);
+    const high = parseFloat(c[col['HIGH']] || 0);
+    const low = parseFloat(c[col['LOW']] || 0);
+    const close = parseFloat(c[col['CLOSE']] || 0);
+    const settlePr = parseFloat(c[col['SETTLE_PR']] || c[col['SETTLPRICE']] || close);
+    const finType = (c[col['INSTRUMENTTYPE']] || c[col['SERIES']] || '').trim();
+
+    if (!symbol || !expiryRaw || settlePr <= 0) continue;
+
+    // Normalize expiry → YYYYMMDD
+    let expiryNorm = expiryRaw.replace(/-/g, '');
+    if (expiryNorm.length === 8 && expiryNorm.match(/^\d{8}$/)) {
+      // Already YYYYMMDD — keep as-is
+    } else if (expiryRaw.includes('-')) {
+      const parts = expiryRaw.split('-');
+      if (parts[0].length === 4) {
+        expiryNorm = expiryRaw.replace(/-/g, ''); // YYYY-MM-DD → YYYYMMDD
+      }
+    }
+
+    let instType;
+    if (finType.includes('FUT') || finType === 'XX') instType = 'FUT';
+    else if (optType === 'CE' || optType === 'C') instType = 'CE';
+    else if (optType === 'PE' || optType === 'P') instType = 'PE';
+    else continue;
+
+    const strike = instType === 'FUT' ? '0' : String(Math.round(strikeRaw));
+    const key = `${symbol}|${expiryNorm}|${strike}|${instType}`;
+    map.set(key, { open, high, low, close, settle_pr: settlePr });
+  }
+
+  return map;
+}
+
 function extractCsvFromBuffer(buf, label) {
-  // Check if ZIP
   if (buf.slice(0, 4).toString('hex') === '504b0304') {
     try {
       const zip = new AdmZip(buf);
-      const entry = zip.getEntries().find(e =>
-        e.entryName.toLowerCase().endsWith('.csv')
-      );
+      const entry = zip.getEntries().find(e => e.entryName.toLowerCase().endsWith('.csv'));
       if (entry) {
         const csvBuf = entry.getData();
         console.log(`   [${label}] ✅ Extracted ${csvBuf.length} bytes CSV from ZIP.`);
@@ -374,8 +775,11 @@ function extractCsvFromBuffer(buf, label) {
     return null;
   }
 
-  // Maybe direct CSV
   const text = buf.toString('utf8').substring(0, 200);
+
+  // Debug: show what was actually received
+  console.log(`   [${label}] Raw preview: ${text.substring(0, 150).replace(/\n/g, ' ')}`);
+
   if (text.includes('SYMBOL') || text.includes('TckrSymb') || (text.includes(',') && !text.startsWith('<'))) {
     console.log(`   [${label}] ✅ Direct CSV: ${buf.length} bytes.`);
     return buf;
@@ -390,24 +794,49 @@ function extractCsvFromBuffer(buf, label) {
 // 1. NSE F&O — session-based download from nsearchives.nseindia.com
 // ═══════════════════════════════════════════════════════════════════════════
 
-/**
- * Fetch NSE F&O settlement prices from UDiFF bhavcopy.
- * Uses session-based download (cookie jar) to bypass NSE's bot protection.
- * Matches NFO/BFO instruments in DB by symbol+expiry+strike+type.
- * @returns {{ matched, unmatched }}
- */
 async function fetchNseBhavcopy(date, instruments, closePriceMap) {
-  const yyyymmdd = dateToYYYYMMDD(date);
+  const dow = date.getDay();
+
+  // Quick sanity checks before hitting NSE
+  if (dow === 0 || dow === 6) {
+    console.log(`   [NSE] ${dateToDashed(date)} is a weekend — skipping.`);
+    return { matched: 0, unmatched: 0 };
+  }
+
+  // Known Indian exchange holidays (2026) — Format: 'MMDD'
+  const KNOWN_HOLIDAYS_2026 = new Set([
+    '0101', // New Year
+    '0126', // Republic Day
+    '0219', // Chhatrapati Shivaji Maharaj Jayanti
+    '0225', // Mahashivratri
+    '0303', // Holi
+    '0331', // Id-Ul-Fitr (tentative)
+    '0406', // Ram Navami (tentative)
+    '0414', // Dr. Ambedkar Jayanti
+    '0501', // Maharashtra Day
+    '0815', // Independence Day
+    '1002', // Gandhi Jayanti
+    '1024', // Dussehra (tentative)
+    '1114', // Diwali Laxmi Pujan (tentative)
+    '1125', // Gurunanak Jayanti (tentative)
+    '1225', // Christmas
+  ]);
+
+  const key = `${pad(date.getMonth() + 1)}${pad(date.getDate())}`;
+  if (KNOWN_HOLIDAYS_2026.has(key)) {
+    console.log(`   [NSE] ${dateToDashed(date)} is a known trading holiday — skipping download.`);
+    return { matched: 0, unmatched: 0 };
+  }
+
   console.log(`   [NSE] Fetching NSE F&O bhavcopy for ${dateToDashed(date)}...`);
 
   const zipBuf = await downloadNseSessionZip(date);
 
   if (!zipBuf) {
     console.warn(`   [NSE] ⚠️ Download failed (may be a trading holiday or session issue).`);
-    return { matched: 0, unmatched: 0 };
+    return { matched: 0, unmatched: 0, bfoMatched: 0 };
   }
 
-  // Extract CSV from ZIP
   let csvText;
   try {
     const zip = new AdmZip(zipBuf);
@@ -416,21 +845,20 @@ async function fetchNseBhavcopy(date, instruments, closePriceMap) {
     csvText = entry.getData().toString('utf8');
   } catch (err) {
     console.error(`   [NSE] ❌ Extract failed: ${err.message}`);
-    return { matched: 0, unmatched: 0 };
+    return { matched: 0, unmatched: 0, bfoMatched: 0 };
   }
 
-  // Parse UDiFF CSV → lookup map
   const bhavMap = parseNseUdiffCSV(csvText);
   console.log(`   [NSE] Parsed ${bhavMap.size} entries.`);
 
-  // Match against DB instruments (NFO/BFO only)
-  const nfoInstruments = instruments.filter(i =>
-    i.exchange === 'NFO' || i.exchange === 'BFO' || (i.exchange === 'NSE' && i.instrument_type)
-  );
-  const bulkOps = [];
-  let matched = 0, unmatched = 0;
+  // NFO and BFO both get prices from NSE bhavcopy — track them separately
+  const nfoInstruments = instruments.filter(i => i.exchange === 'NFO' || (i.exchange === 'NSE' && i.instrument_type));
+  const bfoInstruments = instruments.filter(i => i.exchange === 'BFO');
 
-  for (const inst of nfoInstruments) {
+  const bulkOps = [];
+  let matched = 0, unmatched = 0, bfoMatched = 0;
+
+  for (const inst of [...nfoInstruments, ...bfoInstruments]) {
     const key = buildMatchKey(inst);
     if (!key) { unmatched++; continue; }
     const bhav = bhavMap.get(key);
@@ -449,15 +877,16 @@ async function fetchNseBhavcopy(date, instruments, closePriceMap) {
           } },
         },
       });
-      matched++;
+      if (inst.exchange === 'BFO') bfoMatched++;
+      else matched++;
     } else {
       unmatched++;
     }
   }
 
   if (bulkOps.length > 0) await KiteInstrument.bulkWrite(bulkOps, { ordered: false });
-  console.log(`   [NSE] ✅ ${matched} matched, ${unmatched} unmatched.`);
-  return { matched, unmatched };
+  console.log(`   [NSE] ✅ NFO: ${matched} matched, BFO via NSE: ${bfoMatched} matched, ${unmatched} unmatched.`);
+  return { matched, unmatched, bfoMatched };
 }
 
 function parseNseUdiffCSV(csvText) {
@@ -498,17 +927,12 @@ function parseNseUdiffCSV(csvText) {
 // 2. MCX — fallback chain: session → Playwright → Samco pwsh
 // ═══════════════════════════════════════════════════════════════════════════
 
-/**
- * Fetch MCX settlement prices.
- * Tries: 1) mcxindia.com with session, 2) Playwright, 3) Samco pwsh
- * @returns {{ matched }}
- */
 async function fetchMcxBhavcopy(date, instruments, closePriceMap) {
   console.log(`   [MCX] Fetching MCX settlement prices for ${dateToDashed(date)}...`);
 
   let csvBuf = null;
 
-  // Try 1: MCX official with session cookies
+  // Try 1: MCX official with ViewState POST
   csvBuf = await downloadMcxSession(date);
 
   // Try 2: Playwright (handles JS-set cookies)
@@ -516,7 +940,7 @@ async function fetchMcxBhavcopy(date, instruments, closePriceMap) {
     csvBuf = await downloadMcxPlaywright(date);
   }
 
-  // Try 3: Samco via pwsh (legacy fallback — works on Windows production)
+  // Try 3: Samco via pwsh (legacy fallback)
   if (!csvBuf) {
     csvBuf = await downloadMcxSamcoPwsh(date);
   }
@@ -564,10 +988,6 @@ async function fetchMcxBhavcopy(date, instruments, closePriceMap) {
   return { matched: 0 };
 }
 
-/**
- * Parse MCX bhavcopy CSV (works for both mcxindia.com and Samco MCX format).
- * Columns: SYMBOL, EXPIRY_DATE, OPTIONTYPE, STRIKEPRICE, OPEN, HIGH, LOW, CLOSE, INSTRUMENTNAME, ...
- */
 function parseMcxCSV(csvText) {
   const lines = csvText.trim().split('\n');
   if (lines.length < 2) return new Map();
@@ -609,20 +1029,6 @@ function parseMcxCSV(csvText) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// 3. BSE — covered by NSE bhavcopy on trading days
-// ═══════════════════════════════════════════════════════════════════════════
-
-async function fetchBseBhavcopy(date, instruments, closePriceMap) {
-  const bfoInstruments = instruments.filter(i => i.exchange === 'BFO');
-  if (bfoInstruments.length === 0) {
-    console.log(`   [BSE] No BFO instruments.`);
-    return { matched: 0 };
-  }
-  console.log(`   [BSE] ${bfoInstruments.length} BFO instruments — covered by NSE bhavcopy on trading days.`);
-  return { matched: 0 };
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
 // SHARED UTILITIES
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -650,22 +1056,15 @@ function parseCsvLine(line) {
   return cols;
 }
 
-
 // ═══════════════════════════════════════════════════════════════════════════
 // MAIN ENTRY POINT
 // ═══════════════════════════════════════════════════════════════════════════
 
-/**
- * Fetch settlement prices from all sources and update DB.
- * @param {Date} [targetDate] - Defaults to last Friday.
- * @returns {{ closePriceMap, matched, unmatched, mcxFallback, bseMatched }}
- */
 async function fetchAndApplyBhavcopy(targetDate) {
-  const date = targetDate || getLastFriday();
+  const date = targetDate || new Date('2026-04-30');
   const dayNames = ['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'];
   console.log(`📊 [Bhavcopy] Fetching settlement prices for ${dateToDashed(date)} (${dayNames[date.getDay()]})...`);
 
-  // Load all active instruments from DB
   const allInstruments = await KiteInstrument.find({
     is_active: true,
     instrument_token: { $not: /^9999/ },
@@ -675,30 +1074,27 @@ async function fetchAndApplyBhavcopy(targetDate) {
 
   const closePriceMap = {};
 
-  // 1. NSE F&O
+  // 1. NSE F&O (also covers BFO)
   const nseResult = await fetchNseBhavcopy(date, allInstruments, closePriceMap);
 
   // 2. MCX
   const mcxResult = await fetchMcxBhavcopy(date, allInstruments, closePriceMap);
 
-  // 3. BSE — covered by NSE bhavcopy on trading days
-  const bseResult = await fetchBseBhavcopy(date, allInstruments, closePriceMap);
+  // 3. BSE — only downloads if BFO instruments remain uncovered after NSE step
+  const bseResult = await fetchBseBhavcopy(date, allInstruments, closePriceMap, nseResult.bfoMatched || 0);
 
   const total = Object.keys(closePriceMap).length;
-  console.log(`   ✅ Total: ${total} prices (NSE: ${nseResult.matched}, MCX: ${mcxResult.matched}, BSE: ${bseResult.matched})`);
+  console.log(`   ✅ Total: ${total} prices (NSE: ${nseResult.matched}, MCX: ${mcxResult.matched}, BSE/BFO: ${bseResult.matched})`);
 
-  // Broadcast settlement prices to connected Flutter clients (if running inside server)
+  // Broadcast settlement prices to connected Flutter clients
   if (total > 0) {
     try {
       const livePriceService = require('./livePriceService');
       if (livePriceService && livePriceService._broadcastToClients) {
         const ticks = [];
         for (const [tokenStr, closePrice] of Object.entries(closePriceMap)) {
-          // Store in settlement prices map (separate from live prices)
           if (!livePriceService._settlementPrices) livePriceService._settlementPrices = new Map();
           livePriceService._settlementPrices.set(tokenStr, closePrice);
-
-          // Also update latestPrices for API fallback reads
           livePriceService.latestPrices.set(tokenStr, closePrice);
           livePriceService.latestPrices.set(parseInt(tokenStr), closePrice);
 
