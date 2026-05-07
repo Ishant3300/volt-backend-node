@@ -185,6 +185,15 @@ const createChildMaster = async (req, res) => {
       });
       await childTx.save({ session });
 
+      // Copy parent master's ScriptQuantity data to the new child master
+      const { copyFromMasterToSubMaster, copyFromGroupedQuantityToMaster } = require('../services/scriptQuantityCopyService');
+      if (parentMaster) {
+        await copyFromMasterToSubMaster(parentMaster._id.toString(), childMaster._id.toString(), session);
+      } else {
+        // Admin creating master directly (no parent) — copy from GroupedQuantity
+        await copyFromGroupedQuantityToMaster(childMaster._id, session);
+      }
+
       resultData = { child_master: childMaster.toJSON() };
       if (parentMaster) {
         resultData.parent_master_remaining_balance = parentMaster.equity;

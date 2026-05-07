@@ -126,6 +126,10 @@ const createMaster = async (req, res) => {
       });
       await transaction.save({ session });
 
+      // Copy GroupedQuantity data into ScriptQuantity for this new master
+      const { copyFromGroupedQuantityToMaster } = require('../services/scriptQuantityCopyService');
+      await copyFromGroupedQuantityToMaster(master._id, session);
+
       resultData = master.toJSON();
     });
 

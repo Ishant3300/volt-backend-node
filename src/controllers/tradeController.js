@@ -277,7 +277,6 @@ const placeTrade = async (req, res) => {
                 const rawSegment = (segment || exchange || '').toUpperCase();
                 const normalizedExchange = rawSegment === 'GLOBAL' ? 'INDICES' : rawSegment;
                 const userExchange = user.exchanges_allowed?.find(ex => ex.exchange_name.toUpperCase() === normalizedExchange);
-                const groupName = userExchange?.group_name;
 
                 // Determine mode from user's exchange config
                 const isTurnover = userExchange?.turnover === true;
@@ -291,52 +290,12 @@ const placeTrade = async (req, res) => {
                 if (kiteInst?.lot_size) lotSize = kiteInst.lot_size;
                 instrumentRawName = kiteInst?.raw_name || kiteInst?.name || null;
 
-                if (groupName) {
-                    // Primary: lookup by raw_name
-                    let groupQty = null;
-                    if (instrumentRawName) {
-                        groupQty = await GroupedQuantity.findOne({
-                            exchange_name: normalizedExchange,
-                            lot_name: groupName,
-                            raw_name: instrumentRawName,
-                            deleted_at: null
-                        }).session(session);
-                    }
-
-                    // Fallback: instrument_symbol (legacy)
-                    if (!groupQty) {
-                        groupQty = await GroupedQuantity.findOne({
-                            exchange_name: normalizedExchange,
-                            lot_name: groupName,
-                            instrument_symbol: tradingsymbol,
-                            deleted_at: null
-                        }).session(session);
-                    }
-
-                    // Fallback: instrument_id (legacy)
-                    if (!groupQty) {
-                        groupQty = await GroupedQuantity.findOne({
-                            exchange_name: normalizedExchange,
-                            lot_name: groupName,
-                            instrument_id: instrument_token,
-                            deleted_at: null
-                        }).session(session);
-                    }
-
-                    if (groupQty) {
-                        limitValue = groupQty.max_qty;
-                        breakValue = groupQty.break_qty || 0;
-                        if (groupQty.lot_size) {
-                            lotSize = groupQty.lot_size;
-                        }
-                    }
-                }
-
-                if (limitValue === null) {
-                    // Try by raw_name first, then tradingsymbol
+                // Lookup from ScriptQuantity with user's owner_id (always exists — created with user)
+                {
                     let scriptQty = null;
                     if (instrumentRawName) {
                         scriptQty = await ScriptQuantity.findOne({
+                            owner_id: user._id,
                             exchange_name: normalizedExchange,
                             script_name: instrumentRawName,
                             deleted_at: null
@@ -344,6 +303,7 @@ const placeTrade = async (req, res) => {
                     }
                     if (!scriptQty) {
                         scriptQty = await ScriptQuantity.findOne({
+                            owner_id: user._id,
                             exchange_name: normalizedExchange,
                             script_name: tradingsymbol,
                             deleted_at: null

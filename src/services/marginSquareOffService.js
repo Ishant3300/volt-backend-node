@@ -34,23 +34,30 @@ const checkUser = async (userId, metrics) => {
   try {
     const user = await User.findById(userId).select('margin_square_off margin_square_off_percentage credits master_id server_id username active_status deleted_at').lean();
     if (!user) return;
-    if (!user.margin_square_off) return; // Feature not enabled
     if (!user.active_status || user.deleted_at) return;
-
-    const percentage = user.margin_square_off_percentage || 0;
-    if (percentage <= 0) return; // No threshold set
+    if (!user.margin_square_off && !(user.margin_square_off_percentage > 0)) return; // Neither feature enabled
 
     const credit = user.credits || 0;
-    if (credit <= 0) return; // No credit to compare against
-
-    // Threshold: equity must stay above this value
-    // percentage=50 means equity must stay above 50% of credit
-    const threshold = credit * (1 - percentage / 100);
     const equity = metrics.equity;
+    let shouldSquareOff = false;
 
-    // Check if equity has dropped below threshold
-    if (equity < threshold && metrics.positions && metrics.positions.length > 0) {
-      console.log(`🛡️  [MarginSquareOff] User ${user.username}: equity=₹${equity.toFixed(2)} < threshold=₹${threshold.toFixed(2)} (${percentage}% of ₹${credit}), squaring off`);
+    // Condition 1: Toggle ON + equity went negative → immediate square off
+    if (user.margin_square_off && equity < 0) {
+      console.log(`🛡️  [MarginSquareOff] User ${user.username}: equity=₹${equity.toFixed(2)} < 0 (toggle ON), squaring off`);
+      shouldSquareOff = true;
+    }
+
+    // Condition 2: Percentage set + equity below threshold → square off
+    if (!shouldSquareOff && user.margin_square_off_percentage > 0 && credit > 0) {
+      const percentage = user.margin_square_off_percentage;
+      const threshold = credit * (1 - percentage / 100);
+      if (equity < threshold) {
+        console.log(`🛡️  [MarginSquareOff] User ${user.username}: equity=₹${equity.toFixed(2)} < threshold=₹${threshold.toFixed(2)} (${percentage}% of ₹${credit}), squaring off`);
+        shouldSquareOff = true;
+      }
+    }
+
+    if (shouldSquareOff && metrics.positions && metrics.positions.length > 0) {
       _squaringOff.add(userId);
 
       // Capture prices at the moment the condition triggered (before any async delay)

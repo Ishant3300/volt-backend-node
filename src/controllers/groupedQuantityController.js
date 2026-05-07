@@ -433,7 +433,7 @@ const ScriptQuantity = require('../models/ScriptQuantity');
  */
 const bulkCreateScriptQuantity = async (req, res) => {
   try {
-    const { exchange_name, default_max_qty, default_brk_qty } = req.body;
+    const { exchange_name, default_max_qty, default_brk_qty, owner_id, owner_type } = req.body;
     if (!exchange_name || default_max_qty === undefined || default_brk_qty === undefined) {
       return res.status(400).json({ success: false, message: 'exchange_name, default_max_qty, and default_brk_qty are required', data: null });
     }
@@ -447,17 +447,43 @@ const bulkCreateScriptQuantity = async (req, res) => {
     if (results.length === 0) {
       return res.status(404).json({ success: false, message: `No instruments found for ${normalizedExchange}`, data: null });
     }
+
+    // If owner_id is provided, create/update for that specific owner
+    const baseFilter = { exchange_name: normalizedExchange, deleted_at: null };
+    if (owner_id) baseFilter.owner_id = owner_id;
+
     const bulkOps = results.map(r => ({
       updateOne: {
-        filter: { exchange_name: normalizedExchange, script_name: r._id, deleted_at: null },
+        filter: { ...baseFilter, script_name: r._id },
         update: {
-          $setOnInsert: { exchange_name: normalizedExchange, script_name: r._id, lot_size: r.lot_size || 1, max_qty: default_max_qty, brk_qty: default_brk_qty, created_at: new Date() },
+          $setOnInsert: {
+            exchange_name: normalizedExchange,
+            script_name: r._id,
+            lot_size: r.lot_size || 1,
+            max_qty: default_max_qty,
+            brk_qty: default_brk_qty,
+            ...(owner_id ? { owner_id, owner_type: owner_type || 'Master' } : {}),
+            created_at: new Date(),
+          },
           $set: { updated_at: new Date(), deleted_at: null }
         },
         upsert: true
       }
     }));
     const bulkResult = await ScriptQuantity.bulkWrite(bulkOps);
+
+    // If updating a master's data, cascade to direct users
+    if (owner_id && owner_type === 'Master') {
+      const { cascadeToDirectUsers } = require('../services/scriptQuantityCopyService');
+      for (const r of results) {
+        await cascadeToDirectUsers(owner_id, normalizedExchange, r._id, {
+          max_qty: default_max_qty,
+          brk_qty: default_brk_qty,
+          lot_size: r.lot_size || 1,
+        });
+      }
+    }
+
     res.status(201).json({
       success: true,
       message: `Script quantity created for ${results.length} instruments`,
@@ -475,7 +501,7 @@ const bulkCreateScriptQuantity = async (req, res) => {
 const getScriptQuantityByExchange = async (req, res) => {
   try {
     const { exchange_name } = req.params;
-    const { page = 1, limit = 500 } = req.query;
+    const { page = 1, limit = 500, owner_id } = req.query;
     const upperName = exchange_name.toUpperCase();
     // Map GLOBAL → INDICES (same segment naming as brokerage/trade margin)
     const mappedName = upperName === 'GLOBAL' ? 'INDICES' : upperName;
@@ -485,6 +511,12 @@ const getScriptQuantityByExchange = async (req, res) => {
       ? { $in: [mappedName, baseExchange] }
       : mappedName;
     const filter = { exchange_name: exchangeFilter, deleted_at: null };
+
+    // If owner_id is provided, filter to that specific master/user's ScriptQuantity
+    if (owner_id) {
+      filter.owner_id = owner_id;
+    }
+
     const items = await ScriptQuantity.find(filter)
       .limit(parseInt(limit)).skip((parseInt(page) - 1) * parseInt(limit)).sort({ script_name: 1 });
     const count = await ScriptQuantity.countDocuments(filter);

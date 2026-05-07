@@ -155,80 +155,41 @@ const getInstrumentLimit = async (req, res) => {
 
     let limit = null;
 
-    // 1. Try GroupedQuantity first (if user has a lot assignment)
-    if (allowedExchange.group_name) {
-      // Primary: resolve by raw_name (instrument base name)
-      // First, get the raw_name for this instrument
-      let rawName = raw_name || null;
-      if (!rawName && (symbol || instrument_id)) {
-        const KiteInstrument = require('../models/KiteInstrument');
-        let kiteInst = null;
-        if (instrument_id) {
-          kiteInst = await KiteInstrument.findOne({ instrument_token: instrument_id }).lean();
-        }
-        if (!kiteInst && symbol) {
-          kiteInst = await KiteInstrument.findOne({ tradingsymbol: symbol }).lean();
-        }
-        if (kiteInst) {
-          rawName = kiteInst.raw_name || kiteInst.name;
-        }
-      }
-
-      // Try by raw_name first (new approach)
-      if (rawName) {
-        limit = await GroupedQuantity.findOne({
-          exchange_name: normalizedSegment,
-          lot_name: allowedExchange.group_name,
-          raw_name: rawName,
-          deleted_at: null
-        }).lean();
-      }
-
-      // Fallback: try by instrument_symbol (legacy)
-      if (!limit && symbol) {
-        limit = await GroupedQuantity.findOne({
-          exchange_name: normalizedSegment,
-          lot_name: allowedExchange.group_name,
-          instrument_symbol: symbol,
-          deleted_at: null
-        }).lean();
-      }
-
-      // Fallback: try by instrument_id (legacy)
-      if (!limit && instrument_id) {
-        limit = await GroupedQuantity.findOne({
-          exchange_name: normalizedSegment,
-          lot_name: allowedExchange.group_name,
-          instrument_id: instrument_id,
-          deleted_at: null
-        }).lean();
-      }
+    // Lookup from ScriptQuantity with user's owner_id (always exists — created with user)
+    let rawName = raw_name || null;
+    if (!rawName) {
+      const KiteInstrument = require('../models/KiteInstrument');
+      let kiteInst = null;
+      if (instrument_id) kiteInst = await KiteInstrument.findOne({ instrument_token: instrument_id }).lean();
+      if (!kiteInst && symbol) kiteInst = await KiteInstrument.findOne({ tradingsymbol: symbol }).lean();
+      if (kiteInst) rawName = kiteInst.raw_name || kiteInst.name;
     }
 
-    // 2. Fallback to ScriptQuantity (global script-level limits) if not found in grouped
-    if (!limit) {
-      const resolvedSymbol = symbol || (() => null)();
-      if (resolvedSymbol) {
+    const scriptName = rawName || symbol || null;
+    if (scriptName) {
+      const scriptLimit = await ScriptQuantity.findOne({
+        owner_id: targetUserId,
+        exchange_name: normalizedSegment,
+        script_name: scriptName,
+        deleted_at: null
+      }).lean();
+
+      if (scriptLimit) {
+        limit = { ...scriptLimit, break_qty: scriptLimit.brk_qty };
+      }
+    } else if (instrument_id) {
+      const KiteInstrument = require('../models/KiteInstrument');
+      const kiteInst = await KiteInstrument.findOne({ instrument_token: instrument_id }).lean();
+      if (kiteInst?.raw_name || kiteInst?.tradingsymbol) {
+        const name = kiteInst.raw_name || kiteInst.tradingsymbol;
         const scriptLimit = await ScriptQuantity.findOne({
+          owner_id: targetUserId,
           exchange_name: normalizedSegment,
-          script_name: resolvedSymbol,
+          script_name: name,
           deleted_at: null
         }).lean();
         if (scriptLimit) {
           limit = { ...scriptLimit, break_qty: scriptLimit.brk_qty };
-        }
-      } else if (instrument_id) {
-        const KiteInstrument = require('../models/KiteInstrument');
-        const kiteInst = await KiteInstrument.findOne({ instrument_token: instrument_id }).lean();
-        if (kiteInst?.tradingsymbol) {
-          const scriptLimit = await ScriptQuantity.findOne({
-            exchange_name: normalizedSegment,
-            script_name: kiteInst.tradingsymbol,
-            deleted_at: null
-          }).lean();
-          if (scriptLimit) {
-            limit = { ...scriptLimit, break_qty: scriptLimit.brk_qty };
-          }
         }
       }
     }

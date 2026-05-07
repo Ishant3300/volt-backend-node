@@ -1,6 +1,16 @@
 const mongoose = require('mongoose');
 
 const scriptQuantitySchema = new mongoose.Schema({
+  owner_id: {
+    type: mongoose.Schema.Types.ObjectId,
+    required: true,
+    index: true
+  },
+  owner_type: {
+    type: String,
+    enum: ['Master', 'User'],
+    required: true
+  },
   exchange_name: {
     type: String,
     required: true,
@@ -61,6 +71,8 @@ scriptQuantitySchema.pre('save', function(next) {
 scriptQuantitySchema.index({ deleted_at: 1 });
 scriptQuantitySchema.index({ exchange_name: 1 });
 scriptQuantitySchema.index({ script_name: 1 });
+scriptQuantitySchema.index({ owner_id: 1, exchange_name: 1 });
+scriptQuantitySchema.index({ owner_id: 1, exchange_name: 1, script_name: 1 });
 
 const ScriptQuantity = mongoose.model('ScriptQuantity', scriptQuantitySchema);
 

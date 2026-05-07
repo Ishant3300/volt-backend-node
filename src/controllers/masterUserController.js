@@ -268,6 +268,10 @@ const createUser = async (req, res) => {
       });
       await userTx.save({ session });
 
+      // Copy master's ScriptQuantity data to the new user
+      const { copyFromMasterToUser } = require('../services/scriptQuantityCopyService');
+      await copyFromMasterToUser(parentMaster._id.toString(), user._id.toString(), session);
+
       resultData = {
         user: user.toJSON(),
         parent_master_remaining_balance: parentMaster.equity
