@@ -697,6 +697,14 @@ class MetricsEngine {
       this.scheduleMidnightAudit();
     }, msUntilMidnight);
   }
+
+  /**
+   * Returns all instrument tokens that have open positions.
+   * Used by livePriceService to ensure these tokens are always subscribed on Kite.
+   */
+  getPositionTokens() {
+    return Array.from(this._tokenToUsers.keys()).map(t => parseInt(t)).filter(t => !isNaN(t));
+  }
 }
 
 module.exports = new MetricsEngine();

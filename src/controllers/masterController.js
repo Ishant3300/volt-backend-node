@@ -500,6 +500,21 @@ const updateMasterPermissions = async (req, res) => {
         { $set: cascadeFields }
       );
       console.log(`🔄 [Cascade] Master ${master.username}: updated ${JSON.stringify(cascadeFields)} on all child users`);
+
+      // If margin_square_off was toggled ON, immediately check all affected users
+      if (cascadeFields.margin_square_off === true) {
+        try {
+          const metricsEngine = require('../services/metricsEngine');
+          const marginSquareOffService = require('../services/marginSquareOffService');
+          const affectedUsers = await User.find({ master_id: master._id, deleted_at: null, active_status: true }).select('_id').lean();
+          for (const u of affectedUsers) {
+            const metrics = metricsEngine.getCachedMetrics(u._id.toString());
+            if (metrics && metrics.equity < 0) {
+              marginSquareOffService.checkUser(u._id.toString(), metrics);
+            }
+          }
+        } catch (_) {}
+      }
     }
 
     res.status(200).json({

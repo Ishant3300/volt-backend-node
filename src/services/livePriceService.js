@@ -296,6 +296,13 @@ class LivePriceService {
     const syntheticSourceTokens = syntheticInstrumentService.getSourceTokens();
     syntheticSourceTokens.forEach(t => this.subscribedTokens.add(t));
 
+    // Include all tokens with open positions so metricsEngine can check margin square-off
+    try {
+      const metricsEngine = require('./metricsEngine');
+      const positionTokens = metricsEngine.getPositionTokens();
+      positionTokens.forEach(t => this.subscribedTokens.add(t));
+    } catch (_) {}
+
     const tokens = Array.from(this.subscribedTokens);
     if (tokens.length === 0) {
       console.log('📊 No tokens to subscribe');
@@ -588,13 +595,23 @@ class LivePriceService {
   }
 
   /**
-   * Remove tokens that no clients need anymore
+   * Remove tokens that no clients need anymore.
+   * Always keeps position tokens subscribed for margin square-off monitoring.
    */
   _cleanupUnusedTokens() {
     if (this.wss && this.wss.clients.size === 0) {
-      console.log('🧹 No clients connected, clearing subscriptions and latest prices');
+      console.log('🧹 No clients connected, clearing client subscriptions and latest prices');
       this.subscribedTokens.clear();
       this.latestPrices.clear();
+      // Re-add position tokens so margin square-off still works
+      try {
+        const metricsEngine = require('./metricsEngine');
+        const positionTokens = metricsEngine.getPositionTokens();
+        positionTokens.forEach(t => this.subscribedTokens.add(t));
+        if (positionTokens.length > 0) {
+          this._updateKiteSubscription();
+        }
+      } catch (_) {}
     }
   }
 

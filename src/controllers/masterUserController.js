@@ -506,6 +506,22 @@ const updateUserDetails = async (req, res) => {
 
     await user.save();
 
+    // If margin_square_off was just toggled ON, immediately check if user needs square-off
+    if (margin_square_off === true) {
+      try {
+        const metricsEngine = require('../services/metricsEngine');
+        const marginSquareOffService = require('../services/marginSquareOffService');
+        // Force a fresh rebuild so we get current LTP-based equity
+        await metricsEngine.onTradeExecuted(user._id.toString());
+        const metrics = metricsEngine.getCachedMetrics(user._id.toString());
+        if (metrics) {
+          await marginSquareOffService.checkUser(user._id.toString(), metrics);
+        }
+      } catch (e) {
+        console.error('[MarginSquareOff] Immediate check after toggle failed:', e.message);
+      }
+    }
+
     res.status(200).json({
       success: true,
       message: 'User details updated successfully',
@@ -1050,6 +1066,21 @@ const updateUserMarginSquareoffPercentage = async (req, res) => {
 
     user.margin_square_off_percentage = margin_square_off_percentage;
     await user.save();
+
+    // If percentage was set > 0, immediately check if user needs square-off
+    if (margin_square_off_percentage > 0) {
+      try {
+        const metricsEngine = require('../services/metricsEngine');
+        const marginSquareOffService = require('../services/marginSquareOffService');
+        await metricsEngine.onTradeExecuted(user._id.toString());
+        const metrics = metricsEngine.getCachedMetrics(user._id.toString());
+        if (metrics) {
+          await marginSquareOffService.checkUser(user._id.toString(), metrics);
+        }
+      } catch (e) {
+        console.error('[MarginSquareOff] Immediate check after percentage update failed:', e.message);
+      }
+    }
 
     res.status(200).json({
       success: true,

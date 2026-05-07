@@ -224,6 +224,9 @@ server.listen(PORT, async () => {
   await metricsEngine.init(livePriceService);
   metricsEngine.scheduleMidnightAudit();
 
+  // Ensure all position tokens are subscribed on Kite for margin square-off monitoring
+  livePriceService._updateKiteSubscription();
+
   // Initialize margin square off monitoring service
   const marginSquareOffService = require('./services/marginSquareOffService');
   marginSquareOffService.init(livePriceService);
