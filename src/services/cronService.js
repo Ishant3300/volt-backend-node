@@ -109,66 +109,32 @@ class CronService {
         // ── Settlement prices are now fetched via bhavcopy crons below (no OHLC) ──
 
         // ── Bhavcopy Settlement Price Fetch ──────────────────────────────
-        // NSE/BFO/BSE: 5 PM IST (Mon-Fri), retries 6 PM, 7 PM, 8 PM — uses TODAY's date
-        // MCX: 12:30 AM IST (Tue-Sat), retries 1:30 AM, 2:30 AM, 3:30 AM — uses YESTERDAY's date
-        this._nseSettlementDone = false;
-        this._mcxSettlementDone = false;
+        // NSE: 5:30 PM IST (Mon-Fri) — fetches today's settlement prices
+        // MCX: 1:00 AM IST (Tue-Sat) — fetches previous day's settlement prices
 
-        // NSE/BFO/BSE: 5 PM, 6 PM, 7 PM, 8 PM (Mon-Fri)
-        for (const hour of [17, 18, 19, 20]) {
-            const nseJob = cron.schedule(`0 ${hour} * * 1-5`, async () => {
-                if (this._nseSettlementDone) return;
-                console.log(`📊 [CRON] Bhavcopy NSE/BFO/BSE attempt (${hour}:00 IST)...`);
-                try {
-                    const { fetchAndApplyBhavcopy } = require('./bhavcopyService');
-                    const now = new Date();
-                    const ist = new Date(now.getTime() + (5.5 * 3600000 - now.getTimezoneOffset() * 60000));
-                    const today = new Date(ist.getFullYear(), ist.getMonth(), ist.getDate());
-                    const result = await fetchAndApplyBhavcopy(today);
-                    if (result.matched > 0 || result.bseMatched > 0) {
-                        this._nseSettlementDone = true;
-                        console.log(`✅ [CRON] Bhavcopy NSE/BSE done: NSE=${result.matched}, BSE=${result.bseMatched}`);
-                    } else {
-                        console.log(`⚠️ [CRON] Bhavcopy NSE/BSE: 0 matched. Retry next hour.`);
-                    }
-                } catch (error) {
-                    console.error(`❌ [CRON] Bhavcopy NSE/BSE error: ${error.message}`);
-                }
-            }, { timezone: 'Asia/Kolkata' });
-            this.jobs.push(nseJob);
-        }
+        const nseBhavcopyJob = cron.schedule('30 17 * * 1-5', async () => {
+            console.log(`📊 [CRON] Fetching NSE settlement prices (5:30 PM IST)...`);
+            try {
+                const { fetchAndApplyBhavcopy } = require('./bhavcopyService');
+                const result = await fetchAndApplyBhavcopy();
+                console.log(`✅ [CRON] Bhavcopy done: NSE=${result.nseMatched}, MCX=${result.mcxMatched}`);
+            } catch (error) {
+                console.error(`❌ [CRON] Bhavcopy NSE error: ${error.message}`);
+            }
+        }, { timezone: 'Asia/Kolkata' });
+        this.jobs.push(nseBhavcopyJob);
 
-        // MCX: 12:30 AM, 1:30 AM, 2:30 AM, 3:30 AM (Tue-Sat) — uses YESTERDAY
-        for (const hour of [0, 1, 2, 3]) {
-            const mcxJob = cron.schedule(`30 ${hour} * * 2-6`, async () => {
-                if (this._mcxSettlementDone) return;
-                console.log(`📊 [CRON] Bhavcopy MCX attempt (${hour}:30 IST)...`);
-                try {
-                    const { fetchAndApplyBhavcopy } = require('./bhavcopyService');
-                    const now = new Date();
-                    const ist = new Date(now.getTime() + (5.5 * 3600000 - now.getTimezoneOffset() * 60000));
-                    const yesterday = new Date(ist.getFullYear(), ist.getMonth(), ist.getDate() - 1);
-                    const result = await fetchAndApplyBhavcopy(yesterday);
-                    if (result.mcxFallback > 0) {
-                        this._mcxSettlementDone = true;
-                        console.log(`✅ [CRON] Bhavcopy MCX done: ${result.mcxFallback} matched.`);
-                    } else {
-                        console.log(`⚠️ [CRON] Bhavcopy MCX: 0 matched. Retry next hour.`);
-                    }
-                } catch (error) {
-                    console.error(`❌ [CRON] Bhavcopy MCX error: ${error.message}`);
-                }
-            }, { timezone: 'Asia/Kolkata' });
-            this.jobs.push(mcxJob);
-        }
-
-        // Reset flags so next day's fetches run fresh
-        // NSE flags reset at 4 PM (before 5 PM first attempt)
-        // MCX flags reset at 11 PM (before 12:30 AM first attempt)
-        const resetNseFlags = cron.schedule('0 16 * * 1-5', () => { this._nseSettlementDone = false; }, { timezone: 'Asia/Kolkata' });
-        const resetMcxFlags = cron.schedule('0 23 * * 1-5', () => { this._mcxSettlementDone = false; }, { timezone: 'Asia/Kolkata' });
-        this.jobs.push(resetNseFlags);
-        this.jobs.push(resetMcxFlags);
+        const mcxBhavcopyJob = cron.schedule('0 1 * * 2-6', async () => {
+            console.log(`📊 [CRON] Fetching MCX settlement prices (1:00 AM IST)...`);
+            try {
+                const { fetchAndApplyBhavcopy } = require('./bhavcopyService');
+                const result = await fetchAndApplyBhavcopy();
+                console.log(`✅ [CRON] Bhavcopy done: NSE=${result.nseMatched}, MCX=${result.mcxMatched}`);
+            } catch (error) {
+                console.error(`❌ [CRON] Bhavcopy MCX error: ${error.message}`);
+            }
+        }, { timezone: 'Asia/Kolkata' });
+        this.jobs.push(mcxBhavcopyJob);
 
         // ── Expiry Auto Square-Off ───────────────────────────────────────
         // 3:35 PM IST (after NSE close) + 11:32 PM IST (after MCX close at 11:30 PM)

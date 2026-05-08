@@ -362,16 +362,27 @@ class LivePriceService {
       }
 
       if (ticks.length > 0) {
-        // Update latest prices map
+        // Update latest prices map and filter out ticks for closed markets with settlement prices
+        const liveTicks = [];
         ticks.forEach(t => {
           if (t && t.instrument_token && t.last_price) {
-            this.latestPrices.set(t.instrument_token.toString(), t.last_price);
-            this.latestPrices.set(parseInt(t.instrument_token), t.last_price);
+            const tokenStr = t.instrument_token.toString();
 
-            // Clear settlement price for this token — live tick takes over
-            if (this._settlementPrices) {
-              this._settlementPrices.delete(t.instrument_token.toString());
+            // If settlement price exists for this token, check if market is open
+            // before allowing live tick to override it
+            if (this._settlementPrices && this._settlementPrices.has(tokenStr)) {
+              const segment = (metricsEngine._kiteMap[tokenStr] || {}).segment || '';
+              const exchange = segment.split('-')[0] || '';
+              if (!this._isMarketOpen(exchange)) {
+                // Market closed — ignore this tick entirely, keep settlement price
+                return;
+              }
+              // Market open — clear settlement price, live tick takes over
+              this._settlementPrices.delete(tokenStr);
             }
+
+            this.latestPrices.set(tokenStr, t.last_price);
+            this.latestPrices.set(parseInt(t.instrument_token), t.last_price);
 
             // Publish price update to BullMQ for order matching
             priceQueueService.publishPriceUpdate(t.instrument_token.toString(), t.last_price);
@@ -381,20 +392,24 @@ class LivePriceService {
 
             // Update real-time metrics engine (with bid/ask for P&L computation)
             metricsEngine.onTick(t.instrument_token, t.last_price, t.bid_price, t.ask_price);
+
+            liveTicks.push(t);
           }
         });
 
         if (LOG_LIVE_TICKS) {
-          console.log(`📈 Received ${ticks.length} tick(s):`);
-          ticks.forEach(t => {
+          console.log(`📈 Received ${ticks.length} tick(s), broadcasting ${liveTicks.length}:`);
+          liveTicks.forEach(t => {
             console.log(`   Token: ${t.instrument_token} | LTP: ${t.last_price}`);
           });
         }
 
-        this._broadcastToClients({
-          type: 'ticks',
-          data: ticks,
-        });
+        if (liveTicks.length > 0) {
+          this._broadcastToClients({
+            type: 'ticks',
+            data: liveTicks,
+          });
+        }
       }
     } catch (error) {
       console.log('❌ Error processing Kite tick:', error.message);
@@ -539,6 +554,31 @@ class LivePriceService {
       console.log('❌ Error parsing tick packet:', error.message);
       return null;
     }
+  }
+
+  /**
+   * Check if market is currently open for a given exchange.
+   * NSE/NFO/BFO: 9:15 AM - 3:30 PM IST (Mon-Fri)
+   * MCX: 9:00 AM - 11:30 PM IST (Mon-Fri)
+   */
+  _isMarketOpen(exchange) {
+    const now = new Date();
+    const istString = now.toLocaleString('en-US', { timeZone: 'Asia/Kolkata' });
+    const ist = new Date(istString);
+    const day = ist.getDay();
+    if (day === 0 || day === 6) return false; // Weekend
+
+    const hours = ist.getHours();
+    const minutes = ist.getMinutes();
+    const timeInMinutes = hours * 60 + minutes;
+
+    const ex = (exchange || '').toUpperCase();
+    if (ex === 'MCX') {
+      // MCX: 9:00 AM to 11:30 PM
+      return timeInMinutes >= 540 && timeInMinutes <= 1410;
+    }
+    // NSE/NFO/BFO/BSE: 9:15 AM to 3:30 PM
+    return timeInMinutes >= 555 && timeInMinutes <= 930;
   }
 
   /**
