@@ -1258,6 +1258,7 @@ const getAccountMetrics = async (req, res) => {
                     position_pnl: metrics.position_pnl,
                     m2m_pnl: metrics.m2m_pnl,
                     margin_used: metrics.margin_used,
+                    positions: metrics.positions || [],
                 }
             });
         }

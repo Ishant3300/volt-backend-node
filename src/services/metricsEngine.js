@@ -57,6 +57,30 @@ class MetricsEngine {
     await this._loadRules();
     await this._rebuildAllUserCaches();
 
+    // Seed LTP/bid/ask maps from DB for tokens with open positions
+    // This ensures CMP is correct on restart (especially after settlement when market is closed)
+    const positionTokens = Array.from(this._tokenToUsers.keys());
+    if (positionTokens.length > 0) {
+      const KiteInstrument = require('../models/KiteInstrument');
+      const instruments = await KiteInstrument.find(
+        { instrument_token: { $in: positionTokens }, last_price: { $gt: 0 } },
+        'instrument_token last_price'
+      ).lean();
+      let seeded = 0;
+      for (const inst of instruments) {
+        const token = inst.instrument_token.toString();
+        if (!this._ltpMap.has(token)) {
+          this._ltpMap.set(token, inst.last_price);
+          this._bidMap.set(token, inst.last_price);
+          this._askMap.set(token, inst.last_price);
+          seeded++;
+        }
+      }
+      if (seeded > 0) {
+        console.log(`📊 [MetricsEngine] Seeded ${seeded} position tokens from DB (last_price).`);
+      }
+    }
+
     this._initialized = true;
     console.log(`📊 [MetricsEngine] Ready. Tracking ${this._userCache.size} users, ${this._tokenToUsers.size} instruments`);
   }
@@ -260,6 +284,20 @@ class MetricsEngine {
     if (!this._initialized) return;
 
     const token = instrumentToken.toString();
+
+    // After settlement, ignore ticks for settled tokens until market opens
+    // (Kite sends cached "snapshot" ticks on subscribe even when market is closed)
+    if (this._settledTokens && this._settledTokens.has(token)) {
+      // Check if this tick represents genuine market activity (price moved >0.5% from settled value)
+      const settledLtp = this._ltpMap.get(token);
+      if (settledLtp && Math.abs(lastPrice - settledLtp) / settledLtp > 0.005) {
+        // Market is open — clear lock for ALL tokens and process normally
+        this.clearSettledTokens();
+      } else {
+        return;
+      }
+    }
+
     this._ltpMap.set(token, lastPrice);
     if (bidPrice && bidPrice > 0) this._bidMap.set(token, bidPrice);
     if (askPrice && askPrice > 0) this._askMap.set(token, askPrice);
@@ -268,6 +306,26 @@ class MetricsEngine {
     // Debounce: process all pending tokens after 50ms of quiet
     if (this._tickTimer) clearTimeout(this._tickTimer);
     this._tickTimer = setTimeout(() => this._processPendingTicks(), 50);
+  }
+
+  /**
+   * Mark tokens as settled — ticks for these will be ignored until clearSettledTokens() is called.
+   * Called by settlementService after setting CMP = settlement price.
+   */
+  setSettledTokens(tokens) {
+    this._settledTokens = new Set(tokens.map(t => t.toString()));
+    console.log(`📊 [MetricsEngine] ${this._settledTokens.size} tokens locked to settlement prices.`);
+  }
+
+  /**
+   * Clear settled tokens lock — allows ticks to flow again.
+   * Called when market opens (first genuine tick with price movement).
+   */
+  clearSettledTokens() {
+    if (this._settledTokens) {
+      console.log(`📊 [MetricsEngine] Cleared settlement lock for ${this._settledTokens.size} tokens.`);
+      this._settledTokens = null;
+    }
   }
 
   /**

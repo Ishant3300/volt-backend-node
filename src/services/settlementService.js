@@ -204,10 +204,18 @@ async function _executeSettlement() {
       ? (closePrice - avgEntryPrice) * absQty
       : (avgEntryPrice - closePrice) * absQty;
 
+    console.log(`   📊 ${pos.tradingsymbol}: avgEntry=${avgEntryPrice.toFixed(2)}, settlement=${closePrice.toFixed(2)}, pnl=${closingPnl.toFixed(2)}`);
+
     try {
-      // 1. CLOSING trade — opposite side at settlement price
-      // Soft-deleted immediately so metricsEngine ignores it (only reopening trade counts).
+      // 1. CLOSING trade — opposite side, closes at settlement price
+      // price = settlement price (what it was closed at)
+      // pnl = actual profit/loss from original entry to settlement
+      // Soft-deleted so metricsEngine ignores it (only reopening trade counts).
       // History page includes settlement trades via special query.
+      // Timestamp is 1 second before reopening so history sorts correctly.
+      const closeTime = new Date();
+      const reopenTime = new Date(closeTime.getTime() + 1000);
+
       await Trade.create({
         user_id: userId,
         master_id: pos.master_id,
@@ -222,16 +230,17 @@ async function _executeSettlement() {
         placed_by: 'SYSTEM',
         trade_type: 'carry_forward',
         status: 'completed',
-        executed_at: new Date(),
+        executed_at: closeTime,
         executed_price: closePrice,
         executed_quantity: absQty,
-        pnl: 0,
-        deleted_at: new Date(),
+        pnl: closingPnl,
+        deleted_at: closeTime,
         remarks: 'Settlement: position closed at settlement price',
       });
       closedCount++;
 
       // 2. RE-OPENING trade — same side at settlement price (fresh position for new week)
+      // ATP = CMP = settlement price → P&L starts at 0 for new week
       await Trade.create({
         user_id: userId,
         master_id: pos.master_id,
@@ -246,7 +255,7 @@ async function _executeSettlement() {
         placed_by: 'SYSTEM',
         trade_type: 'carry_forward',
         status: 'completed',
-        executed_at: new Date(),
+        executed_at: reopenTime,
         executed_price: closePrice,
         executed_quantity: absQty,
         pnl: 0,
@@ -267,17 +276,31 @@ async function _executeSettlement() {
   broadcastProgress();
 
   // Update metricsEngine's LTP/bid/ask maps with settlement prices
-  // so CMP = ATP = settlement price (position P&L = 0)
+  // so CMP = ATP = settlement price (position P&L = 0 after settlement)
+  // Update from closePriceMap (all instruments from bhavcopy)
   for (const [tokenStr, price] of Object.entries(closePriceMap)) {
     metricsEngine._ltpMap.set(tokenStr, price);
     metricsEngine._bidMap.set(tokenStr, price);
     metricsEngine._askMap.set(tokenStr, price);
+  }
+  // Also ensure all settled position tokens are updated (in case they weren't in closePriceMap)
+  for (const pos of openPositions) {
+    const tokenStr = pos._id.instrument_token.toString();
+    const price = closePriceMap[tokenStr];
+    if (price) {
+      metricsEngine._ltpMap.set(tokenStr, price);
+      metricsEngine._bidMap.set(tokenStr, price);
+      metricsEngine._askMap.set(tokenStr, price);
+    }
   }
 
   // Full rebuild of ALL user caches — not just affected users.
   // This ensures users with fully closed positions also get their metrics reset to 0.
   // After settlement, only carry_forward trades exist → brokerage = 0, fifoPnl = 0.
   await metricsEngine._rebuildAllUserCaches();
+
+  // Lock settled tokens so stale Kite ticks don't override settlement prices
+  metricsEngine.setSettledTokens(Object.keys(closePriceMap));
 
   // ── Phase 7: Broadcast settlement ticks (close price as LTP/bid/ask) ──
   console.log('📊 [Settlement] Phase 7: Broadcasting settlement ticks...');

@@ -76,15 +76,14 @@ function buildMatchKey(inst) {
 // ═══════════════════════════════════════════════════════════════════════════
 
 async function fetchNseBhavcopy(date, instruments, closePriceMap) {
-  const dow = date.getDay();
-  if (dow === 0 || dow === 6) {
-    console.log(`   [NSE] ${dateToDashed(date)} is a weekend — skipping.`);
-    return { matched: 0, unmatched: 0 };
-  }
+  // If weekend, go back to Friday
+  const nseDate = new Date(date);
+  if (nseDate.getDay() === 0) nseDate.setDate(nseDate.getDate() - 2); // Sun → Fri
+  if (nseDate.getDay() === 6) nseDate.setDate(nseDate.getDate() - 1); // Sat → Fri
 
-  console.log(`   [NSE] Fetching NSE F&O bhavcopy for ${dateToDashed(date)}...`);
+  console.log(`   [NSE] Fetching NSE F&O bhavcopy for ${dateToDashed(nseDate)}...`);
 
-  const { ddmmyyyy } = dateParts(date);
+  const { ddmmyyyy } = dateParts(nseDate);
   const url = `https://nsearchives.nseindia.com/content/trdops/FNO_BC${ddmmyyyy}.DAT`;
 
   console.log(`   [NSE] Trying direct (no session): FNO_BC${ddmmyyyy}.DAT`);
@@ -406,15 +405,13 @@ async function fetchAndApplyBhavcopy(targetDate) {
   const total = Object.keys(closePriceMap).length;
   console.log(`   ✅ Total: ${total} prices (NSE: ${nseResult.matched}, MCX: ${mcxResult.matched})`);
 
-  // Broadcast settlement prices to connected Flutter clients
+  // Broadcast settlement prices to connected Flutter clients (watchlist only)
   if (total > 0) {
     try {
       const livePriceService = require('./livePriceService');
       if (livePriceService && livePriceService._broadcastToClients) {
-        // Clear ALL stale live prices
-        livePriceService.latestPrices.clear();
+        // Update settlement prices map and latestPrices for watchlist display
         if (!livePriceService._settlementPrices) livePriceService._settlementPrices = new Map();
-        livePriceService._settlementPrices.clear();
 
         const ticks = [];
         for (const [tokenStr, closePrice] of Object.entries(closePriceMap)) {
@@ -431,19 +428,6 @@ async function fetchAndApplyBhavcopy(targetDate) {
             is_settlement: true,
           });
         }
-
-        // Clear metricsEngine bid/ask/ltp maps and repopulate with settlement
-        try {
-          const metricsEngine = require('./metricsEngine');
-          if (metricsEngine._bidMap) metricsEngine._bidMap.clear();
-          if (metricsEngine._askMap) metricsEngine._askMap.clear();
-          if (metricsEngine._ltpMap) metricsEngine._ltpMap.clear();
-          for (const [tokenStr, closePrice] of Object.entries(closePriceMap)) {
-            metricsEngine._ltpMap.set(tokenStr, closePrice);
-            metricsEngine._bidMap.set(tokenStr, closePrice);
-            metricsEngine._askMap.set(tokenStr, closePrice);
-          }
-        } catch (_) {}
 
         if (ticks.length > 0) {
           livePriceService._broadcastToClients({ type: 'ticks', data: ticks });

@@ -37,9 +37,16 @@ const getTradeReport = async (req, res) => {
 
     const match = {
       status: 'completed',
-      deleted_at: null,
       executed_at: { $gte: fromDate, $lte: toDate },
-      trade_type: { $nin: ['carry_forward', 'margin_square_off'] }, // Hide system trades
+      // Include:
+      // 1. Active regular trades
+      // 2. Regular trades soft-deleted by settlement (week reset)
+      // 3. Settlement closing trades (carry_forward type, soft-deleted, shows the close at settlement price)
+      $or: [
+        { deleted_at: null, trade_type: { $nin: ['carry_forward', 'margin_square_off'] } },
+        { remarks: 'Settlement: week reset', trade_type: { $nin: ['carry_forward', 'margin_square_off'] } },
+        { remarks: 'Settlement: position closed at settlement price' },
+      ],
     };
     if (targetUserId) match.user_id = targetUserId;
     else if (role === 'master') {
@@ -224,6 +231,46 @@ const getTradeReport = async (req, res) => {
           quantity: Math.abs(diff),
           price: diff > 0 ? avgBuyPrice : avgSellPrice,
         });
+      }
+    }
+
+    // Also include settlement carry_forward positions (reopened at settlement price)
+    // These are active trades with trade_type='carry_forward' that represent current open positions
+    if (targetUserId) {
+      const cfTrades = await Trade.find({
+        user_id: targetUserId,
+        status: 'completed',
+        deleted_at: null,
+        trade_type: 'carry_forward',
+        remarks: 'Settlement: position carried forward at close price',
+      }).lean();
+
+      for (const t of cfTrades) {
+        const ki = kiteMap[t.instrument_token] || {};
+        let displayName = t.tradingsymbol;
+        if (ki.name) {
+          const base = ki.name;
+          if (ki.expiry) {
+            const exp = new Date(ki.expiry);
+            const months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+            displayName = `${base} ${exp.getDate()} ${months[exp.getMonth()]} ${ki.instrument_type || ''}`.trim();
+          }
+        }
+
+        // Only add if not already in carryForward from the regular trade matching
+        const exists = carryForward.some(cf =>
+          cf.tradingsymbol === t.tradingsymbol && cf.exchange === t.exchange
+        );
+        if (!exists) {
+          carryForward.push({
+            exchange: t.exchange,
+            tradingsymbol: t.tradingsymbol,
+            display_name: displayName,
+            type: t.transaction_type === 'BUY' ? 'Buy' : 'Sell',
+            quantity: t.executed_quantity,
+            price: t.executed_price,
+          });
+        }
       }
     }
 
