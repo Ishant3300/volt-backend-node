@@ -1347,7 +1347,10 @@ getPositions = async (req, res) => {
         const trades = await Trade.find({
             user_id: targetUserId,
             $or: [
-                { deleted_at: null },
+                // Active regular trades (not system trades)
+                { deleted_at: null, trade_type: { $nin: ['carry_forward', 'margin_square_off'] } },
+                // Active carry_forward trades (needed for position calculation, but marked so Flutter can hide from Trade tab)
+                { deleted_at: null, trade_type: 'carry_forward' },
                 // Include settlement closing trades (soft-deleted but should show in history)
                 { remarks: 'Settlement: position closed at settlement price' },
             ],

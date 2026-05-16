@@ -42,10 +42,12 @@ const getTradeReport = async (req, res) => {
       // 1. Active regular trades
       // 2. Regular trades soft-deleted by settlement (week reset)
       // 3. Settlement closing trades (carry_forward type, soft-deleted, shows the close at settlement price)
+      // 4. Active carry_forward re-opening trades (positions carried forward at settlement price)
       $or: [
         { deleted_at: null, trade_type: { $nin: ['carry_forward', 'margin_square_off'] } },
         { remarks: 'Settlement: week reset', trade_type: { $nin: ['carry_forward', 'margin_square_off'] } },
         { remarks: 'Settlement: position closed at settlement price' },
+        { deleted_at: null, trade_type: 'carry_forward' },
       ],
     };
     if (targetUserId) match.user_id = targetUserId;
