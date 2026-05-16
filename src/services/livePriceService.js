@@ -383,8 +383,8 @@ class LivePriceService {
               // (price differs significantly from settlement = market is trading again)
               const settlPrice = this._settlementPrices.get(tokenStr);
               const priceDiff = Math.abs(t.last_price - settlPrice) / settlPrice;
-              if (priceDiff > 0.001) {
-                // Price moved >0.1% from settlement — market is open, clear settlement
+              if (priceDiff > 0.005) {
+                // Price moved >0.5% from settlement — market is open, clear settlement
                 this._settlementPrices.delete(tokenStr);
                 this.latestPrices.set(tokenStr, t.last_price);
                 this.latestPrices.set(parseInt(t.instrument_token), t.last_price);
