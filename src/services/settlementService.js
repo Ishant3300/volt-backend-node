@@ -36,6 +36,7 @@ function resetState() {
     running: false, phase: 'idle', total: 0, processed: 0,
     currentInstrument: '', startedAt: null, completedAt: null, error: null,
     closedTrades: 0, reopenedTrades: 0, usersAffected: 0, pricesFetched: 0,
+    activeTradesInDb: 0,
   };
 }
 
@@ -90,9 +91,31 @@ async function _executeSettlement() {
     closePriceMap[inst.instrument_token.toString()] = inst.last_price;
   }
 
+  // Fallback: For instruments with open positions but no DB price,
+  // use metricsEngine's in-memory LTP (last live price from Kite).
+  // This prevents positions from being lost when bhavcopy didn't cover them.
+  const positionTokens = metricsEngine.getPositionTokens();
+  let fallbackCount = 0;
+  for (const tokenInt of positionTokens) {
+    const tokenStr = tokenInt.toString();
+    if (!closePriceMap[tokenStr]) {
+      const ltp = metricsEngine._ltpMap.get(tokenStr);
+      const bid = metricsEngine._bidMap.get(tokenStr);
+      const ask = metricsEngine._askMap.get(tokenStr);
+      const fallbackPrice = ltp || bid || ask;
+      if (fallbackPrice && fallbackPrice > 0) {
+        closePriceMap[tokenStr] = fallbackPrice;
+        fallbackCount++;
+      }
+    }
+  }
+  if (fallbackCount > 0) {
+    console.log(`   📊 Added ${fallbackCount} fallback prices from metricsEngine (live LTP).`);
+  }
+
   _settlementState.pricesFetched = Object.keys(closePriceMap).length;
   broadcastProgress();
-  console.log(`   📊 Loaded ${Object.keys(closePriceMap).length} close prices from DB.`);
+  console.log(`   📊 Loaded ${Object.keys(closePriceMap).length} close prices (${allInstruments.length} from DB + ${fallbackCount} from live LTP).`);
 
   if (Object.keys(closePriceMap).length === 0) {
     throw new Error('No close prices in DB — run "Fetch Settlement Prices" first');
@@ -122,6 +145,21 @@ async function _executeSettlement() {
   broadcastProgress();
   console.log('📊 [Settlement] Phase 3: Collecting open positions...');
 
+  // Diagnostic: count active trades before aggregation
+  const activeTradeCount = await Trade.countDocuments({ status: 'completed', deleted_at: null });
+  console.log(`   📊 Active completed trades in DB: ${activeTradeCount}`);
+  _settlementState.activeTradesInDb = activeTradeCount;
+
+  if (activeTradeCount > 0) {
+    // Sample a few trades to verify data integrity
+    const sampleTrades = await Trade.find({ status: 'completed', deleted_at: null })
+      .select('user_id instrument_token transaction_type executed_quantity tradingsymbol trade_type')
+      .limit(5).lean();
+    for (const t of sampleTrades) {
+      console.log(`   📋 Sample: ${t.tradingsymbol} ${t.transaction_type} qty=${t.executed_quantity} token=${t.instrument_token} type=${t.trade_type} user=${t.user_id}`);
+    }
+  }
+
   const openPositions = await Trade.aggregate([
     { $match: { status: 'completed', deleted_at: null } },
     { $group: {
@@ -139,7 +177,28 @@ async function _executeSettlement() {
     { $match: { net_qty: { $ne: 0 } } },
   ]);
 
-  _settlementState.total = openPositions.length;
+  // Diagnostic: if no positions found but trades exist, log the grouped results before net_qty filter
+  if (openPositions.length === 0 && activeTradeCount > 0) {
+    console.warn('   ⚠️ No open positions found despite having active trades! Checking grouped data...');
+    const allGrouped = await Trade.aggregate([
+      { $match: { status: 'completed', deleted_at: null } },
+      { $group: {
+        _id: { user_id: '$user_id', instrument_token: '$instrument_token' },
+        net_qty: { $sum: { $cond: [{ $eq: ['$transaction_type', 'BUY'] }, '$executed_quantity', { $multiply: ['$executed_quantity', -1] }] } },
+        total_buy_qty: { $sum: { $cond: [{ $eq: ['$transaction_type', 'BUY'] }, '$executed_quantity', 0] } },
+        total_sell_qty: { $sum: { $cond: [{ $eq: ['$transaction_type', 'SELL'] }, '$executed_quantity', 0] } },
+        tradingsymbol: { $first: '$tradingsymbol' },
+        count: { $sum: 1 },
+      }},
+    ]);
+    console.log(`   📊 Total grouped positions (before net_qty filter): ${allGrouped.length}`);
+    const sample = allGrouped.slice(0, 10);
+    for (const g of sample) {
+      console.log(`   📋 ${g.tradingsymbol}: net=${g.net_qty}, buy=${g.total_buy_qty}, sell=${g.total_sell_qty}, trades=${g.count}`);
+    }
+  }
+
+  _settlementState.total = openPositions.length; // preliminary count (may reduce after price check)
   broadcastProgress();
   console.log(`   Found ${openPositions.length} open position(s).`);
 
@@ -150,29 +209,98 @@ async function _executeSettlement() {
   const instMap = {};
   instruments.forEach(i => { instMap[i.instrument_token.toString()] = i; });
 
-  // ── Phase 4: Soft-delete ALL old completed trades ────────────────
+  // ── Phase 4: Soft-delete old completed trades ────────────────
+  // IMPORTANT: Only soft-delete trades for positions that have a valid close price.
+  // If a position has no close price, we CANNOT settle it — leave those trades intact.
   console.log('📊 [Settlement] Phase 4: Soft-deleting old trades...');
   _settlementState.currentInstrument = 'Cleaning up old trades...';
   broadcastProgress();
 
-  const deleteResult = await Trade.updateMany(
-    { status: 'completed', deleted_at: null },
-    { $set: { deleted_at: new Date(), remarks: 'Settlement: week reset' } }
-  );
-  console.log(`   Soft-deleted ${deleteResult.modifiedCount} old trade(s).`);
+  // Determine which positions have valid close prices
+  const settleableTokens = new Set();
+  const unsettleablePositions = [];
+  for (const pos of openPositions) {
+    const tokenStr = pos._id.instrument_token.toString();
+    const closePrice = closePriceMap[tokenStr];
+    if (closePrice && closePrice > 0) {
+      settleableTokens.add(tokenStr);
+    } else {
+      unsettleablePositions.push(pos);
+    }
+  }
+
+  if (unsettleablePositions.length > 0) {
+    console.warn(`   ⚠️ ${unsettleablePositions.length} position(s) have no close price — will NOT be settled:`);
+    for (const pos of unsettleablePositions) {
+      const inst = instMap[pos._id.instrument_token.toString()];
+      const name = inst?.display_name || inst?.raw_name || pos.tradingsymbol || pos._id.instrument_token;
+      console.warn(`      - ${name} (token: ${pos._id.instrument_token}, user: ${pos._id.user_id})`);
+    }
+  }
+
+  // Only soft-delete trades for instruments that have a valid close price
+  // Trades for unsettleable instruments remain active (untouched)
+  let deleteResult;
+  if (settleableTokens.size > 0) {
+    deleteResult = await Trade.updateMany(
+      { status: 'completed', deleted_at: null, instrument_token: { $in: [...settleableTokens] } },
+      { $set: { deleted_at: new Date(), remarks: 'Settlement: week reset' } }
+    );
+    console.log(`   Soft-deleted ${deleteResult.modifiedCount} old trade(s) for ${settleableTokens.size} settleable instruments.`);
+  } else {
+    deleteResult = { modifiedCount: 0 };
+    console.log('   No settleable instruments — nothing to delete.');
+  }
+
+  // Also soft-delete trades for fully-closed positions (net_qty = 0) that have settleable tokens
+  // These are positions where buy_qty == sell_qty — no re-opening needed
+  const flatPositionTokens = new Set();
+  const allGroupedForFlat = await Trade.aggregate([
+    { $match: { status: 'completed', deleted_at: null } },
+    { $group: {
+      _id: { user_id: '$user_id', instrument_token: '$instrument_token' },
+      net_qty: { $sum: { $cond: [{ $eq: ['$transaction_type', 'BUY'] }, '$executed_quantity', { $multiply: ['$executed_quantity', -1] }] } },
+    }},
+    { $match: { net_qty: 0 } },
+  ]);
+  for (const flat of allGroupedForFlat) {
+    const tokenStr = flat._id.instrument_token.toString();
+    if (settleableTokens.has(tokenStr) || closePriceMap[tokenStr]) {
+      flatPositionTokens.add(tokenStr);
+    }
+  }
+  if (flatPositionTokens.size > 0) {
+    const flatDelete = await Trade.updateMany(
+      { status: 'completed', deleted_at: null, instrument_token: { $in: [...flatPositionTokens] } },
+      { $set: { deleted_at: new Date(), remarks: 'Settlement: week reset (flat position)' } }
+    );
+    if (flatDelete.modifiedCount > 0) {
+      console.log(`   Also soft-deleted ${flatDelete.modifiedCount} trade(s) from ${flatPositionTokens.size} flat (closed) positions.`);
+    }
+  }
 
   // ── Phase 5: Create closing + re-opening trades at settlement price ──
-  // For each open position:
+  // For each open position WITH a valid close price:
   //   1. CLOSING trade (opposite side) at settlement price — shows deals/P&L in history
   //   2. RE-OPENING trade (same side) at settlement price — fresh position for new week
+  // Positions without close prices are left untouched (not deleted in Phase 4 either).
   console.log('📊 [Settlement] Phase 5: Creating closing + re-opening trades...');
+
+  // Only process positions that have a valid close price (settleable ones)
+  const settleablePositions = openPositions.filter(pos => {
+    const tokenStr = pos._id.instrument_token.toString();
+    return settleableTokens.has(tokenStr);
+  });
+
+  _settlementState.total = settleablePositions.length;
+  broadcastProgress();
 
   const affectedUsers = new Set();
   let closedCount = 0;
   let reopenedCount = 0;
 
-  for (let i = 0; i < openPositions.length; i++) {
-    const pos = openPositions[i];
+  for (let i = 0; i < settleablePositions.length; i++) {
+    const pos = settleablePositions[i];
     const token = pos._id.instrument_token;
     const userId = pos._id.user_id;
     const tokenStr = token.toString();
@@ -184,11 +312,7 @@ async function _executeSettlement() {
     _settlementState.currentInstrument = displayName;
     broadcastProgress();
 
-    if (!closePrice || closePrice <= 0) {
-      console.warn(`   ⚠️ No close price for ${displayName}, skipping.`);
-      continue;
-    }
-
+    // closePrice is guaranteed > 0 here (filtered in settleablePositions)
     const absQty = Math.abs(pos.net_qty);
     const isLong = pos.net_qty > 0;
     const openSide = isLong ? 'BUY' : 'SELL';
@@ -347,6 +471,9 @@ async function _executeSettlement() {
   broadcastProgress();
 
   console.log(`✅ [Settlement] Complete: ${deleteResult.modifiedCount} old trades deleted, ${closedCount} closed, ${reopenedCount} re-opened, ${affectedUsers.size} users.`);
+  if (unsettleablePositions.length > 0) {
+    console.log(`   ⚠️ ${unsettleablePositions.length} position(s) were NOT settled (no close price) — left intact.`);
+  }
 }
 
 module.exports = { runSettlement, getState, resetState };
