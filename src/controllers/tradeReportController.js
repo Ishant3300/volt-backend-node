@@ -93,6 +93,7 @@ const getTradeReport = async (req, res) => {
       grouped[key].all_trades.push({
         date: t.executed_at,
         type: t.transaction_type,
+        trade_type: t.trade_type || 'regular',
         buy_qty: t.transaction_type === 'BUY' ? (t.executed_quantity || 0) : 0,
         sell_qty: t.transaction_type === 'SELL' ? (t.executed_quantity || 0) : 0,
         rate: t.executed_price || 0,
@@ -134,6 +135,9 @@ const getTradeReport = async (req, res) => {
       const instrTrades = trades.filter(t => `${t.exchange}::${t.tradingsymbol}` === key);
       let brokerage = 0;
       for (const t of instrTrades) {
+        // No brokerage on carry_forward or margin_square_off trades
+        if (t.trade_type === 'carry_forward' || t.trade_type === 'margin_square_off') continue;
+
         const ki = kiteMap[t.instrument_token] || {};
         const seg = ki.segment || '';
         const rawName = ki.raw_name || '';
@@ -172,6 +176,9 @@ const getTradeReport = async (req, res) => {
       if (!perTradeRule) perTradeRule = brkRules.find(r => r.exchange_name === (seg.split('-')[0] || '').toUpperCase() && !r.script_name);
 
       for (const at of g.all_trades) {
+        // No brokerage on carry_forward or margin_square_off trades
+        if (at.trade_type === 'carry_forward' || at.trade_type === 'margin_square_off') continue;
+
         if (perTradeRule) {
           const qty = (at.buy_qty || 0) + (at.sell_qty || 0);
           const rate = at.rate || 0;
