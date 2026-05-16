@@ -81,6 +81,12 @@ const getTradeReport = async (req, res) => {
           all_trades: [], // chronological for advanced mode
         };
       }
+
+      // Skip active carry_forward re-opening trades from buy/sell aggregation
+      // (they only appear in the Carry Forward section via dedicated query below)
+      const isActiveCarryForward = t.trade_type === 'carry_forward' && !t.deleted_at;
+      if (isActiveCarryForward) continue;
+
       const entry = {
         date: t.executed_at,
         qty: t.executed_quantity || 0,
