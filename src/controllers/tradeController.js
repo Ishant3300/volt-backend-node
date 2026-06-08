@@ -697,6 +697,10 @@ const placeTrade = async (req, res) => {
             }
 
             if (order_type === 'MARKET') {
+                // Admin placing with a custom price: use that price directly (no bid/ask override)
+                if (req.admin && price && price > 0) {
+                    executedPrice = price;
+                } else {
                 // For MARKET orders closing a position, use bid/ask (matching orders page CMP)
                 // BUY to close short → use ask price; SELL to close long → use bid price
                 // This ensures the execution price matches what the user sees on the orders page.
@@ -766,6 +770,7 @@ const placeTrade = async (req, res) => {
                 if (!executedPrice) {
                     throw new Error('Could not determine price for MARKET order');
                 }
+                } // end else (non-admin MARKET order)
             }
 
             // 2. For LIMIT/SL orders, check if the condition is already met
