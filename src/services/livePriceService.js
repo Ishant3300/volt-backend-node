@@ -368,29 +368,28 @@ class LivePriceService {
           if (t && t.instrument_token && t.last_price) {
             const tokenStr = t.instrument_token.toString();
 
-            // If settlement price exists for this token, don't override watchlist display
-            // (Kite sends stale ticks after market close — settlement price is authoritative)
-            // But ALWAYS feed metricsEngine regardless (positions use live data)
-            const hasSettlement = this._settlementPrices && this._settlementPrices.has(tokenStr);
+            // If settlement prices exist, check if market is now open
+            // (genuine ticks = market is trading again → clear ALL settlement prices)
+            if (this._settlementPrices && this._settlementPrices.size > 0) {
+              const settlPrice = this._settlementPrices.get(tokenStr);
+              if (settlPrice) {
+                const priceDiff = Math.abs(t.last_price - settlPrice) / settlPrice;
+                if (priceDiff > 0.005) {
+                  // Price moved >0.5% from settlement — market is open
+                  // Clear ALL settlement prices (not just this token)
+                  console.log(`📊 Market open detected (${tokenStr}: ${settlPrice} → ${t.last_price}). Clearing all settlement prices.`);
+                  this._settlementPrices.clear();
+                }
+              }
+            }
 
-            if (!hasSettlement) {
-              // No settlement — normal flow: update latestPrices and broadcast
+            // If settlement price still exists for this specific token, skip watchlist update
+            // (but still feed metricsEngine below)
+            const stillHasSettlement = this._settlementPrices && this._settlementPrices.has(tokenStr);
+            if (!stillHasSettlement) {
               this.latestPrices.set(tokenStr, t.last_price);
               this.latestPrices.set(parseInt(t.instrument_token), t.last_price);
               liveTicks.push(t);
-            } else {
-              // Settlement exists — clear it only if this looks like a genuine market-open tick
-              // (price differs significantly from settlement = market is trading again)
-              const settlPrice = this._settlementPrices.get(tokenStr);
-              const priceDiff = Math.abs(t.last_price - settlPrice) / settlPrice;
-              if (priceDiff > 0.005) {
-                // Price moved >0.5% from settlement — market is open, clear settlement
-                this._settlementPrices.delete(tokenStr);
-                this.latestPrices.set(tokenStr, t.last_price);
-                this.latestPrices.set(parseInt(t.instrument_token), t.last_price);
-                liveTicks.push(t);
-              }
-              // Otherwise: stale tick ≈ settlement price, ignore for watchlist
             }
 
             // ALWAYS update metricsEngine (positions need live data, independent of watchlist)
