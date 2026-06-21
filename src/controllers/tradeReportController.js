@@ -309,4 +309,85 @@ const getTradeReport = async (req, res) => {
   }
 };
 
-module.exports = { getTradeReport };
+/**
+ * GET /api/trade/open-positions
+ * Returns actual current open positions for a user by aggregating ALL active trades.
+ * No date filter — this is the source of truth for direction and qty.
+ * Query: user_id (required for admin/master, optional for user — defaults to self)
+ */
+const getOpenPositions = async (req, res) => {
+  try {
+    const { user_id } = req.query;
+    const role = req.admin ? 'admin' : req.master ? 'master' : 'user';
+    const callerId = req.admin?.id || req.master?.id || req.user?.id;
+
+    let targetUserId;
+    if (role === 'user') {
+      targetUserId = new mongoose.Types.ObjectId(callerId);
+    } else if (user_id) {
+      targetUserId = new mongoose.Types.ObjectId(user_id);
+    } else {
+      return res.status(400).json({ success: false, message: 'user_id is required' });
+    }
+
+    // All active (non-deleted) completed trades — no date filter
+    const trades = await Trade.find({
+      user_id: targetUserId,
+      status: 'completed',
+      deleted_at: null,
+    }).lean();
+
+    // Compute net position per instrument
+    const posMap = {};
+    for (const t of trades) {
+      const key = `${t.exchange}::${t.tradingsymbol}`;
+      if (!posMap[key]) {
+        posMap[key] = {
+          exchange: t.exchange,
+          tradingsymbol: t.tradingsymbol,
+          instrument_token: t.instrument_token,
+          netQty: 0,
+          totalBuyQty: 0,
+          totalBuyValue: 0,
+          totalSellQty: 0,
+          totalSellValue: 0,
+        };
+      }
+      const qty = t.executed_quantity || 0;
+      const price = t.executed_price || 0;
+      if (t.transaction_type === 'BUY') {
+        posMap[key].netQty += qty;
+        posMap[key].totalBuyQty += qty;
+        posMap[key].totalBuyValue += qty * price;
+      } else {
+        posMap[key].netQty -= qty;
+        posMap[key].totalSellQty += qty;
+        posMap[key].totalSellValue += qty * price;
+      }
+    }
+
+    const openPositions = [];
+    for (const pos of Object.values(posMap)) {
+      if (Math.abs(pos.netQty) > 0.001) {
+        const isLong = pos.netQty > 0;
+        const avgPrice = isLong
+          ? (pos.totalBuyQty > 0 ? pos.totalBuyValue / pos.totalBuyQty : 0)
+          : (pos.totalSellQty > 0 ? pos.totalSellValue / pos.totalSellQty : 0);
+        openPositions.push({
+          exchange: pos.exchange,
+          tradingsymbol: pos.tradingsymbol,
+          instrument_token: pos.instrument_token,
+          direction: isLong ? 'BUY' : 'SELL',
+          open_qty: Math.abs(pos.netQty),
+          avg_price: avgPrice,
+        });
+      }
+    }
+
+    res.status(200).json({ success: true, data: openPositions });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+module.exports = { getTradeReport, getOpenPositions };
