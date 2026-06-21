@@ -238,18 +238,14 @@ async function _executeSettlement() {
     }
   }
 
-  // Only soft-delete trades for instruments that have a valid close price
-  // Trades for unsettleable instruments remain active (untouched)
-  let deleteResult;
-  if (settleableTokens.size > 0) {
-    deleteResult = await Trade.updateMany(
-      { status: 'completed', deleted_at: null, instrument_token: { $in: [...settleableTokens] } },
-      { $set: { deleted_at: new Date(), remarks: 'Settlement: week reset' } }
-    );
-    console.log(`   Soft-deleted ${deleteResult.modifiedCount} old trade(s) for ${settleableTokens.size} settleable instruments.`);
+  // Deletion of old trades now happens PER-POSITION inside Phase 5,
+  // AFTER new trades are successfully created ("create then delete" pattern).
+  // This prevents silent data loss if Trade.create() fails for any position.
+  let deleteResult = { modifiedCount: 0 };
+  if (settleableTokens.size === 0) {
+    console.log('   No settleable instruments — nothing to process.');
   } else {
-    deleteResult = { modifiedCount: 0 };
-    console.log('   No settleable instruments — nothing to delete.');
+    console.log(`   ${settleableTokens.size} settleable instrument(s) — old trades will be deleted per-position in Phase 5 after new trades are confirmed.`);
   }
 
   // Also soft-delete trades for fully-closed positions (net_qty = 0) that have settleable tokens
@@ -298,6 +294,7 @@ async function _executeSettlement() {
   const affectedUsers = new Set();
   let closedCount = 0;
   let reopenedCount = 0;
+  const failedPositions = []; // positions where create failed — old trades preserved intact
 
   for (let i = 0; i < settleablePositions.length; i++) {
     const pos = settleablePositions[i];
@@ -311,6 +308,17 @@ async function _executeSettlement() {
     _settlementState.processed = i + 1;
     _settlementState.currentInstrument = displayName;
     broadcastProgress();
+
+    // ── Guard: validate required fields BEFORE touching any DB records ──
+    // If master_id is missing the Trade schema will reject the create,
+    // and with the old "batch delete first" approach this caused silent data loss.
+    if (!pos.master_id) {
+      const reason = 'master_id is null/missing — cannot create settlement trades';
+      console.error(`   ❌ SKIP ${displayName} (user: ${userId}): ${reason}`);
+      console.error(`      Old trades preserved — position NOT lost.`);
+      failedPositions.push({ instrument: displayName, userId, reason });
+      continue;
+    }
 
     // closePrice is guaranteed > 0 here (filtered in settleablePositions)
     const absQty = Math.abs(pos.net_qty);
@@ -331,15 +339,13 @@ async function _executeSettlement() {
     console.log(`   📊 ${pos.tradingsymbol}: avgEntry=${avgEntryPrice.toFixed(2)}, settlement=${closePrice.toFixed(2)}, pnl=${closingPnl.toFixed(2)}`);
 
     try {
-      // 1. CLOSING trade — opposite side, closes at settlement price
-      // price = settlement price (what it was closed at)
-      // pnl = actual profit/loss from original entry to settlement
-      // Soft-deleted so metricsEngine ignores it (only reopening trade counts).
-      // History page includes settlement trades via special query.
-      // Timestamp is 1 second before reopening so history sorts correctly.
       const closeTime = new Date();
       const reopenTime = new Date(closeTime.getTime() + 1000);
 
+      // ── Step A: Create BOTH new trades FIRST (before deleting old ones) ──
+      // If either create throws, the catch block fires and old trades stay intact.
+
+      // 1. CLOSING trade — soft-deleted at creation; shows up in history/deals
       await Trade.create({
         user_id: userId,
         master_id: pos.master_id,
@@ -361,11 +367,9 @@ async function _executeSettlement() {
         deleted_at: closeTime,
         remarks: 'Settlement: position closed at settlement price',
       });
-      closedCount++;
 
-      // 2. RE-OPENING trade — same side at settlement price (fresh position for new week)
-      // ATP = CMP = settlement price → P&L starts at 0 for new week
-      await Trade.create({
+      // 2. RE-OPENING trade — active, ATP = settlement price, P&L = 0
+      const reopeningDoc = await Trade.create({
         user_id: userId,
         master_id: pos.master_id,
         admin_id: pos.admin_id || null,
@@ -385,14 +389,38 @@ async function _executeSettlement() {
         pnl: 0,
         remarks: 'Settlement: position carried forward at close price',
       });
+
+      // ── Step B: Both new trades exist — NOW safe to delete old trades ──
+      // Exclude the re-opening doc we just created (by _id) so it is never deleted.
+      const deleted = await Trade.updateMany(
+        {
+          status: 'completed',
+          deleted_at: null,
+          user_id: userId,
+          instrument_token: tokenStr,
+          _id: { $ne: reopeningDoc._id },
+        },
+        { $set: { deleted_at: closeTime, remarks: 'Settlement: week reset' } }
+      );
+
+      deleteResult.modifiedCount += deleted.modifiedCount;
+      closedCount++;
       reopenedCount++;
       affectedUsers.add(userId.toString());
+      console.log(`   ✅ Settled ${displayName} (user: ${userId}) — deleted ${deleted.modifiedCount} old trade(s).`);
     } catch (err) {
-      console.error(`   ❌ Error settling ${displayName} for user ${userId}: ${err.message}`);
+      console.error(`   ❌ FAILED to settle ${displayName} for user ${userId}: ${err.message}`);
+      console.error(`      Old trades preserved — position NOT lost.`);
+      failedPositions.push({ instrument: displayName, userId, reason: err.message });
     }
   }
 
-  console.log(`   Created ${closedCount} closing + ${reopenedCount} re-opening trade(s) for ${affectedUsers.size} user(s).`);
+  if (failedPositions.length > 0) {
+    console.error(`\n   ⚠️ [Settlement] ${failedPositions.length} POSITION(S) FAILED — old trades were preserved:`);
+    for (const f of failedPositions) {
+      console.error(`      - ${f.instrument} (user: ${f.userId}): ${f.reason}`);
+    }
+  }
 
   // ── Phase 6: Update metricsEngine price maps + full rebuild ─────
   console.log('📊 [Settlement] Phase 6: Rebuilding metrics...');
