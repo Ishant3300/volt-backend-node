@@ -249,15 +249,22 @@ const getTradeReport = async (req, res) => {
       }
     }
 
-    // Also include settlement carry_forward positions (reopened at settlement price)
-    // These are active trades with trade_type='carry_forward' that represent current open positions
+    // Also include settlement carry_forward positions (reopened at settlement price).
+    // Include both:
+    //   - Active (deleted_at: null) → currently open carry-forwards
+    //   - Soft-deleted AFTER fromDate → were open during the report period (settled mid-period)
+    // This ensures positions that existed during the report window always show in Carry Forward,
+    // even if they were subsequently settled by a later settlement run.
     if (targetUserId) {
       const cfTrades = await Trade.find({
         user_id: targetUserId,
         status: 'completed',
-        deleted_at: null,
         trade_type: 'carry_forward',
         remarks: 'Settlement: position carried forward at close price',
+        $or: [
+          { deleted_at: null },                        // still open
+          { deleted_at: { $gt: fromDate } },           // settled after the report window started
+        ],
       }).lean();
 
       for (const t of cfTrades) {
