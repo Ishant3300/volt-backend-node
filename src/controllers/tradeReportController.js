@@ -2,6 +2,7 @@ const Trade = require('../models/Trade');
 const User = require('../models/User');
 const BrokerageSettings = require('../models/BrokerageSettings');
 const KiteInstrument = require('../models/KiteInstrument');
+const SettlementHistory = require('../models/SettlementHistory');
 const mongoose = require('mongoose');
 
 /**
@@ -35,25 +36,12 @@ const getTradeReport = async (req, res) => {
       targetUserId = null; // admin/master without user_id = all users
     }
 
-    const match = {
-      status: 'completed',
-      executed_at: { $gte: fromDate, $lte: toDate },
-      // Include:
-      // 1. Active regular trades
-      // 2. Regular trades soft-deleted by settlement (week reset)
-      // 3. Settlement closing trades (carry_forward type, soft-deleted, shows the close at settlement price)
-      // 4. Active carry_forward re-opening trades (positions carried forward at settlement price)
-      $or: [
-        { deleted_at: null, trade_type: { $nin: ['carry_forward', 'margin_square_off'] } },
-        { remarks: 'Settlement: week reset', trade_type: { $nin: ['carry_forward', 'margin_square_off'] } },
-        { remarks: 'Settlement: position closed at settlement price' },
-        { deleted_at: null, trade_type: 'carry_forward' },
-      ],
-    };
-    if (targetUserId) match.user_id = targetUserId;
+    // User scope (applied to both the live Trade collection and the ledger)
+    const userScope = {};
+    if (targetUserId) userScope.user_id = targetUserId;
     else if (role === 'master') {
       const childIds = await User.find({ master_id: callerId, deleted_at: null }).distinct('_id');
-      match.user_id = { $in: childIds };
+      userScope.user_id = { $in: childIds };
     }
 
     // Fetch user info
@@ -63,9 +51,53 @@ const getTradeReport = async (req, res) => {
       if (u) userName = u.name || u.username;
     }
 
-    const trades = await Trade.find(match)
-      .sort({ executed_at: 1 })
-      .lean();
+    // ── Trade-table sources (response shape unchanged) ──
+    // (1) Current/unsettled period: LIVE active regular fills within the window.
+    const liveRegular = await Trade.find({
+      ...userScope,
+      status: 'completed',
+      deleted_at: null,
+      trade_type: { $nin: ['carry_forward', 'margin_square_off'] },
+      executed_at: { $gte: fromDate, $lte: toDate },
+    }).sort({ executed_at: 1 }).lean();
+
+    // (2) Historical/settled period: immutable SettlementHistory ledger fills within the
+    //     window. This is the DURABLE source of historical bills — independent of any
+    //     live-table mutation. It replaces the old fragile soft-deleted "week reset"
+    //     remarks matching, which could silently drop history.
+    const snapshots = await SettlementHistory.find({
+      ...userScope,
+      period_from: { $lte: toDate },
+      period_to: { $gte: fromDate },
+    }).lean();
+
+    const ledgerRows = [];
+    for (const s of snapshots) {
+      for (const f of (s.fills || [])) {
+        if (!f.executed_at) continue;
+        const at = new Date(f.executed_at);
+        if (at < fromDate || at > toDate) continue;
+        // Only actual market trades belong in the table; carry_forward/margin
+        // markers are represented via the Carry Forward section, not as fills.
+        if (f.trade_type === 'carry_forward' || f.trade_type === 'margin_square_off') continue;
+        ledgerRows.push({
+          exchange: s.exchange,
+          tradingsymbol: s.tradingsymbol,
+          instrument_token: s.instrument_token,
+          transaction_type: f.transaction_type,
+          executed_quantity: f.executed_quantity || 0,
+          executed_price: f.executed_price || 0,
+          executed_at: at,
+          pnl: f.pnl || 0,
+          trade_type: f.trade_type || 'regular',
+        });
+      }
+    }
+
+    // Merge live (current) + ledger (historical) fills, chronologically.
+    const trades = [...liveRegular, ...ledgerRows].sort(
+      (a, b) => new Date(a.executed_at) - new Date(b.executed_at)
+    );
 
     // Group by instrument key (exchange + tradingsymbol)
     const grouped = {};
@@ -397,4 +429,44 @@ const getOpenPositions = async (req, res) => {
   }
 };
 
-module.exports = { getTradeReport, getOpenPositions };
+/**
+ * GET /api/trade/settlement-history
+ * Returns immutable settlement-ledger snapshots for a user within a period.
+ * This is the durable source of truth for historical bills (survives any
+ * live Trade-table mutation). Query: user_id (required for admin/master,
+ * optional for user — defaults to self), from, to (ISO dates, optional).
+ */
+const getSettlementHistory = async (req, res) => {
+  try {
+    const SettlementHistory = require('../models/SettlementHistory');
+    const { user_id, from, to } = req.query;
+    const role = req.admin ? 'admin' : req.master ? 'master' : 'user';
+    const callerId = req.admin?.id || req.master?.id || req.user?.id;
+
+    let targetUserId;
+    if (role === 'user') {
+      targetUserId = new mongoose.Types.ObjectId(callerId);
+    } else if (user_id) {
+      targetUserId = new mongoose.Types.ObjectId(user_id);
+    } else {
+      return res.status(400).json({ success: false, message: 'user_id is required' });
+    }
+
+    const q = { user_id: targetUserId };
+    if (from || to) {
+      q.period_to = {};
+      if (from) q.period_to.$gte = new Date(from);
+      if (to) { const t = new Date(to); t.setHours(23, 59, 59, 999); q.period_to.$lte = t; }
+    }
+
+    const snapshots = await SettlementHistory.find(q)
+      .sort({ period_to: -1, tradingsymbol: 1 })
+      .lean();
+
+    res.status(200).json({ success: true, data: snapshots });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+module.exports = { getTradeReport, getOpenPositions, getSettlementHistory };

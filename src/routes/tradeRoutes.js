@@ -3,7 +3,7 @@ const router = express.Router();
 const { authenticateAny } = require('../middlewares/auth');
 const { validateTrade } = require('../middlewares/validate');
 const tradeController = require('../controllers/tradeController');
-const { getTradeReport, getOpenPositions } = require('../controllers/tradeReportController');
+const { getTradeReport, getOpenPositions, getSettlementHistory } = require('../controllers/tradeReportController');
 const { getRejectionLog } = require('../controllers/rejectionLogController');
 const { getUserwisePositions } = require('../controllers/userwisePositionController');
 const { getScriptQtyDetails, getAllLots, getInstrumentLimit } = require('../controllers/scriptQtyDetailController');
@@ -41,6 +41,9 @@ router.get('/report', getTradeReport);
 
 // Actual open positions for a user (no date filter — used by Live M2M PDF)
 router.get('/open-positions', getOpenPositions);
+
+// Immutable settlement-history ledger (durable source for historical bills)
+router.get('/settlement-history', getSettlementHistory);
 
 // Instrument info for trade card info sheet
 router.get('/instrument-info', tradeController.getInstrumentInfo);

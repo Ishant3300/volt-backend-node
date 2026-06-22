@@ -248,6 +248,190 @@ async function _executeSettlement() {
     console.log(`   ${settleableTokens.size} settleable instrument(s) — old trades will be deleted per-position in Phase 5 after new trades are confirmed.`);
   }
 
+  // ── Phase 3.5: Write immutable settlement-history ledger BEFORE any deletion ──
+  // Capture-before-mutate: a complete, self-contained snapshot of every position
+  // being settled this run is persisted to SettlementHistory. If this write fails,
+  // we throw and abort the entire settlement BEFORE deleting anything, so the live
+  // Trade data is never lost. The ledger is append-only and never modified.
+  console.log('📊 [Settlement] Phase 3.5: Writing settlement-history ledger...');
+  _settlementState.currentInstrument = 'Saving history snapshot...';
+  broadcastProgress();
+
+  {
+    const mongooseRef = require('mongoose');
+    const SettlementHistory = require('../models/SettlementHistory');
+    const BrokerageSettings = require('../models/BrokerageSettings');
+
+    // Flat (net 0) positions whose trades will also be reset this run
+    const flatGroupedSnap = await Trade.aggregate([
+      { $match: { status: 'completed', deleted_at: null } },
+      { $group: {
+        _id: { user_id: '$user_id', instrument_token: '$instrument_token' },
+        net_qty: { $sum: { $cond: [{ $eq: ['$transaction_type', 'BUY'] }, '$executed_quantity', { $multiply: ['$executed_quantity', -1] }] } },
+      }},
+      { $match: { net_qty: 0 } },
+    ]);
+    const flatTokensForSnapshot = new Set();
+    for (const f of flatGroupedSnap) {
+      const ts = f._id.instrument_token.toString();
+      if (settleableTokens.has(ts) || closePriceMap[ts]) flatTokensForSnapshot.add(ts);
+    }
+
+    const deletableTokens = new Set([...settleableTokens, ...flatTokensForSnapshot]);
+
+    if (deletableTokens.size > 0) {
+      const settlementRunId = new mongooseRef.Types.ObjectId();
+      const settlementDate = new Date();
+      _settlementState.settlementRunId = settlementRunId.toString();
+
+      const brkRules = await BrokerageSettings.find({ deleted_at: null }).lean();
+      const snapTokens = [...deletableTokens];
+      const snapInstr = await KiteInstrument.find({ instrument_token: { $in: snapTokens } })
+        .select('instrument_token lot_size segment raw_name name expiry instrument_type strike display_name').lean();
+      const snapInstMap = {};
+      snapInstr.forEach(ki => { snapInstMap[ki.instrument_token.toString()] = ki; });
+
+      const computeBrokerage = (ki, qty, price) => {
+        if (!ki) return 0;
+        const seg = ki.segment || '';
+        const rawName = ki.raw_name || '';
+        const lotSize = ki.lot_size || 1;
+        let rule = brkRules.find(r => r.script_name?.toUpperCase() === rawName.toUpperCase() && r.exchange_name === seg.toUpperCase());
+        if (!rule && rawName) rule = brkRules.find(r => r.script_name?.toUpperCase() === rawName.toUpperCase());
+        if (!rule && seg) rule = brkRules.find(r => r.exchange_name === seg.toUpperCase() && !r.script_name);
+        if (!rule) rule = brkRules.find(r => r.exchange_name === (seg.split('-')[0] || '').toUpperCase() && !r.script_name);
+        if (!rule) return 0;
+        if (rule.type === 'TURNOVER WISE') return Math.round(price * qty * (rule.brk_value / 10000) * 100) / 100;
+        if (rule.type === 'LOT WISE') return Math.round((lotSize > 1 ? qty / lotSize : qty) * rule.brk_value * 100) / 100;
+        return 0;
+      };
+
+      const buildDisplayName = (ki, fallback) => {
+        if (!ki || !ki.name) return fallback;
+        const base = ki.name;
+        if (!ki.expiry) return base;
+        const exp = new Date(ki.expiry);
+        const months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+        const d = exp.getDate(), m = months[exp.getMonth()];
+        if (ki.instrument_type === 'FUT') return `${base} ${d} ${m} FUT`;
+        if (ki.instrument_type === 'CE' || ki.instrument_type === 'PE') return `${base} ${ki.strike || ''} ${ki.instrument_type} ${d} ${m}`;
+        return `${base} ${d} ${m}`;
+      };
+
+      // All active trades being reset this run, grouped by user+instrument
+      const snapTrades = await Trade.find({
+        status: 'completed',
+        deleted_at: null,
+        instrument_token: { $in: snapTokens },
+      }).sort({ executed_at: 1 }).lean();
+
+      const groups = {};
+      for (const t of snapTrades) {
+        const ts = t.instrument_token.toString();
+        if (!deletableTokens.has(ts)) continue;
+        const key = `${t.user_id}::${ts}`;
+        if (!groups[key]) groups[key] = [];
+        groups[key].push(t);
+      }
+
+      const snapshots = [];
+      for (const key of Object.keys(groups)) {
+        const fills = groups[key];
+        const first = fills[0];
+        const ts = first.instrument_token.toString();
+        const ki = snapInstMap[ts];
+        const settlementPrice = closePriceMap[ts] || 0;
+
+        let totalBuyQty = 0, totalBuyValue = 0, totalSellQty = 0, totalSellValue = 0;
+        let realizedPnl = 0, brokerage = 0;
+        let openingFill = null;
+        const fillDocs = [];
+
+        for (const f of fills) {
+          const q = f.executed_quantity || 0;
+          const p = f.executed_price || 0;
+          if (f.transaction_type === 'BUY') { totalBuyQty += q; totalBuyValue += q * p; }
+          else { totalSellQty += q; totalSellValue += q * p; }
+          realizedPnl += (f.pnl || 0);
+          const br = (f.trade_type === 'carry_forward' || f.trade_type === 'margin_square_off') ? 0 : computeBrokerage(ki, q, p);
+          brokerage += br;
+          if (!openingFill && f.trade_type === 'carry_forward') openingFill = f;
+          fillDocs.push({
+            transaction_type: f.transaction_type,
+            executed_quantity: q,
+            executed_price: p,
+            executed_at: f.executed_at,
+            pnl: f.pnl || 0,
+            brokerage: br,
+            order_type: f.order_type || 'MARKET',
+            placed_by: f.placed_by || 'USER',
+            trade_type: f.trade_type || 'regular',
+          });
+        }
+
+        const avgBuyPrice = totalBuyQty > 0 ? totalBuyValue / totalBuyQty : 0;
+        const avgSellPrice = totalSellQty > 0 ? totalSellValue / totalSellQty : 0;
+        const netQty = totalBuyQty - totalSellQty;
+        const isLong = netQty > 0;
+        const absNet = Math.abs(netQty);
+        const avgEntry = isLong ? avgBuyPrice : avgSellPrice;
+        const settlementPnl = (absNet > 0 && settlementPrice > 0)
+          ? (isLong ? (settlementPrice - avgEntry) * absNet : (avgEntry - settlementPrice) * absNet)
+          : 0;
+
+        snapshots.push({
+          settlement_run_id: settlementRunId,
+          settlement_date: settlementDate,
+          period_from: first.executed_at,
+          period_to: settlementDate,
+          user_id: first.user_id,
+          master_id: first.master_id,
+          admin_id: first.admin_id || null,
+          exchange: first.exchange,
+          tradingsymbol: first.tradingsymbol,
+          instrument_token: ts,
+          display_name: buildDisplayName(ki, first.tradingsymbol),
+          opening_qty: openingFill ? (openingFill.executed_quantity || 0) : 0,
+          opening_price: openingFill ? (openingFill.executed_price || 0) : 0,
+          opening_side: openingFill ? openingFill.transaction_type : null,
+          fills: fillDocs,
+          total_buy_qty: totalBuyQty,
+          total_buy_value: totalBuyValue,
+          avg_buy_price: avgBuyPrice,
+          total_sell_qty: totalSellQty,
+          total_sell_value: totalSellValue,
+          avg_sell_price: avgSellPrice,
+          closing_qty: absNet,
+          closing_side: absNet > 0 ? (isLong ? 'SELL' : 'BUY') : null,
+          settlement_price: settlementPrice,
+          close_method: 'settlement',
+          realized_pnl: realizedPnl,
+          settlement_pnl: settlementPnl,
+          total_pnl: realizedPnl + settlementPnl,
+          brokerage: brokerage,
+          net_pnl: (realizedPnl + settlementPnl) - brokerage,
+          carry_forward_qty: absNet,
+          carry_forward_price: absNet > 0 ? settlementPrice : 0,
+          carry_forward_side: absNet > 0 ? (isLong ? 'BUY' : 'SELL') : null,
+        });
+      }
+
+      if (snapshots.length > 0) {
+        try {
+          await SettlementHistory.insertMany(snapshots, { ordered: true });
+          console.log(`   ✅ Wrote ${snapshots.length} settlement-history snapshot(s). run_id=${settlementRunId}`);
+        } catch (err) {
+          console.error(`   ❌ FATAL: failed to write settlement history — ABORTING before any deletion. ${err.message}`);
+          throw new Error(`Settlement aborted: could not write history ledger: ${err.message}`);
+        }
+      } else {
+        console.log('   No snapshots to write.');
+      }
+    } else {
+      console.log('   No settleable/flat positions to snapshot.');
+    }
+  }
+
   // Also soft-delete trades for fully-closed positions (net_qty = 0) that have settleable tokens
   // These are positions where buy_qty == sell_qty — no re-opening needed
   const flatPositionTokens = new Set();
