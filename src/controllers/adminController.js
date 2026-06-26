@@ -956,7 +956,8 @@ const createBrokerageSettings = async (req, res) => {
 
     const newBrokerageSettings = await BrokerageSettings.findOneAndUpdate(
       { type, exchange_name, script_name, deleted_at: null },
-      { type, exchange_name, script_name, brk_value, deleted_at: null },
+      // effective_from stamps the moment this rate takes effect (insert or update).
+      { type, exchange_name, script_name, brk_value, deleted_at: null, effective_from: new Date() },
       { upsert: true, new: true, setDefaultsOnInsert: true }
     );
 
@@ -1055,7 +1056,11 @@ const updateBrokerageSettings = async (req, res) => {
     if (type) brokerageSettings.type = type;
     if (exchange_name) brokerageSettings.exchange_name = exchange_name;
     if (script_name) brokerageSettings.script_name = script_name;
-    if (brk_value !== undefined) brokerageSettings.brk_value = brk_value;
+    if (brk_value !== undefined) {
+      brokerageSettings.brk_value = brk_value;
+      // Stamp the moment this rate takes effect so historical bills use the old rate.
+      brokerageSettings.effective_from = new Date();
+    }
 
     await brokerageSettings.save();
 

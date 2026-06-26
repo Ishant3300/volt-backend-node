@@ -31,6 +31,12 @@ const brokerageSettingsSchema = new mongoose.Schema({
     type: Date,
     default: Date.now
   },
+  // Brokerage applies only to trades executed AFTER this date.
+  // Defaults to created_at so existing rules apply from when they were created.
+  effective_from: {
+    type: Date,
+    default: Date.now,
+  },
   deleted_at: {
     type: Date,
     default: null

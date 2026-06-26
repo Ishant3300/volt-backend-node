@@ -90,6 +90,8 @@ const getTradeReport = async (req, res) => {
           executed_at: at,
           pnl: f.pnl || 0,
           trade_type: f.trade_type || 'regular',
+          _stored_brokerage: f.brokerage || 0,  // brokerage calculated at settlement time
+          _is_ledger: true,
         });
       }
     }
@@ -145,7 +147,7 @@ const getTradeReport = async (req, res) => {
     const allTokens = [...new Set(trades.map(t => t.instrument_token))];
     const kiteInstruments = await KiteInstrument.find(
       { instrument_token: { $in: allTokens } },
-      'instrument_token lot_size segment raw_name name expiry instrument_type'
+      'instrument_token lot_size segment raw_name name expiry instrument_type strike'
     ).lean();
     const kiteMap = {};
     kiteInstruments.forEach(ki => { kiteMap[ki.instrument_token] = ki; });
@@ -169,23 +171,41 @@ const getTradeReport = async (req, res) => {
       const matchedQty = Math.min(totalBuyQty, totalSellQty);
       const pnl = matchedQty > 0 ? (avgSellPrice - avgBuyPrice) * matchedQty : 0;
 
-      // Recalculate brokerage from BrokerageSettings (stored trade.brokerage is unreliable)
+      // Brokerage: for ledger (settled) rows use the stored value captured at settlement time.
+      // For live rows recalculate, but only with rules that were effective at the trade date
+      // (prevents a brokerage rate change from retroactively affecting old trades).
       const instrTrades = trades.filter(t => `${t.exchange}::${t.tradingsymbol}` === key);
       let brokerage = 0;
       for (const t of instrTrades) {
-        // No brokerage on carry_forward or margin_square_off trades
         if (t.trade_type === 'carry_forward' || t.trade_type === 'margin_square_off') continue;
 
+        // Settled/historical fills: trust the brokerage stored in the ledger.
+        if (t._is_ledger) {
+          brokerage += t._stored_brokerage || 0;
+          continue;
+        }
+
+        // Live fills: recalculate using only rules effective at the trade's execution time.
+        const tradeDate = new Date(t.executed_at);
         const ki = kiteMap[t.instrument_token] || {};
         const seg = ki.segment || '';
         const rawName = ki.raw_name || '';
         const lotSize = ki.lot_size || 1;
 
+        // Filter to rules effective at tradeDate, then pick the most recently effective one.
+        const effectiveRules = brkRules.filter(r =>
+          !r.effective_from || new Date(r.effective_from) <= tradeDate
+        );
+
+        const pickRule = (candidates) => candidates.sort(
+          (a, b) => new Date(b.effective_from || 0) - new Date(a.effective_from || 0)
+        )[0] || null;
+
         let rule = null;
-        if (rawName && seg) rule = brkRules.find(r => r.script_name?.toUpperCase() === rawName.toUpperCase() && r.exchange_name === seg.toUpperCase());
-        if (!rule && rawName) rule = brkRules.find(r => r.script_name?.toUpperCase() === rawName.toUpperCase());
-        if (!rule && seg) rule = brkRules.find(r => r.exchange_name === seg.toUpperCase() && !r.script_name);
-        if (!rule) rule = brkRules.find(r => r.exchange_name === (seg.split('-')[0] || '').toUpperCase() && !r.script_name);
+        if (rawName && seg) rule = pickRule(effectiveRules.filter(r => r.script_name?.toUpperCase() === rawName.toUpperCase() && r.exchange_name === seg.toUpperCase()));
+        if (!rule && rawName) rule = pickRule(effectiveRules.filter(r => r.script_name?.toUpperCase() === rawName.toUpperCase()));
+        if (!rule && seg) rule = pickRule(effectiveRules.filter(r => r.exchange_name === seg.toUpperCase() && !r.script_name));
+        if (!rule) rule = pickRule(effectiveRules.filter(r => r.exchange_name === (seg.split('-')[0] || '').toUpperCase() && !r.script_name));
 
         if (rule) {
           if (rule.type === 'TURNOVER WISE') {
@@ -201,29 +221,46 @@ const getTradeReport = async (req, res) => {
       grandTotalPnl += pnl;
       grandBrokerage += brokerage;
 
-      // Recalculate per-trade brokerage in all_trades (stored t.brokerage is unreliable)
+      // Per-trade brokerage in all_trades: use stored value for ledger rows,
+      // recalculate with effective rules for live rows.
       const ki = kiteMap[g.instrument_token] || {};
       const seg = ki.segment || '';
       const rawName = ki.raw_name || '';
       const lotSize = ki.lot_size || 1;
 
-      let perTradeRule = null;
-      if (rawName && seg) perTradeRule = brkRules.find(r => r.script_name?.toUpperCase() === rawName.toUpperCase() && r.exchange_name === seg.toUpperCase());
-      if (!perTradeRule && rawName) perTradeRule = brkRules.find(r => r.script_name?.toUpperCase() === rawName.toUpperCase());
-      if (!perTradeRule && seg) perTradeRule = brkRules.find(r => r.exchange_name === seg.toUpperCase() && !r.script_name);
-      if (!perTradeRule) perTradeRule = brkRules.find(r => r.exchange_name === (seg.split('-')[0] || '').toUpperCase() && !r.script_name);
-
       for (const at of g.all_trades) {
-        // No brokerage on carry_forward or margin_square_off trades
         if (at.trade_type === 'carry_forward' || at.trade_type === 'margin_square_off') continue;
 
-        if (perTradeRule) {
-          const qty = (at.buy_qty || 0) + (at.sell_qty || 0);
-          const rate = at.rate || 0;
-          if (perTradeRule.type === 'TURNOVER WISE') {
-            at.brokerage = Math.round(rate * qty * (perTradeRule.brk_value / 10000) * 100) / 100;
-          } else if (perTradeRule.type === 'LOT WISE') {
-            at.brokerage = Math.round((lotSize > 1 ? qty / lotSize : qty) * perTradeRule.brk_value * 100) / 100;
+        // Ledger (settled) fill: use brokerage stored at settlement time — no recalculation.
+        if (at._is_ledger) {
+          at.brokerage = at._stored_brokerage || 0;
+          continue;
+        }
+
+        // Live fill: find effective rule at the trade date to avoid retroactive changes.
+        if (at.rate && (at.buy_qty || at.sell_qty)) {
+          const tradeDate = new Date(at.date);
+          const effectiveRules = brkRules.filter(r =>
+            !r.effective_from || new Date(r.effective_from) <= tradeDate
+          );
+          const pickRule2 = (candidates) => candidates.sort(
+            (a, b) => new Date(b.effective_from || 0) - new Date(a.effective_from || 0)
+          )[0] || null;
+
+          let atRule = null;
+          if (rawName && seg) atRule = pickRule2(effectiveRules.filter(r => r.script_name?.toUpperCase() === rawName.toUpperCase() && r.exchange_name === seg.toUpperCase()));
+          if (!atRule && rawName) atRule = pickRule2(effectiveRules.filter(r => r.script_name?.toUpperCase() === rawName.toUpperCase()));
+          if (!atRule && seg) atRule = pickRule2(effectiveRules.filter(r => r.exchange_name === seg.toUpperCase() && !r.script_name));
+          if (!atRule) atRule = pickRule2(effectiveRules.filter(r => r.exchange_name === (seg.split('-')[0] || '').toUpperCase() && !r.script_name));
+
+          if (atRule) {
+            const qty = (at.buy_qty || 0) + (at.sell_qty || 0);
+            const rate = at.rate || 0;
+            if (atRule.type === 'TURNOVER WISE') {
+              at.brokerage = Math.round(rate * qty * (atRule.brk_value / 10000) * 100) / 100;
+            } else if (atRule.type === 'LOT WISE') {
+              at.brokerage = Math.round((lotSize > 1 ? qty / lotSize : qty) * atRule.brk_value * 100) / 100;
+            }
           }
         }
       }
@@ -307,7 +344,14 @@ const getTradeReport = async (req, res) => {
           if (ki.expiry) {
             const exp = new Date(ki.expiry);
             const months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
-            displayName = `${base} ${exp.getDate()} ${months[exp.getMonth()]} ${ki.instrument_type || ''}`.trim();
+            const d = exp.getDate(), m = months[exp.getMonth()];
+            if (ki.instrument_type === 'FUT') {
+              displayName = `${base} ${d} ${m} FUT`;
+            } else if (ki.instrument_type === 'CE' || ki.instrument_type === 'PE') {
+              displayName = `${base} ${ki.strike || ''} ${ki.instrument_type} ${d} ${m}`.replace(/\s+/g, ' ').trim();
+            } else {
+              displayName = `${base} ${d} ${m}`;
+            }
           }
         }
 

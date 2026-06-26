@@ -111,7 +111,8 @@ router.put('/brokerage-settings/bulk-update', authenticateAdminOrMaster, async (
       return res.status(400).json({ success: false, message: 'ids array and brk_value are required', data: null });
     }
     const BrokerageSettings = require('../models/BrokerageSettings');
-    const updateFields = { brk_value };
+    // Stamp effective_from so this new rate only applies to trades from now onwards.
+    const updateFields = { brk_value, effective_from: new Date() };
     if (type) updateFields.type = type;
     const result = await BrokerageSettings.updateMany({ _id: { $in: ids }, deleted_at: null }, { $set: updateFields });
 
