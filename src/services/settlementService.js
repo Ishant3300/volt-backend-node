@@ -274,7 +274,8 @@ async function _executeSettlement() {
     const flatTokensForSnapshot = new Set();
     for (const f of flatGroupedSnap) {
       const ts = f._id.instrument_token.toString();
-      if (settleableTokens.has(ts) || closePriceMap[ts]) flatTokensForSnapshot.add(ts);
+      // Flat positions (net=0) don't need a settlement price — always snapshot them.
+      flatTokensForSnapshot.add(ts);
     }
 
     const deletableTokens = new Set([...settleableTokens, ...flatTokensForSnapshot]);
@@ -436,9 +437,9 @@ async function _executeSettlement() {
           let creditedUsers = 0;
           for (const [uid, delta] of Object.entries(creditByUser)) {
             if (Math.abs(delta) < 0.01) continue; // skip negligible rounding noise
-            await UserModel.findByIdAndUpdate(uid, { $inc: { credits: Math.round(delta * 100) / 100 } });
-            console.log(`   💰 User ${uid}: credits ${delta >= 0 ? '+' : ''}${delta.toFixed(2)} (settled P&L)`);
-            if (delta < 0) console.warn(`      ⚠️ User ${uid} had a net loss — credits reduced.`);
+            await UserModel.findByIdAndUpdate(uid, { $inc: { settled_pnl: Math.round(delta * 100) / 100 } });
+            console.log(`   💰 User ${uid}: settled_pnl ${delta >= 0 ? '+' : ''}${delta.toFixed(2)} (settled P&L locked into equity)`);
+            if (delta < 0) console.warn(`      ⚠️ User ${uid} had a net loss this period.`);
             creditedUsers++;
           }
           if (creditedUsers > 0) {
@@ -469,9 +470,9 @@ async function _executeSettlement() {
   ]);
   for (const flat of allGroupedForFlat) {
     const tokenStr = flat._id.instrument_token.toString();
-    if (settleableTokens.has(tokenStr) || closePriceMap[tokenStr]) {
-      flatPositionTokens.add(tokenStr);
-    }
+    // Flat positions (net=0) don't need a settlement price — they're already fully closed.
+    // Always include them for reset regardless of whether a close price exists.
+    flatPositionTokens.add(tokenStr);
   }
   if (flatPositionTokens.size > 0) {
     const flatDelete = await Trade.updateMany(

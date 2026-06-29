@@ -149,6 +149,12 @@ const userSchema = new mongoose.Schema({
     type: String,
     default: null
   },
+  // Cumulative locked P&L from past settlements — not admin credit.
+  // equity = credits + settled_pnl + m2mPnl
+  settled_pnl: {
+    type: Number,
+    default: 0,
+  },
   deleted_at: {
     type: Date,
     default: null

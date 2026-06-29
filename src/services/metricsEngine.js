@@ -114,7 +114,7 @@ class MetricsEngine {
   async _rebuildAllUserCaches() {
     try {
       const userIds = await Trade.distinct('user_id', { status: 'completed', deleted_at: null });
-      const users = await User.find({ _id: { $in: userIds }, deleted_at: null }).select('_id credits master_id').lean();
+      const users = await User.find({ _id: { $in: userIds }, deleted_at: null }).select('_id credits settled_pnl master_id').lean();
 
       // Build master hierarchy maps for broadcast aggregation
       const allMasters = await Master.find({ deleted_at: null }).select('_id master_id').lean();
@@ -134,7 +134,7 @@ class MetricsEngine {
       this._tokenToUsers.clear();
 
       for (const user of users) {
-        await this._rebuildUserCache(user._id.toString(), user.credits || 0, user.master_id?.toString());
+        await this._rebuildUserCache(user._id.toString(), user.credits || 0, user.settled_pnl || 0, user.master_id?.toString());
       }
 
       // Compute initial metrics for all cached users (so getCachedMetrics works
@@ -151,7 +151,7 @@ class MetricsEngine {
   /**
    * Rebuild cache for a single user.
    */
-  async _rebuildUserCache(userId, credit, masterId) {
+  async _rebuildUserCache(userId, credit, settledPnl, masterId) {
     try {
       const trades = await Trade.find({
         user_id: userId, status: 'completed', deleted_at: null
@@ -266,6 +266,7 @@ class MetricsEngine {
 
       this._userCache.set(userId, {
         credit,
+        settledPnl,
         masterId,
         fifoPnl: totalFifoPnl,
         brokerage: totalBrokerage,
@@ -368,7 +369,7 @@ class MetricsEngine {
     const cache = this._userCache.get(userId);
     if (!cache) return null;
 
-    const { credit, openPositions, fifoPnl, brokerage } = cache;
+    const { credit, settledPnl, openPositions, fifoPnl, brokerage } = cache;
 
     let totalFloating = 0;
     let totalMargin = 0;
@@ -443,7 +444,7 @@ class MetricsEngine {
     const positionPnl = Math.round(totalFloating * 100) / 100;
     const m2mPnl = Math.round((realisedPnl + positionPnl) * 100) / 100;
     const marginUsed = Math.round(totalMargin * 100) / 100;
-    const equity = Math.round((credit + m2mPnl) * 100) / 100;
+    const equity = Math.round((credit + (settledPnl || 0) + m2mPnl) * 100) / 100;
     const freeMargin = Math.round((equity - marginUsed) * 100) / 100;
 
     return {
@@ -635,7 +636,7 @@ class MetricsEngine {
   async onTradeExecuted(userId) {
     if (!this._initialized) return;
     try {
-      const user = await User.findById(userId).select('credits master_id').lean();
+      const user = await User.findById(userId).select('credits settled_pnl master_id').lean();
       if (!user) return;
 
       // Clear old token→user mappings for this user
@@ -644,7 +645,7 @@ class MetricsEngine {
         if (users.size === 0) this._tokenToUsers.delete(token);
       }
 
-      await this._rebuildUserCache(userId, user.credits || 0, user.master_id?.toString());
+      await this._rebuildUserCache(userId, user.credits || 0, user.settled_pnl || 0, user.master_id?.toString());
 
       const metrics = this._computeUserMetrics(userId);
       if (metrics) {
@@ -674,7 +675,7 @@ class MetricsEngine {
 
     // No cache — rebuild this user's data and compute
     try {
-      const user = await User.findById(userId).select('credits master_id').lean();
+      const user = await User.findById(userId).select('credits settled_pnl master_id').lean();
       if (!user) return null;
 
       // Clear old token→user mappings for this user
@@ -683,7 +684,7 @@ class MetricsEngine {
         if (users.size === 0) this._tokenToUsers.delete(token);
       }
 
-      await this._rebuildUserCache(userId, user.credits || 0, user.master_id?.toString());
+      await this._rebuildUserCache(userId, user.credits || 0, user.settled_pnl || 0, user.master_id?.toString());
 
       const metrics = this._computeUserMetrics(userId);
       if (metrics) {
