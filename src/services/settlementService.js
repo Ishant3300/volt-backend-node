@@ -420,9 +420,33 @@ async function _executeSettlement() {
         try {
           await SettlementHistory.insertMany(snapshots, { ordered: true });
           console.log(`   ✅ Wrote ${snapshots.length} settlement-history snapshot(s). run_id=${settlementRunId}`);
+
+          // ── Phase 3.6: Credit each user with their settled net P&L ─────────
+          // Adds (realized_pnl + settlement_pnl - brokerage) to User.credits so
+          // the user's wealth is preserved after settlement resets active trades.
+          // After Phase 6 rebuild: equity = (credit + settled_pnl) + new_week_m2mPnl.
+          // Runs inside same try-block: if this fails, settlement aborts before deletion.
+          const UserModel = require('../models/User');
+          const creditByUser = {};
+          for (const snap of snapshots) {
+            const uid = snap.user_id.toString();
+            if (!creditByUser[uid]) creditByUser[uid] = 0;
+            creditByUser[uid] += snap.net_pnl;
+          }
+          let creditedUsers = 0;
+          for (const [uid, delta] of Object.entries(creditByUser)) {
+            if (Math.abs(delta) < 0.01) continue; // skip negligible rounding noise
+            await UserModel.findByIdAndUpdate(uid, { $inc: { credits: Math.round(delta * 100) / 100 } });
+            console.log(`   💰 User ${uid}: credits ${delta >= 0 ? '+' : ''}${delta.toFixed(2)} (settled P&L)`);
+            if (delta < 0) console.warn(`      ⚠️ User ${uid} had a net loss — credits reduced.`);
+            creditedUsers++;
+          }
+          if (creditedUsers > 0) {
+            console.log(`   ✅ Phase 3.6: Credited ${creditedUsers} user(s) — Phase 6 rebuild will reflect updated equity.`);
+          }
         } catch (err) {
-          console.error(`   ❌ FATAL: failed to write settlement history — ABORTING before any deletion. ${err.message}`);
-          throw new Error(`Settlement aborted: could not write history ledger: ${err.message}`);
+          console.error(`   ❌ FATAL: failed in Phase 3.5/3.6 — ABORTING before any deletion. ${err.message}`);
+          throw new Error(`Settlement aborted: ledger write or credit update failed: ${err.message}`);
         }
       } else {
         console.log('   No snapshots to write.');
