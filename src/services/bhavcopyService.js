@@ -98,11 +98,32 @@ async function fetchNseBhavcopy(date, instruments, closePriceMap) {
     });
 
     if (res.status !== 200) {
-      console.warn(`   [NSE] ⚠️ HTTP ${res.status} — file not available yet.`);
-      return { matched: 0, unmatched: 0 };
+      // Retry with previous trading day (bhavcopy might not be published yet for today)
+      console.warn(`   [NSE] ⚠️ HTTP ${res.status} for FNO_BC${ddmmyyyy}.DAT — retrying previous trading day...`);
+      nseDate.setDate(nseDate.getDate() - 1);
+      if (nseDate.getDay() === 0) nseDate.setDate(nseDate.getDate() - 2);
+      if (nseDate.getDay() === 6) nseDate.setDate(nseDate.getDate() - 1);
+      const retryParts = dateParts(nseDate);
+      const retryUrl = `https://nsearchives.nseindia.com/content/trdops/FNO_BC${retryParts.ddmmyyyy}.DAT`;
+      console.log(`   [NSE] Retrying: FNO_BC${retryParts.ddmmyyyy}.DAT`);
+      try {
+        const retryRes = await axios.get(retryUrl, {
+          responseType: 'arraybuffer', timeout: 60000,
+          validateStatus: () => true, headers: { 'User-Agent': BROWSER_UA },
+        });
+        if (retryRes.status !== 200) {
+          console.warn(`   [NSE] ⚠️ Retry also failed (HTTP ${retryRes.status}). No NSE data.`);
+          return { matched: 0, unmatched: 0 };
+        }
+        buf = Buffer.from(retryRes.data);
+        console.log(`   [NSE] ✅ Retry succeeded with ${dateToDashed(nseDate)}: ${(buf.length / 1024).toFixed(1)} KB.`);
+      } catch (retryErr) {
+        console.warn(`   [NSE] ⚠️ Retry download failed: ${retryErr.message}`);
+        return { matched: 0, unmatched: 0 };
+      }
+    } else {
+      buf = Buffer.from(res.data);
     }
-
-    buf = Buffer.from(res.data);
     if (buf.length < 500) {
       console.warn(`   [NSE] ⚠️ Response too small (${buf.length}B).`);
       return { matched: 0, unmatched: 0 };
@@ -376,13 +397,19 @@ async function fetchAndApplyBhavcopy(targetDate) {
   // Use IST date regardless of server timezone
   let date;
   if (targetDate) {
-    date = targetDate;
+    date = new Date(targetDate);
   } else {
     const now = new Date();
     const istString = now.toLocaleString('en-US', { timeZone: 'Asia/Kolkata' });
     const istDate = new Date(istString);
     date = new Date(istDate.getFullYear(), istDate.getMonth(), istDate.getDate());
   }
+
+  // Auto-rollback to the LAST TRADING DAY if today is a weekend.
+  // Bhavcopy is only published for trading days (Mon-Fri).
+  // If admin didn't pass a specific date, always use the most recent trading day.
+  if (date.getDay() === 0) date.setDate(date.getDate() - 2);      // Sunday → Friday
+  else if (date.getDay() === 6) date.setDate(date.getDate() - 1); // Saturday → Friday
 
   const dayNames = ['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'];
   console.log(`📊 [Bhavcopy] Fetching settlement prices for ${dateToDashed(date)} (${dayNames[date.getDay()]})...`);
