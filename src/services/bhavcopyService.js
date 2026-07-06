@@ -286,6 +286,8 @@ async function fetchMcxBhavcopy(date, instruments, closePriceMap) {
   const bulkOps = [];
   let matched = 0;
 
+  // Pass 1: Exact match (symbol + exact expiry date + strike + type)
+  const matchedTokens = new Set();
   for (const inst of mcxInstruments) {
     const key = buildMatchKey(inst);
     if (!key) continue;
@@ -306,6 +308,61 @@ async function fetchMcxBhavcopy(date, instruments, closePriceMap) {
         },
       });
       matched++;
+      matchedTokens.add(t);
+    }
+  }
+
+  // Pass 2: Fuzzy match for unmatched instruments
+  // MCX FUT/OPT expiry dates in the CSV may differ from DB by a few days
+  // (e.g., CSV says 24JUL2026 but DB has 31JUL2026 for the same contract).
+  // Match by: symbol + year-month + strike + type (ignore exact day).
+  if (mcxMap.size > 0) {
+    // Build a month-based lookup from the CSV: "SYMBOL|YYYYMM|STRIKE|TYPE" → data
+    const mcxMonthMap = new Map();
+    for (const [key, data] of mcxMap) {
+      // key format: "SYMBOL|YYYYMMDD|STRIKE|TYPE"
+      const parts = key.split('|');
+      if (parts.length === 4) {
+        const monthKey = `${parts[0]}|${parts[1].substring(0, 6)}|${parts[2]}|${parts[3]}`;
+        // Keep the first (or highest-close) entry per month-key
+        if (!mcxMonthMap.has(monthKey) || data.close > (mcxMonthMap.get(monthKey).close || 0)) {
+          mcxMonthMap.set(monthKey, data);
+        }
+      }
+    }
+
+    let fuzzyMatched = 0;
+    for (const inst of mcxInstruments) {
+      const t = inst.instrument_token.toString();
+      if (matchedTokens.has(t)) continue; // already matched exactly
+      const key = buildMatchKey(inst);
+      if (!key) continue;
+      // Build month-key from DB instrument
+      const parts = key.split('|');
+      if (parts.length !== 4) continue;
+      const monthKey = `${parts[0]}|${parts[1].substring(0, 6)}|${parts[2]}|${parts[3]}`;
+      const data = mcxMonthMap.get(monthKey);
+      if (data && data.close > 0) {
+        closePriceMap[t] = data.close;
+        bulkOps.push({
+          updateOne: {
+            filter: { instrument_token: t },
+            update: { $set: {
+              last_price: data.close,
+              ohlc_open: data.open || 0,
+              ohlc_high: data.high || 0,
+              ohlc_low: data.low || 0,
+              ohlc_close: data.close,
+            } },
+          },
+        });
+        fuzzyMatched++;
+        matchedTokens.add(t);
+      }
+    }
+    if (fuzzyMatched > 0) {
+      console.log(`   [MCX] Fuzzy match (month-based): +${fuzzyMatched} additional instruments.`);
+      matched += fuzzyMatched;
     }
   }
 
