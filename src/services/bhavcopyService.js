@@ -248,20 +248,38 @@ async function fetchMcxBhavcopy(date, instruments, closePriceMap) {
 
   console.log(`   [MCX] Fetching MCX settlement prices for ${dateToDashed(mcxDate)} (previous trading day)...`);
 
-  const csvBuf = await downloadMcxSamco(mcxDate);
+  let csvText = null;
 
-  if (!csvBuf || csvBuf.length < 100) {
-    console.warn(`   [MCX] ⚠️ No MCX data available.`);
+  // Strategy 1: Puppeteer (headless browser) — MCX blocks direct HTTP requests
+  try {
+    csvText = await fetchMcxViaPuppeteer(mcxDate);
+  } catch (e) {
+    console.warn(`   [MCX] Puppeteer approach failed: ${e.message}`);
+  }
+
+  // Strategy 2: Samco fallback (legacy, may not work for all dates)
+  if (!csvText) {
+    try {
+      const samcoBuf = await downloadMcxSamco(mcxDate);
+      if (samcoBuf && samcoBuf.length > 100) {
+        const text = samcoBuf.toString('utf8');
+        if (!text.startsWith('<!') && !text.startsWith('<html')) {
+          csvText = text;
+          console.log(`   [MCX] ✅ Samco fallback succeeded.`);
+        }
+      }
+    } catch (e) {
+      console.warn(`   [MCX] Samco fallback also failed: ${e.message}`);
+    }
+  }
+
+  if (!csvText || csvText.length < 200) {
+    console.warn(`   [MCX] ⚠️ No MCX data available from any source.`);
     return { matched: 0 };
   }
 
-  const csvText = csvBuf.toString('utf8');
-  if (csvText.startsWith('<!') || csvText.startsWith('<html')) {
-    console.warn(`   [MCX] ⚠️ Got HTML instead of CSV.`);
-    return { matched: 0 };
-  }
-
-  const mcxMap = parseMcxCSV(csvText);
+  // Parse the CSV (same format whether from Puppeteer or Samco)
+  const mcxMap = parseMcxBhavcopyCSV(csvText);
   console.log(`   [MCX] Parsed ${mcxMap.size} entries.`);
 
   const mcxInstruments = instruments.filter(i => i.exchange === 'MCX');
@@ -274,16 +292,16 @@ async function fetchMcxBhavcopy(date, instruments, closePriceMap) {
     const data = mcxMap.get(key);
     if (data) {
       const t = inst.instrument_token.toString();
-      closePriceMap[t] = data.settle_pr;
+      closePriceMap[t] = data.close;
       bulkOps.push({
         updateOne: {
           filter: { instrument_token: t },
           update: { $set: {
-            last_price: data.settle_pr,
+            last_price: data.close,
             ohlc_open: data.open || 0,
             ohlc_high: data.high || 0,
             ohlc_low: data.low || 0,
-            ohlc_close: data.settle_pr,
+            ohlc_close: data.close,
           } },
         },
       });
@@ -296,30 +314,239 @@ async function fetchMcxBhavcopy(date, instruments, closePriceMap) {
   return { matched };
 }
 
-async function downloadMcxSamco(date) {
-  ensureTmpDir();
-  const yyyymmdd = dateToYYYYMMDD(date);
-  const dd = dateToDashed(date);
-  const filePath = `/var/www/html/samco/public_html/Downloads/bhavcopy_data/${dd}/${yyyymmdd}_MCX.csv`;
-  const b64 = Buffer.from(filePath).toString('base64').replace(/=+$/, '');
-  const outPath = path.join(TMP_DIR, `samco_MCX_${yyyymmdd}.csv`);
-  const dataUrl = `https://www.samco.in/bse_nse_mcx/datacopy/${b64}`;
+/**
+ * Fetch MCX bhavcopy CSV via Puppeteer headless browser.
+ * MCX India (mcxindia.com) blocks all direct HTTP requests via Akamai CDN.
+ * This uses puppeteer-extra with stealth plugin to bypass it, then intercepts
+ * the CSV blob generated when clicking the "Download CSV" button.
+ */
+async function fetchMcxViaPuppeteer(mcxDate) {
+  const puppeteer = require('puppeteer-extra');
+  const StealthPlugin = require('puppeteer-extra-plugin-stealth');
+  puppeteer.use(StealthPlugin());
 
+  const dd = pad(mcxDate.getDate());
+  const mm = pad(mcxDate.getMonth() + 1);
+  const yyyy = mcxDate.getFullYear();
+  const dateStr = `${dd}/${mm}/${yyyy}`;
+
+  console.log(`   [MCX] Launching Puppeteer for mcxindia.com (date: ${dateStr})...`);
+
+  // Auto-detect Chrome executable path for different environments
+  const { execSync } = require('child_process');
+  let executablePath = undefined; // let Puppeteer use bundled Chromium by default
+  try {
+    // macOS: use system Chrome if bundled Chromium doesn't work
+    if (process.platform === 'darwin') {
+      const chromePath = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
+      if (require('fs').existsSync(chromePath)) executablePath = chromePath;
+    }
+    // Linux: try google-chrome or chromium-browser
+    if (process.platform === 'linux') {
+      try { executablePath = execSync('which google-chrome || which chromium-browser || which chromium', { encoding: 'utf8', timeout: 5000 }).trim(); } catch (_) {}
+    }
+  } catch (_) {}
+
+  const browser = await puppeteer.launch({
+    headless: 'new',
+    executablePath,
+    args: [
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
+      '--disable-dev-shm-usage',
+      '--disable-gpu',
+      '--single-process',
+      '--no-zygote',
+    ],
+  });
+
+  let csvText = null;
+
+  try {
+    const page = await browser.newPage();
+    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36');
+    await page.setViewport({ width: 1920, height: 1080 });
+
+    await page.goto('https://www.mcxindia.com/market-data/BhavCopy', {
+      waitUntil: 'networkidle2',
+      timeout: 60000,
+    });
+
+    // Check for Akamai block
+    const bodyText = await page.evaluate(() => document.body.innerText.substring(0, 100));
+    if (bodyText.includes('Access Denied') || bodyText.includes('403')) {
+      throw new Error('Blocked by Akamai CDN');
+    }
+
+    // Wait for date input
+    await page.waitForSelector('#bhavCopyDateWise', { timeout: 15000 });
+
+    // Set the target date
+    await page.evaluate((d) => {
+      const input = document.getElementById('bhavCopyDateWise');
+      if (input) { input.value = d; input.dispatchEvent(new Event('change', { bubbles: true })); }
+      const hdn = document.getElementById('hdnUCDate');
+      if (hdn) hdn.value = d;
+    }, dateStr);
+
+    // Wait for page to load data for the new date
+    await new Promise(r => setTimeout(r, 3000));
+
+    // Inject blob interceptors BEFORE clicking download
+    await page.evaluate(() => {
+      window.__mcxCsvData = null;
+      window.__mcxCsvReady = false;
+
+      const origCreateElement = document.createElement.bind(document);
+      document.createElement = function(tagName) {
+        const el = origCreateElement(tagName);
+        if (tagName.toLowerCase() === 'a') {
+          const origClick = el.click.bind(el);
+          el.click = function() {
+            if (el.href && el.href.startsWith('blob:')) {
+              fetch(el.href).then(r => r.text()).then(text => {
+                window.__mcxCsvData = text;
+                window.__mcxCsvReady = true;
+              }).catch(() => origClick());
+            } else { origClick(); }
+          };
+        }
+        return el;
+      };
+
+      const origCreateObjectURL = URL.createObjectURL.bind(URL);
+      URL.createObjectURL = function(blob) {
+        const url = origCreateObjectURL(blob);
+        if (blob instanceof Blob && (blob.type.includes('csv') || blob.type.includes('octet') || blob.type === '')) {
+          blob.text().then(text => {
+            if (text.length > 50 && !text.startsWith('<!')) {
+              window.__mcxCsvData = text;
+              window.__mcxCsvReady = true;
+            }
+          });
+        }
+        return url;
+      };
+    });
+
+    // Click CSV download button
+    const csvBtn = await page.$('#btnDateWiseCSV');
+    if (!csvBtn) throw new Error('CSV button #btnDateWiseCSV not found');
+
+    await csvBtn.click();
+
+    // Wait for blob capture (up to 20 seconds)
+    for (let i = 0; i < 40; i++) {
+      const ready = await page.evaluate(() => window.__mcxCsvReady === true);
+      if (ready) break;
+      await new Promise(r => setTimeout(r, 500));
+    }
+
+    csvText = await page.evaluate(() => window.__mcxCsvData);
+    if (csvText && csvText.length > 100) {
+      console.log(`   [MCX] ✅ Puppeteer captured ${(csvText.length / 1024).toFixed(1)} KB CSV.`);
+    } else {
+      csvText = null;
+      console.log(`   [MCX] ⚠️ Puppeteer blob capture returned empty/null.`);
+    }
+
+  } finally {
+    await browser.close();
+  }
+
+  return csvText;
+}
+
+/**
+ * Parse MCX bhavcopy CSV from mcxindia.com format.
+ * Headers: Date, Instrument Name, Symbol, Expiry Date, Option Type, Strike Price,
+ *          Open, High, Low, Close, Previous Close, Volume(Lots), ...
+ * Returns Map<matchKey, { open, high, low, close }>
+ */
+function parseMcxBhavcopyCSV(csvText) {
+  const lines = csvText.trim().split('\n');
+  if (lines.length < 2) return new Map();
+
+  // First line is the header
+  const headers = lines[0].split(',').map(h => h.trim().replace(/"/g, ''));
+  const col = {};
+  headers.forEach((h, i) => { col[h.toLowerCase()] = i; });
+
+  // Map header names (MCX uses these column names)
+  const iSymbol = col['symbol'] ?? col['Symbol'];
+  const iExpiry = col['expiry date'] ?? col['Expiry Date'] ?? col['expiry'];
+  const iOptType = col['option type'] ?? col['Option Type'] ?? col['optiontype'];
+  const iStrike = col['strike price'] ?? col['Strike Price'] ?? col['strikeprice'];
+  const iOpen = col['open'] ?? col['Open'];
+  const iHigh = col['high'] ?? col['High'];
+  const iLow = col['low'] ?? col['Low'];
+  const iClose = col['close'] ?? col['Close'];
+  const iInstName = col['instrument name'] ?? col['Instrument Name'] ?? col['instrumentname'];
+
+  const MONTHS = { Jan:'01',Feb:'02',Mar:'03',Apr:'04',May:'05',Jun:'06',Jul:'07',Aug:'08',Sep:'09',Oct:'10',Nov:'11',Dec:'12' };
+  const map = new Map();
+
+  for (let i = 1; i < lines.length; i++) {
+    const c = lines[i].split(',').map(s => s.trim().replace(/"/g, '').trim());
+    if (c.length < 10) continue;
+
+    const symbol = (c[iSymbol] || '').trim().toUpperCase();
+    const expiryRaw = (c[iExpiry] || '').trim(); // DDMMMYYYY like 31JUL2026
+    const optType = (c[iOptType] || '').trim();
+    const strikePr = parseFloat(c[iStrike]) || 0;
+    const open = parseFloat(c[iOpen]) || 0;
+    const high = parseFloat(c[iHigh]) || 0;
+    const low = parseFloat(c[iLow]) || 0;
+    const close = parseFloat(c[iClose]) || 0;
+    const instName = (c[iInstName] || '').trim();
+
+    if (!symbol || close <= 0) continue;
+
+    // Parse expiry: "31JUL2026" → "20260731"
+    let expiryNorm = null;
+    const expiryMatch = expiryRaw.match(/^(\d{2})([A-Z]{3})(\d{4})$/);
+    if (expiryMatch) {
+      const [, day, mon, year] = expiryMatch;
+      const mm = MONTHS[mon.charAt(0).toUpperCase() + mon.slice(1).toLowerCase()];
+      if (mm) expiryNorm = `${year}${mm}${day}`;
+    }
+    if (!expiryNorm) continue;
+
+    // Determine instrument type
+    let instType;
+    if (instName.startsWith('FUT') || instName.includes('FUT')) instType = 'FUT';
+    else if (optType === 'CE') instType = 'CE';
+    else if (optType === 'PE') instType = 'PE';
+    else continue;
+
+    const strike = instType === 'FUT' ? '0' : String(Math.round(strikePr));
+    const key = `${symbol}|${expiryNorm}|${strike}|${instType}`;
+    map.set(key, { open, high, low, close });
+  }
+
+  return map;
+}
+
+async function downloadMcxSamco(date) {
+  // Legacy Samco fallback — may not work for all dates.
   const { execSync } = require('child_process');
   let shell = null;
   try { execSync('pwsh -Version', { stdio: 'pipe', timeout: 5000 }); shell = 'pwsh'; } catch (_) {
     try { execSync('powershell -Version', { stdio: 'pipe', timeout: 5000 }); shell = 'powershell'; } catch (__) {}
   }
-  if (!shell) {
-    console.log('   [MCX] No PowerShell available — skipping.');
-    return null;
-  }
+  if (!shell) return null;
 
-  console.log(`   [MCX] Trying Samco via ${shell}...`);
+  const yyyymmdd = dateToYYYYMMDD(date);
+  const dd = dateToDashed(date);
+  const filePath = `/var/www/html/samco/public_html/Downloads/bhavcopy_data/${dd}/${yyyymmdd}_MCX.csv`;
+  const b64 = Buffer.from(filePath).toString('base64').replace(/=+$/, '');
+  const dataUrl = `https://www.samco.in/bse_nse_mcx/datacopy/${b64}`;
+  const outPath = path.join(TMP_DIR, `samco_MCX_${yyyymmdd}.csv`);
+
+  ensureTmpDir();
+  const psScript = path.join(TMP_DIR, `samco_dl_MCX_${Date.now()}.ps1`);
   const urlFile = path.join(TMP_DIR, `samco_url_MCX_${Date.now()}.txt`);
   fs.writeFileSync(urlFile, dataUrl, 'utf8');
-
-  const psScript = path.join(TMP_DIR, `samco_dl_MCX_${Date.now()}.ps1`);
   const ps = [
     '$session = $null',
     '$null = Invoke-WebRequest -Uri "https://www.samco.in/bhavcopy-nse-bse-mcx" -SessionVariable session -UserAgent "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" -TimeoutSec 15',
@@ -337,56 +564,9 @@ async function downloadMcxSamco(date) {
   if (fs.existsSync(outPath)) {
     const buf = fs.readFileSync(outPath);
     try { fs.unlinkSync(outPath); } catch (_) {}
-    if (buf.length > 100) {
-      const text = buf.toString('utf8').substring(0, 100);
-      if (!text.startsWith('<!') && !text.startsWith('<html')) {
-        console.log(`   [MCX] ✅ Samco via ${shell}: ${buf.length} bytes.`);
-        return buf;
-      }
-    }
+    if (buf.length > 100) return buf;
   }
-  console.warn(`   [MCX] Samco download failed.`);
   return null;
-}
-
-function parseMcxCSV(csvText) {
-  const lines = csvText.trim().split('\n');
-  if (lines.length < 2) return new Map();
-  const headers = lines[0].split(',').map(h => h.trim().replace(/"/g, ''));
-  const col = {};
-  headers.forEach((h, i) => { col[h] = i; });
-  const MONTHS = { Jan:'01',Feb:'02',Mar:'03',Apr:'04',May:'05',Jun:'06',Jul:'07',Aug:'08',Sep:'09',Oct:'10',Nov:'11',Dec:'12' };
-  const map = new Map();
-
-  for (let i = 1; i < lines.length; i++) {
-    const c = parseCsvLine(lines[i]);
-    if (c.length < 10) continue;
-    const symbol = c[col.SYMBOL];
-    const expiryRaw = c[col.EXPIRY_DATE];
-    const optType = c[col.OPTIONTYPE];
-    const strikePr = parseFloat(c[col.STRIKEPRICE]) || 0;
-    const open = parseFloat(c[col.OPEN]) || 0;
-    const high = parseFloat(c[col.HIGH]) || 0;
-    const low = parseFloat(c[col.LOW]) || 0;
-    const close = parseFloat(c[col.CLOSE]) || 0;
-    const instName = c[col.INSTRUMENTNAME];
-    if (!symbol || !expiryRaw || close <= 0) continue;
-
-    const parts = expiryRaw.split(' ');
-    if (parts.length !== 3) continue;
-    const expiryNorm = `${parts[2]}${MONTHS[parts[1]] || '00'}${parts[0].padStart(2, '0')}`;
-
-    let instType;
-    if (instName && instName.startsWith('FUT')) instType = 'FUT';
-    else if (optType === 'CE' || optType === 'PE') instType = optType;
-    else continue;
-
-    const strike = instType === 'FUT' ? '0' : String(Math.round(strikePr));
-    map.set(`${symbol.toUpperCase()}|${expiryNorm}|${strike}|${instType}`, {
-      open, high, low, close, settle_pr: close,
-    });
-  }
-  return map;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
