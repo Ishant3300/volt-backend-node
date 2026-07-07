@@ -544,7 +544,30 @@ const getLiveMetrics = async (req, res) => {
     const { user_id, master_id } = req.query;
 
     if (user_id) {
-      const metrics = metricsEngine.getCachedMetrics(user_id);
+      // Try cache first; if empty (user has no active trades post-settlement),
+      // build a fresh response from DB so the Position tab shows correct equity.
+      let metrics = metricsEngine.getCachedMetrics(user_id);
+      if (!metrics) {
+        // User not in cache (no active trades) — return their credit + settled_pnl as equity
+        const User = require('../models/User');
+        const user = await User.findById(user_id).select('credits settled_pnl').lean();
+        if (user) {
+          const credit = user.credits || 0;
+          const settledPnl = user.settled_pnl || 0;
+          const equity = Math.round((credit + settledPnl) * 100) / 100;
+          metrics = {
+            user_id,
+            credit: Math.round(credit * 100) / 100,
+            realised_pnl: 0,
+            position_pnl: 0,
+            m2m_pnl: 0,
+            margin_used: 0,
+            equity,
+            free_margin: equity,
+            positions: [],
+          };
+        }
+      }
       return res.status(200).json({ success: true, data: metrics ? [metrics] : [] });
     }
 
