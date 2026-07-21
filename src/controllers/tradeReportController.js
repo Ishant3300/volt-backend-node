@@ -169,7 +169,10 @@ const getTradeReport = async (req, res) => {
       const avgSellPrice = totalSellQty > 0 ? totalSellVol / totalSellQty : 0;
 
       const matchedQty = Math.min(totalBuyQty, totalSellQty);
-      const pnl = matchedQty > 0 ? (avgSellPrice - avgBuyPrice) * matchedQty : 0;
+      // Use sum of per-trade FIFO P&L (stored by backend at execution time) — not the
+      // average-based (avgSell - avgBuy) × matchedQty formula which gives wrong results
+      // when multiple buys/sells happen at different prices within the period.
+      const pnl = g.all_trades.reduce((sum, t) => sum + (t.pnl || 0), 0);
 
       // Brokerage: for ledger (settled) rows use the stored value captured at settlement time.
       // For live rows recalculate, but only with rules that were effective at the trade date
