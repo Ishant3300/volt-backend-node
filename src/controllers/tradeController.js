@@ -875,20 +875,15 @@ const placeTrade = async (req, res) => {
                     }
                 ]).session(session);
 
-                // Calculate P&L using FIFO
+                // Calculate P&L using Average Trade Price (ATP)
+                // Both long and short closures use avg entry price — consistent with
+                // what the orders page shows and what the client expects.
                 if (transaction_type === 'SELL' && netQtyFromPrev > 0) {
-                    // Closing a long position: match against FIFO buy queue
-                    let closingQty = Math.min(quantity, netQtyFromPrev);
-                    let remaining = closingQty;
-                    const tempQueue = fifoQueue.map(e => ({ ...e })); // clone
-                    while (remaining > 0 && tempQueue.length > 0) {
-                        const front = tempQueue[0];
-                        const matched = Math.min(front.qty, remaining);
-                        tradeRealisedPnl += (executedPrice - front.price) * matched;
-                        front.qty -= matched;
-                        remaining -= matched;
-                        if (front.qty === 0) tempQueue.shift();
-                    }
+                    // Closing a long position: use avg buy price from aggregate
+                    const agg = existingAgg.length > 0 ? existingAgg[0] : null;
+                    const avgBuyPrice = agg && agg.total_buy_qty > 0 ? agg.total_buy_value / agg.total_buy_qty : 0;
+                    const closingQty = Math.min(quantity, netQtyFromPrev);
+                    tradeRealisedPnl = (executedPrice - avgBuyPrice) * closingQty;
                 } else if (transaction_type === 'BUY' && netQtyFromPrev < 0) {
                     // Closing a short position: use avg sell price from aggregate
                     const agg = existingAgg.length > 0 ? existingAgg[0] : null;
