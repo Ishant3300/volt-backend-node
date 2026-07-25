@@ -143,13 +143,47 @@ const getAccountSummary = async (req, res) => {
       .map(a => parseInt(a.instrument_token));
     let ltpMap = new Map();
     if (openTokens.length > 0) {
+      // Strategy 1: Use metricsEngine in-memory LTP (most reliable — always has latest tick data)
       try {
-        const { getLatestQuotes } = require('../services/kiteService');
-        const quotes = await getLatestQuotes(openTokens, 100);
-        quotes.forEach(q => {
-          ltpMap.set(q.instrument_token.toString(), q.last_price);
-        });
+        const metricsEngine = require('../services/metricsEngine');
+        for (const token of openTokens) {
+          const tokenStr = token.toString();
+          const ltp = metricsEngine._ltpMap.get(tokenStr);
+          if (ltp && ltp > 0) ltpMap.set(tokenStr, ltp);
+        }
       } catch (_) {}
+
+      // Strategy 2: Fall back to KiteInstrument.last_price from DB (bhavcopy settlement prices)
+      if (ltpMap.size < openTokens.length) {
+        try {
+          const KiteInstrument = require('../models/KiteInstrument');
+          const missingTokens = openTokens.filter(t => !ltpMap.has(t.toString()));
+          if (missingTokens.length > 0) {
+            const dbInstruments = await KiteInstrument.find(
+              { instrument_token: { $in: missingTokens.map(String) }, last_price: { $gt: 0 } },
+              'instrument_token last_price'
+            ).lean();
+            for (const inst of dbInstruments) {
+              const tokenStr = inst.instrument_token.toString();
+              if (!ltpMap.has(tokenStr)) ltpMap.set(tokenStr, inst.last_price);
+            }
+          }
+        } catch (_) {}
+      }
+
+      // Strategy 3: Kite API quotes (may fail if session expired)
+      if (ltpMap.size < openTokens.length) {
+        try {
+          const { getLatestQuotes } = require('../services/kiteService');
+          const missingTokens = openTokens.filter(t => !ltpMap.has(t.toString()));
+          if (missingTokens.length > 0) {
+            const quotes = await getLatestQuotes(missingTokens, 100);
+            quotes.forEach(q => {
+              ltpMap.set(q.instrument_token.toString(), q.last_price);
+            });
+          }
+        } catch (_) {}
+      }
     }
 
     for (const a of Object.values(instMap)) {

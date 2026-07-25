@@ -94,6 +94,30 @@ const getTradeReport = async (req, res) => {
           _is_ledger: true,
         });
       }
+
+      // Include settlement closing entry if the snapshot has a closing position.
+      // This represents the unrealised P&L that was locked at settlement price.
+      // Without this, the General PDF only shows booked trades but misses the
+      // settlement-close P&L for open positions.
+      if (s.closing_qty > 0 && s.settlement_price > 0) {
+        const settleDate = new Date(s.settlement_date || s.period_to);
+        if (settleDate >= fromDate && settleDate <= toDate) {
+          // The closing trade: opposite side at settlement price
+          ledgerRows.push({
+            exchange: s.exchange,
+            tradingsymbol: s.tradingsymbol,
+            instrument_token: s.instrument_token,
+            transaction_type: s.closing_side || (s.carry_forward_side === 'BUY' ? 'SELL' : 'BUY'),
+            executed_quantity: s.closing_qty,
+            executed_price: s.settlement_price,
+            executed_at: settleDate,
+            pnl: s.settlement_pnl || 0,
+            trade_type: 'settlement_close',
+            _stored_brokerage: 0,
+            _is_ledger: true,
+          });
+        }
+      }
     }
 
     // Merge live (current) + ledger (historical) fills, chronologically.
