@@ -655,6 +655,22 @@ async function _executeSettlement() {
     }
   }
 
+  // Persist settlement prices to KiteInstrument.last_price in DB.
+  // This is critical: on server restart, metricsEngine seeds LTP from this field.
+  // Without it, CMP shows 0 or avgBuy (not settlement price) and ATP ≠ CMP.
+  const settlePriceBulkOps = Object.entries(closePriceMap)
+    .filter(([, price]) => price > 0)
+    .map(([tokenStr, price]) => ({
+      updateOne: {
+        filter: { instrument_token: tokenStr },
+        update: { $set: { last_price: price } },
+      },
+    }));
+  if (settlePriceBulkOps.length > 0) {
+    await KiteInstrument.bulkWrite(settlePriceBulkOps, { ordered: false });
+    console.log(`   📊 Persisted ${settlePriceBulkOps.length} settlement prices to KiteInstrument.last_price.`);
+  }
+
   // Full rebuild of ALL user caches — not just affected users.
   // This ensures users with fully closed positions also get their metrics reset to 0.
   // After settlement, only carry_forward trades exist → brokerage = 0, fifoPnl = 0.
