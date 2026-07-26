@@ -59,6 +59,8 @@ class MetricsEngine {
 
     // Seed LTP/bid/ask maps from DB for tokens with open positions
     // This ensures CMP is correct on restart (especially after settlement when market is closed)
+    // ALWAYS override with DB value — it's the authoritative settlement price.
+    // Live ticks will naturally override once market opens (0.5% threshold mechanism).
     const positionTokens = Array.from(this._tokenToUsers.keys());
     if (positionTokens.length > 0) {
       const KiteInstrument = require('../models/KiteInstrument');
@@ -69,15 +71,19 @@ class MetricsEngine {
       let seeded = 0;
       for (const inst of instruments) {
         const token = inst.instrument_token.toString();
-        if (!this._ltpMap.has(token)) {
-          this._ltpMap.set(token, inst.last_price);
-          this._bidMap.set(token, inst.last_price);
-          this._askMap.set(token, inst.last_price);
-          seeded++;
-        }
+        // Always set from DB — settlement prices are authoritative until market opens
+        this._ltpMap.set(token, inst.last_price);
+        this._bidMap.set(token, inst.last_price);
+        this._askMap.set(token, inst.last_price);
+        seeded++;
       }
+
+      // Lock these tokens so stale Kite "snapshot" ticks (sent on subscribe even
+      // when market is closed) don't override the settlement price.
+      // The lock auto-clears when a genuine tick moves >0.5% from the seeded value.
       if (seeded > 0) {
-        console.log(`📊 [MetricsEngine] Seeded ${seeded} position tokens from DB (last_price).`);
+        this._settledTokens = new Set(instruments.map(i => i.instrument_token.toString()));
+        console.log(`📊 [MetricsEngine] Seeded ${seeded} position tokens from DB and locked until market opens.`);
       }
     }
 
