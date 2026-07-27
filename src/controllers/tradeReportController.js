@@ -28,6 +28,7 @@ const getTradeReport = async (req, res) => {
 
     // Determine target user
     let targetUserId;
+    let targetIsMaster = false;
     if (role === 'user') {
       targetUserId = new mongoose.Types.ObjectId(callerId);
     } else if (user_id) {
@@ -38,17 +39,45 @@ const getTradeReport = async (req, res) => {
 
     // User scope (applied to both the live Trade collection and the ledger)
     const userScope = {};
-    if (targetUserId) userScope.user_id = targetUserId;
-    else if (role === 'master') {
+    if (targetUserId) {
+      // Check if the target is a User or a Master
+      const targetUser = await User.findById(targetUserId).select('_id username name').lean();
+      if (targetUser) {
+        // It's a user — scope to this single user
+        userScope.user_id = targetUserId;
+      } else {
+        // It's a master — scope to all DIRECT child users of this master
+        // (excludes users of sub-masters)
+        const Master = require('../models/Master');
+        const targetMaster = await Master.findById(targetUserId).select('_id username name').lean();
+        if (targetMaster) {
+          targetIsMaster = true;
+          const directChildUsers = await User.find({ master_id: targetUserId, deleted_at: null }).distinct('_id');
+          if (directChildUsers.length > 0) {
+            userScope.user_id = { $in: directChildUsers };
+          } else {
+            userScope.user_id = targetUserId; // fallback (will return empty)
+          }
+        } else {
+          userScope.user_id = targetUserId;
+        }
+      }
+    } else if (role === 'master') {
       const childIds = await User.find({ master_id: callerId, deleted_at: null }).distinct('_id');
       userScope.user_id = { $in: childIds };
     }
 
-    // Fetch user info
+    // Fetch user/master name for the PDF header
     let userName = 'Unknown';
     if (targetUserId) {
-      const u = await User.findById(targetUserId).select('username name').lean();
-      if (u) userName = u.name || u.username;
+      if (targetIsMaster) {
+        const Master = require('../models/Master');
+        const m = await Master.findById(targetUserId).select('username name').lean();
+        if (m) userName = m.name || m.username;
+      } else {
+        const u = await User.findById(targetUserId).select('username name').lean();
+        if (u) userName = u.name || u.username;
+      }
     }
 
     // ── Trade-table sources (response shape unchanged) ──
@@ -352,8 +381,10 @@ const getTradeReport = async (req, res) => {
     // This ensures positions that existed during the report window always show in Carry Forward,
     // even if they were subsequently settled by a later settlement run.
     if (targetUserId) {
+      // Use the same user scope as the main query (handles master → direct child users)
+      const cfUserFilter = userScope.user_id ? { user_id: userScope.user_id } : { user_id: targetUserId };
       const cfTrades = await Trade.find({
-        user_id: targetUserId,
+        ...cfUserFilter,
         status: 'completed',
         trade_type: 'carry_forward',
         remarks: 'Settlement: position carried forward at close price',

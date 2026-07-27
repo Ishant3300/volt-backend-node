@@ -50,6 +50,24 @@ const getAccountSummary = async (req, res) => {
     // P&L / Brokerage mode
     const { start, end, weekLabel } = _getDateRange(week, from, to);
 
+    // Determine if the requested period is fully settled (in the past).
+    // If end is before this week's start, trades were soft-deleted by settlement
+    // and the data lives in SettlementHistory (immutable ledger).
+    const now = new Date();
+    const dayOfWeek = now.getDay();
+    const diffToMonday = dayOfWeek === 0 ? 6 : dayOfWeek - 1;
+    const thisWeekStart = new Date(now);
+    thisWeekStart.setDate(now.getDate() - diffToMonday);
+    thisWeekStart.setHours(0, 0, 0, 0);
+
+    const isPastPeriod = end && end <= thisWeekStart;
+
+    if (isPastPeriod) {
+      // ── SETTLED PERIOD: Use SettlementHistory ledger ──
+      return await _handleSettledPeriod(res, targetUserIds, start, end, weekLabel, mode, search, parseInt(limit));
+    }
+
+    // ── CURRENT PERIOD: Use active Trade collection + live LTP ──
     const matchStage = {
       user_id: { $in: targetUserIds },
       status: 'completed',
@@ -247,6 +265,102 @@ const getAccountSummary = async (req, res) => {
     res.status(500).json({ success: false, message: error.message });
   }
 };
+
+// ── Settled period handler (uses SettlementHistory ledger) ──
+async function _handleSettledPeriod(res, targetUserIds, start, end, weekLabel, mode, search, limit) {
+  const SettlementHistory = require('../models/SettlementHistory');
+
+  // Find all settlement snapshots whose period overlaps the requested range
+  const snapshots = await SettlementHistory.find({
+    user_id: { $in: targetUserIds },
+    period_from: { $lte: end },
+    period_to: { $gte: start },
+  }).lean();
+
+  // Group by instrument token — use pre-computed fields from the ledger
+  const instMap = {};
+  let totalFills = 0;
+
+  for (const s of snapshots) {
+    const key = s.instrument_token;
+    if (!instMap[key]) {
+      instMap[key] = {
+        tradingsymbol: s.tradingsymbol || s.display_name || '',
+        exchange: s.exchange || '',
+        buyQty: 0, sellQty: 0, buyVal: 0, sellVal: 0,
+        totalPnl: 0, totalBrokerage: 0,
+        fillCount: 0,
+      };
+    }
+    const a = instMap[key];
+    a.buyQty += s.total_buy_qty || 0;
+    a.sellQty += s.total_sell_qty || 0;
+    a.buyVal += s.total_buy_value || 0;
+    a.sellVal += s.total_sell_value || 0;
+    // total_pnl includes both realised + settlement P&L (the full period P&L)
+    a.totalPnl += s.total_pnl || 0;
+    a.totalBrokerage += s.brokerage || 0;
+    a.fillCount += (s.fills || []).filter(f =>
+      f.trade_type !== 'carry_forward' && f.trade_type !== 'margin_square_off'
+    ).length;
+    totalFills += a.fillCount;
+  }
+
+  // Build response instruments array
+  const instruments = [];
+  let totalPnl = 0, totalBrokerage = 0;
+
+  for (const [key, a] of Object.entries(instMap)) {
+    const avgBuy = a.buyQty > 0 ? a.buyVal / a.buyQty : 0;
+    const avgSell = a.sellQty > 0 ? a.sellVal / a.sellQty : 0;
+    const netQty = a.buyQty - a.sellQty;
+
+    // For settled periods, all positions are closed at settlement price.
+    // total_pnl already includes the settlement P&L (unrealized → realized at close).
+    // No live LTP needed.
+    const pnl = a.totalPnl;
+    const brokerage = a.totalBrokerage;
+
+    totalPnl += pnl;
+    totalBrokerage += brokerage;
+
+    instruments.push({
+      tradingsymbol: a.tradingsymbol,
+      exchange: a.exchange,
+      buy_qty: a.buyQty,
+      sell_qty: a.sellQty,
+      buy_amount: r2(a.buyVal),
+      sell_amount: r2(a.sellVal),
+      avg_buy: r2(avgBuy),
+      avg_sell: r2(avgSell),
+      net_qty: netQty,
+      pnl: r2(pnl),
+      brokerage: r2(brokerage),
+    });
+  }
+
+  // Filter by search
+  let filtered = instruments;
+  if (search) {
+    const q = search.toLowerCase();
+    filtered = instruments.filter(i =>
+      i.tradingsymbol.toLowerCase().includes(q) || i.exchange.toLowerCase().includes(q)
+    );
+  }
+
+  // Sort by absolute P&L descending
+  filtered.sort((a, b) => Math.abs(b.pnl) - Math.abs(a.pnl));
+
+  res.json({
+    success: true,
+    data: {
+      week: weekLabel,
+      mode,
+      instruments: filtered.slice(0, limit),
+      totals: { pnl: r2(totalPnl), brokerage: r2(totalBrokerage), trades: totalFills },
+    }
+  });
+}
 
 // ── Credit mode handler ──
 async function _handleCreditMode(req, res, targetUserIds, week, from, to, limit) {
