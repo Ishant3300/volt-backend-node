@@ -16,6 +16,15 @@ const tradeSchema = new mongoose.Schema({
     ref: 'Admin',
     default: null
   },
+  settlement_run_id: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'SettlementRun',
+    default: null
+  },
+  settlement_period_key: {
+    type: String,
+    default: null
+  },
   instrument_token: {
     type: String,
     required: true
@@ -131,5 +140,6 @@ tradeSchema.index({ admin_id: 1, created_at: -1 });
 tradeSchema.index({ status: 1 });
 tradeSchema.index({ instrument_token: 1 });
 tradeSchema.index({ executed_at: -1 });
+tradeSchema.index({ settlement_period_key: 1, status: 1, deleted_at: 1 });
 
 module.exports = mongoose.model('Trade', tradeSchema);

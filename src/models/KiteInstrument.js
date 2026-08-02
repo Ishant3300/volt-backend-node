@@ -33,6 +33,12 @@ const kiteInstrumentSchema = new mongoose.Schema({
     type: Number,
     default: 0
   },
+  // Official close used by weekly settlement. Kept separate from live last_price
+  // because Kite's daily instrument CSV normally carries last_price=0.
+  settlement_price: { type: Number, default: 0 },
+  settlement_price_date: { type: Date, default: null },
+  settlement_price_source: { type: String, default: null },
+  settlement_price_updated_at: { type: Date, default: null },
   // OHLC from last trading day (populated by weekend carry forward / settlement cron)
   ohlc_open: { type: Number, default: 0 },
   ohlc_high: { type: Number, default: 0 },
@@ -115,6 +121,7 @@ kiteInstrumentSchema.index({ segment: 1 });
 kiteInstrumentSchema.index({ instrument_type: 1 });
 kiteInstrumentSchema.index({ expiry: 1 });
 kiteInstrumentSchema.index({ is_active: 1 });
+kiteInstrumentSchema.index({ settlement_price_date: -1 });
 
 // Compound indexes for smart search cache loading query
 kiteInstrumentSchema.index({ instrument_type: 1, segment: 1, exchange: 1 });

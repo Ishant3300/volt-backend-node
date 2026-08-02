@@ -6,6 +6,7 @@
   "scripts": {
     "start": "node src/index.js",
     "dev": "bash scripts/dev.sh",
+    "test": "jest --runInBand",
     "fetch-instruments": "node scripts/fetchInstruments.js"
   },
   "dependencies": {

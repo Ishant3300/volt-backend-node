@@ -66,8 +66,8 @@ const globalLimiter = rateLimit({
 });
 app.use(skipForWs(globalLimiter));
 
-// Connect to database (awaited in server.listen callback)
-// connectDatabase() is called inside server.listen to ensure proper ordering
+// Database connectivity and index synchronization are awaited in startServer
+// before the HTTP listener is opened.
 
 // Initialize Firebase Admin SDK
 firebaseService.init();
@@ -159,8 +159,9 @@ app.use((err, req, res, _next) => {
 });
 
 // Initialize WebSocket live price service BEFORE server.listen
-// so the upgrade handler is registered before any connections arrive
-livePriceService.init(server);
+// so the upgrade handler is registered before any connections arrive. Defer
+// outbound Kite connectivity until the startup readiness barrier is complete.
+livePriceService.init(server, { connectKite: false });
 
 // Handle WebSocket upgrade manually to bypass Express middleware
 server.on('upgrade', (request, socket, head) => {
@@ -173,13 +174,11 @@ server.on('upgrade', (request, socket, head) => {
   }
 });
 
-// Start server
+// Open the HTTP listener only after all startup prerequisites are ready.
 const PORT = process.env.PORT || 5000;
-server.listen(PORT, async () => {
-  console.log(`Server is running on port ${PORT}`);
-
-  // Connect to database first
+const startServer = async () => {
   await connectDatabase();
+  await livePriceService._preloadSettlementPrices();
 
   // Pre-warm instrument search cache (await so it's ready before first search)
   try {
@@ -190,7 +189,7 @@ server.listen(PORT, async () => {
     console.error('⚠️  Failed to warm instrument cache:', err.message);
   }
 
-  // Initialize Redis connection
+  // Initialize Redis and wait for readiness before selecting the order engine.
   try {
     redisService.init();
     // Wait for Redis to be ready (up to 5 seconds)
@@ -200,12 +199,10 @@ server.listen(PORT, async () => {
     }
 
     if (redisService.isAvailable()) {
-      // Bootstrap: sync pending orders from MongoDB into Redis order book
+      // Bootstrap Redis state, but do not start BullMQ consumers until missed
+      // settlement recovery has materialized/fenced the latest Friday.
       await orderBookService.syncFromDatabase();
-
-      // Initialize BullMQ price queue (producer + worker)
-      priceQueueService.init();
-      console.log('🚀 Redis Order Book + BullMQ Price Queue active');
+      console.log('🚀 Redis Order Book reconciled; BullMQ worker deferred until settlement recovery');
     } else {
       console.log('⚠️  Redis not available – using DB-polling fallback for limit orders');
     }
@@ -213,32 +210,45 @@ server.listen(PORT, async () => {
     console.error('⚠️  Redis init error:', err.message, '– falling back to DB polling');
   }
 
-  console.log('📡 Live price WebSocket ready at ws://localhost:' + PORT + '/ws/live-prices');
-
-  // Initialize synthetic instruments (e.g. BHUJ NIFTY)
+  // These services are readiness-critical; failures must abort startup.
   const syntheticInstrumentService = require('./services/syntheticInstrumentService');
   await syntheticInstrumentService.init(livePriceService);
 
-  // Initialize real-time metrics engine
   const metricsEngine = require('./services/metricsEngine');
   await metricsEngine.init(livePriceService);
-  metricsEngine.scheduleMidnightAudit();
+  await metricsEngine.scheduleMidnightAudit();
 
-  // Ensure all position tokens are subscribed on Kite for margin square-off monitoring
-  livePriceService._updateKiteSubscription();
-
-  // Initialize margin square off monitoring service
-  const marginSquareOffService = require('./services/marginSquareOffService');
-  marginSquareOffService.init(livePriceService);
-
-  // Initialize background jobs
-  cronService.init();
-
-  // Perform Kite auto-login on server start
-  console.log('\n🔐 Checking Kite authentication...');
-
+  // Reconcile an interrupted run (or a missed weekend run after a restart)
+  // before accepting HTTP traffic. If official prices are not ready the run is
+  // durable `failed` and the distributed trade-write guard remains closed until
+  // a scheduled recovery succeeds; reads and administrative diagnostics can
+  // still come online.
   try {
-    // Check if already authenticated
+    const settlementService = require('./services/settlementService');
+    const recovery = await settlementService.recoverIncompleteSettlements({ ensureCurrentPeriod: true });
+    if (recovery.recovered || recovery.ensuredCurrentPeriod) {
+      console.log(`[Settlement] Startup reconciliation: ${recovery.message || recovery.periodKey || 'completed'}`);
+    }
+  } catch (error) {
+    console.error(`[Settlement] Startup reconciliation could not establish a durable fence: ${error.message}`);
+    throw error;
+  }
+
+  // Only now may retained BullMQ jobs mutate trades. A failed/blocked durable
+  // run remains visible to beginTradeWrite() and causes jobs to retry safely.
+  if (redisService.isAvailable()) {
+    await priceQueueService.init();
+    console.log('🚀 Redis Order Book + BullMQ Price Queue active');
+  }
+
+  // Initialize margin square-off monitoring and background jobs.
+  const marginSquareOffService = require('./services/marginSquareOffService');
+  await marginSquareOffService.init(livePriceService);
+  await cronService.init();
+
+  // Establish Kite authentication prerequisites before outbound live-price setup.
+  console.log('\n🔐 Checking Kite authentication...');
+  try {
     const status = await kiteAuthService.checkTokenStatus();
 
     if (status.valid) {
@@ -248,7 +258,7 @@ server.listen(PORT, async () => {
       console.log('🤖 Attempting auto-login...\n');
 
       const loginResult = await kiteAuthService.performAutomatedLogin();
-      console.log({ loginResult })
+      console.log({ loginResult });
       if (loginResult.success) {
         console.log('✅ Kite auto-login successful!');
       } else {
@@ -261,9 +271,17 @@ server.listen(PORT, async () => {
     console.log('💡 You can manually login at: http://localhost:' + PORT + '/api/kite/login');
   }
 
-  console.log('\n🚀 Server ready!\n');
+  await livePriceService._connectToKite();
+  await livePriceService._updateKiteSubscription();
 
-  // Refresh settlement prices on startup via OHLC API
-  // Settlement prices are now fetched via bhavcopy crons (not OHLC)
-  // No startup refresh needed — bhavcopy runs at 5 PM (NSE) and 12:30 AM (MCX)
+  server.listen(PORT, () => {
+    console.log(`Server is running on port ${PORT}`);
+    console.log('📡 Live price WebSocket ready at ws://localhost:' + PORT + '/ws/live-prices');
+    console.log('\n🚀 Server ready!\n');
+  });
+};
+
+startServer().catch(error => {
+  console.error(`Server startup failed: ${error.message}`);
+  process.exit(1);
 });

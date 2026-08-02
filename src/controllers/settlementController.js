@@ -8,8 +8,8 @@ const getSettlementReport = async (req, res) => {
 /** POST /admin/settlement/start — Trigger settlement */
 const startSettlement = async (req, res) => {
   try {
-    const result = await settlementService.runSettlement();
-    res.status(result.success ? 200 : 409).json({ success: result.success, message: result.message, data: settlementService.getState() });
+    const result = await settlementService.runSettlement({ trigger: 'manual' });
+    res.status(result.success ? 200 : 409).json({ success: result.success, message: result.message, data: { ...settlementService.getState(), run_id: result.runId, period_key: result.periodKey, already_completed: result.alreadyCompleted || false } });
   } catch (error) {
     res.status(500).json({ success: false, message: error.message, data: null });
   }
@@ -18,7 +18,7 @@ const startSettlement = async (req, res) => {
 /** GET /admin/settlement/status — Get current settlement progress */
 const getSettlementStatus = async (req, res) => {
   try {
-    const state = settlementService.getState();
+    const state = await settlementService.getStatus();
     const pct = state.total > 0 ? Math.round((state.processed / state.total) * 100) : 0;
     res.status(200).json({ success: true, message: 'Settlement status', data: { ...state, percentage: pct } });
   } catch (error) {

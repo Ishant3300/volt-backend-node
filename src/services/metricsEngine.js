@@ -13,7 +13,10 @@ const User = require('../models/User');
 const Master = require('../models/Master');
 const BrokerageSettings = require('../models/BrokerageSettings');
 const KiteInstrument = require('../models/KiteInstrument');
+const SettlementHistory = require('../models/SettlementHistory');
 const TradeMargin = require('../models/TradeMargin');
+const SettlementRun = require('../models/SettlementRun');
+const { dateRange, isWeekendInIndia } = require('../utils/settlementDates');
 
 class MetricsEngine {
   constructor() {
@@ -44,50 +47,79 @@ class MetricsEngine {
     this._pendingTokens = new Set();
     this._tickTimer = null;
 
+    // Durable settlement generation applied by this worker. Every PM2 worker
+    // independently reconciles against SettlementRun before serving fresh risk
+    // metrics, so process-local caches cannot survive another worker's commit.
+    this._appliedSettlementRunId = null;
+    this._settlementSyncPromise = null;
+    this._lastSettlementCheckAt = 0;
+
     this._initialized = false;
   }
 
   /**
    * Initialize the engine. Call after livePriceService is ready.
    */
-  async init(livePriceService) {
+  async init(livePriceService, options = {}) {
     this.livePriceService = livePriceService;
     console.log('📊 [MetricsEngine] Initializing...');
 
     await this._loadRules();
     await this._rebuildAllUserCaches();
 
-    // Seed LTP/bid/ask maps from DB for tokens with open positions
-    // This ensures CMP is correct on restart (especially after settlement when market is closed)
-    // ALWAYS override with DB value — it's the authoritative settlement price.
-    // Live ticks will naturally override once market opens (0.5% threshold mechanism).
+    // Seed position prices from the durable official settlement field on weekends.
+    // Daily instrument CSV imports can contain last_price=0, so OHLC is retained as
+    // a backward-compatible fallback for settlements created before this field existed.
     const positionTokens = Array.from(this._tokenToUsers.keys());
     if (positionTokens.length > 0) {
-      const KiteInstrument = require('../models/KiteInstrument');
+      const weekend = isWeekendInIndia(options.now || new Date());
+      const latestRun = weekend
+        ? await SettlementRun.findOne({ status: { $in: ['committed', 'finalizing', 'completed'] } }).sort({ trading_date: -1 }).select('trading_date').lean()
+        : null;
+      const activeRange = latestRun ? dateRange(latestRun.trading_date) : null;
       const instruments = await KiteInstrument.find(
-        { instrument_token: { $in: positionTokens }, last_price: { $gt: 0 } },
-        'instrument_token last_price'
+        {
+          instrument_token: { $in: positionTokens },
+          $or: [
+            { settlement_price: { $gt: 0 } },
+            { last_price: { $gt: 0 } },
+            { ohlc_close: { $gt: 0 } },
+          ],
+        },
+        'instrument_token settlement_price settlement_price_date last_price ohlc_close'
       ).lean();
-      let seeded = 0;
+      const seededTokens = [];
       for (const inst of instruments) {
         const token = inst.instrument_token.toString();
-        // Always set from DB — settlement prices are authoritative until market opens
-        this._ltpMap.set(token, inst.last_price);
-        this._bidMap.set(token, inst.last_price);
-        this._askMap.set(token, inst.last_price);
-        seeded++;
+        const settlementDate = inst.settlement_price_date ? new Date(inst.settlement_price_date) : null;
+        const settlementIsCurrent = !activeRange || (settlementDate && settlementDate >= activeRange.start && settlementDate < activeRange.end);
+        const price = weekend
+          ? ((settlementIsCurrent ? inst.settlement_price : 0) || inst.ohlc_close || inst.last_price)
+          : inst.last_price;
+        if (!price || price <= 0) continue;
+        this._ltpMap.set(token, price);
+        this._bidMap.set(token, price);
+        this._askMap.set(token, price);
+        seededTokens.push(token);
       }
 
-      // Lock these tokens so stale Kite "snapshot" ticks (sent on subscribe even
-      // when market is closed) don't override the settlement price.
-      // The lock auto-clears when a genuine tick moves >0.5% from the seeded value.
-      if (seeded > 0) {
-        this._settledTokens = new Set(instruments.map(i => i.instrument_token.toString()));
-        console.log(`📊 [MetricsEngine] Seeded ${seeded} position tokens from DB and locked until market opens.`);
+      // Weekend ticks can be stale snapshots. Lock official prices until the next
+      // genuine market move; weekdays accept live ticks immediately.
+      if (weekend && seededTokens.length > 0) {
+        this._settledTokens = new Set(seededTokens);
+        console.log(`📊 [MetricsEngine] Seeded and locked ${seededTokens.length} weekend settlement prices.`);
       }
     }
 
+    // _rebuildAllUserCaches computed once before DB price seeding. Recompute the
+    // final metrics now so REST/WebSocket consumers immediately see CMP=ATP.
+    for (const userId of this._userCache.keys()) {
+      const metrics = this._computeUserMetrics(userId);
+      if (metrics) this._metricsCache.set(userId, metrics);
+    }
+
     this._initialized = true;
+    await this.synchronizeSettlementGeneration({ force: true, broadcast: false, now: options.now });
     console.log(`📊 [MetricsEngine] Ready. Tracking ${this._userCache.size} users, ${this._tokenToUsers.size} instruments`);
   }
 
@@ -117,40 +149,42 @@ class MetricsEngine {
   /**
    * Rebuild trade aggregation caches for ALL active users with trades.
    */
-  async _rebuildAllUserCaches() {
+  async _rebuildAllUserCaches(options = {}) {
     try {
-      const userIds = await Trade.distinct('user_id', { status: 'completed', deleted_at: null });
+      const activeUserIds = await Trade.distinct('user_id', { status: 'completed', deleted_at: null });
+      const requestedUserIds = options.includeUserIds || [];
+      const userIds = [...new Set([...activeUserIds, ...requestedUserIds].map(id => id.toString()))];
       const users = await User.find({ _id: { $in: userIds }, deleted_at: null }).select('_id credits settled_pnl master_id').lean();
 
       // Build master hierarchy maps for broadcast aggregation
       const allMasters = await Master.find({ deleted_at: null }).select('_id master_id').lean();
-      this._masterParentMap = {};   // masterId → parentMasterId
-      this._masterChildrenMap = {}; // masterId → [childMasterId, ...]
-      for (const m of allMasters) {
-        const mid = m._id.toString();
-        const parentId = m.master_id?.toString() || null;
-        this._masterParentMap[mid] = parentId;
+      this._masterParentMap = {};
+      this._masterChildrenMap = {};
+      for (const master of allMasters) {
+        const masterId = master._id.toString();
+        const parentId = master.master_id?.toString() || null;
+        this._masterParentMap[masterId] = parentId;
         if (parentId) {
           if (!this._masterChildrenMap[parentId]) this._masterChildrenMap[parentId] = [];
-          this._masterChildrenMap[parentId].push(mid);
+          this._masterChildrenMap[parentId].push(masterId);
         }
       }
 
       this._userCache.clear();
       this._tokenToUsers.clear();
+      this._metricsCache.clear();
 
       for (const user of users) {
         await this._rebuildUserCache(user._id.toString(), user.credits || 0, user.settled_pnl || 0, user.master_id?.toString());
       }
 
-      // Compute initial metrics for all cached users (so getCachedMetrics works
-      // even before the first tick arrives for their instruments)
       for (const userId of this._userCache.keys()) {
         const metrics = this._computeUserMetrics(userId);
         if (metrics) this._metricsCache.set(userId, metrics);
       }
-    } catch (e) {
-      console.error('📊 [MetricsEngine] Error rebuilding user caches:', e.message);
+    } catch (error) {
+      console.error('📊 [MetricsEngine] Error rebuilding user caches:', error.message);
+      throw error;
     }
   }
 
@@ -164,7 +198,17 @@ class MetricsEngine {
       }).sort({ createdAt: 1 }).lean();
 
       if (trades.length === 0) {
-        this._userCache.delete(userId);
+        // Keep an explicit flat-user cache when settlement removed the final
+        // position. Otherwise a stale pre-settlement metrics entry can survive
+        // and REST/WebSocket consumers continue to show phantom P&L.
+        this._userCache.set(userId, {
+          credit,
+          settledPnl,
+          masterId,
+          fifoPnl: 0,
+          brokerage: 0,
+          openPositions: [],
+        });
         return;
       }
 
@@ -292,17 +336,12 @@ class MetricsEngine {
 
     const token = instrumentToken.toString();
 
-    // After settlement, ignore ticks for settled tokens until market opens
-    // (Kite sends cached "snapshot" ticks on subscribe even when market is closed)
+    // Weekend settlement prices are locked against cached subscription ticks.
+    // The first weekday/session tick releases the lock regardless of price
+    // movement; a genuine open can trade at exactly the settlement price.
     if (this._settledTokens && this._settledTokens.has(token)) {
-      // Check if this tick represents genuine market activity (price moved >0.5% from settled value)
-      const settledLtp = this._ltpMap.get(token);
-      if (settledLtp && Math.abs(lastPrice - settledLtp) / settledLtp > 0.005) {
-        // Market is open — clear lock for ALL tokens and process normally
-        this.clearSettledTokens();
-      } else {
-        return;
-      }
+      if (!isWeekendInIndia()) this.clearSettledTokens();
+      else return;
     }
 
     this._ltpMap.set(token, lastPrice);
@@ -664,6 +703,139 @@ class MetricsEngine {
   }
 
   /**
+   * Reconcile this process with the latest durable settlement generation.
+   * SettlementRun is the cross-worker event log; the immutable ledger supplies
+   * position prices, so mutable instrument rows can never rewrite a generation.
+   */
+  async synchronizeSettlementGeneration(options = {}) {
+    const maxAgeMs = options.maxAgeMs ?? 10_000;
+    const now = Date.now();
+    const applyPrices = options.applyPrices ?? isWeekendInIndia(options.now || new Date());
+    if (!options.force && !options.runId && maxAgeMs > 0 && (now - this._lastSettlementCheckAt) < maxAgeMs) {
+      return { changed: false, runId: this._appliedSettlementRunId, pricesApplied: applyPrices };
+    }
+    if (this._settlementSyncPromise) return this._settlementSyncPromise;
+
+    this._settlementSyncPromise = (async () => {
+      const runQuery = options.runId
+        ? { _id: options.runId, status: { $in: ['committed', 'finalizing', 'completed'] } }
+        : { status: { $in: ['committed', 'finalizing', 'completed'] } };
+      const query = SettlementRun.findOne(runQuery).select('_id period_key trading_date price_dates committed_at status');
+      if (!options.runId) query.sort({ committed_at: -1, trading_date: -1 });
+      const run = await query.lean();
+      this._lastSettlementCheckAt = Date.now();
+      if (!run) return { changed: false, runId: this._appliedSettlementRunId, pricesApplied: false };
+
+      // Crossing into a weekday/session must release weekend locks even if this
+      // worker already consumed the same durable generation.
+      if (!applyPrices) {
+        this.clearSettledTokens();
+        this.livePriceService?._settlementPrices?.clear();
+      }
+
+      const runId = run._id.toString();
+      if (!options.force && runId === this._appliedSettlementRunId) {
+        return { changed: false, runId, pricesApplied: false };
+      }
+
+      const snapshots = await SettlementHistory.find({ settlement_run_id: run._id })
+        .select('user_id instrument_token settlement_price carry_forward_qty')
+        .lean();
+      const affectedUserIds = [...new Set(snapshots.map(snapshot => snapshot.user_id.toString()))];
+      const priceMap = new Map();
+      for (const snapshot of snapshots) {
+        if (Number(snapshot.carry_forward_qty || 0) <= 0) continue;
+        const token = snapshot.instrument_token.toString();
+        const price = Number(snapshot.settlement_price || 0);
+        if (price <= 0) throw new Error(`Settlement ${run.period_key} has no committed price for ${token}`);
+        const existing = priceMap.get(token);
+        if (existing && Math.abs(existing - price) >= 0.005) {
+          throw new Error(`Settlement ${run.period_key} has conflicting committed prices for ${token}`);
+        }
+        priceMap.set(token, price);
+      }
+
+      const allPriceMap = new Map(priceMap);
+      if (applyPrices) {
+        const nseRange = dateRange(run.price_dates?.nse || run.trading_date);
+        const mcxRange = dateRange(run.price_dates?.mcx || run.trading_date);
+        const instruments = await KiteInstrument.find({
+          is_active: true,
+          deleted_at: null,
+          settlement_price: { $gt: 0 },
+          $or: [
+            { exchange: 'MCX', settlement_price_date: { $gte: mcxRange.start, $lt: mcxRange.end } },
+            { exchange: { $ne: 'MCX' }, settlement_price_date: { $gte: nseRange.start, $lt: nseRange.end } },
+          ],
+        }).select('instrument_token settlement_price').lean();
+        for (const instrument of instruments) {
+          const token = instrument.instrument_token.toString();
+          if (!allPriceMap.has(token)) allPriceMap.set(token, Number(instrument.settlement_price));
+        }
+
+        for (const [token, price] of allPriceMap) {
+          this._ltpMap.set(token, price);
+          this._bidMap.set(token, price);
+          this._askMap.set(token, price);
+        }
+        if (allPriceMap.size > 0) this.setSettledTokens([...allPriceMap.keys()]);
+      }
+
+      // Rebuild position generations on every worker regardless of whether the
+      // current market session permits settlement-price locking.
+      await this._rebuildAllUserCaches({ includeUserIds: affectedUserIds });
+
+      if (applyPrices && this.livePriceService) {
+        if (!this.livePriceService._settlementPrices) this.livePriceService._settlementPrices = new Map();
+        const ticks = [];
+        for (const [token, price] of allPriceMap) {
+          this.livePriceService._settlementPrices.set(token, price);
+          this.livePriceService.latestPrices.set(token, price);
+          this.livePriceService.latestPrices.set(Number(token), price);
+          ticks.push({
+            instrument_token: token,
+            last_price: price,
+            bid_price: price,
+            ask_price: price,
+            close: price,
+            is_settlement: true,
+            change: 0,
+            change_percent: 0,
+          });
+        }
+        if (options.broadcast !== false) {
+          for (let index = 0; index < ticks.length; index += 100) {
+            this.livePriceService._broadcastToClients({ type: 'ticks', data: ticks.slice(index, index + 100) });
+          }
+        }
+      }
+
+      this._appliedSettlementRunId = runId;
+      for (const userId of affectedUserIds) {
+        const metrics = this._metricsCache.get(userId);
+        if (metrics && options.broadcast !== false) this._broadcastUserMetrics(userId, metrics);
+      }
+      if (options.broadcast !== false) this._broadcastMasterMetrics();
+
+      console.log(`📊 [MetricsEngine] Applied settlement generation ${run.period_key} (${runId}) in worker ${process.pid}; prices ${applyPrices ? 'locked' : 'preserved'}.`);
+      return {
+        changed: true,
+        runId,
+        periodKey: run.period_key,
+        priceMap: Object.fromEntries(priceMap),
+        affectedUserIds,
+        pricesApplied: applyPrices,
+      };
+    })();
+
+    try {
+      return await this._settlementSyncPromise;
+    } finally {
+      this._settlementSyncPromise = null;
+    }
+  }
+
+  /**
    * Get cached metrics for a user (for REST API fallback).
    */
   getCachedMetrics(userId) {
@@ -675,7 +847,11 @@ class MetricsEngine {
    * This is the method tradeController should use to guarantee consistency with the orders page.
    */
   async getFreshMetrics(userId) {
-    // Try cache first
+    // A risk decision must never use a process-local cache older than another
+    // worker's committed settlement. This indexed generation check occurs before
+    // returning a cached value; periodic polling keeps non-trade UI traffic warm.
+    await this.synchronizeSettlementGeneration({ maxAgeMs: 0 });
+
     const cached = this._metricsCache.get(userId);
     if (cached) return cached;
 

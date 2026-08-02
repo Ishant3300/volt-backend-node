@@ -12,6 +12,7 @@ const Transaction = require('../models/Transaction');
 const orderBookService = require('../services/orderBookService');
 const { calculateMargin } = require('../services/marginService');
 const firebaseService = require('../services/firebaseService');
+const { beginTradeWrite, withTradeWriteLease } = require('../services/tradeWriteFenceService');
 
 const _getLivePricesFromKite = async (instrumentTokens) => {
     if (!instrumentTokens || instrumentTokens.length === 0) return new Map();
@@ -75,6 +76,7 @@ const _computeUserFloatingPnl = async (userId, session) => {
  */
 const placeTrade = async (req, res) => {
     const session = await mongoose.startSession();
+    let tradeWriteLease = null;
     try {
         // #8 FIX: When admin places trade for a user, use req.body.user_id as the target, not the admin's own ID.
         const callerId = req.user?.id || req.master?.id || req.admin?.id;
@@ -121,8 +123,10 @@ const placeTrade = async (req, res) => {
         }
 
         let resultTrade;
+        tradeWriteLease = await beginTradeWrite('place_trade');
 
         await session.withTransaction(async () => {
+            await tradeWriteLease.assertActive({ session });
             const user = await User.findById(targetUserId).populate('master_id').session(session);
             if (!user) {
                 throw new Error('User not found');
@@ -1075,10 +1079,11 @@ const placeTrade = async (req, res) => {
                 await tx.save({ session });
             }
 
+            await tradeWriteLease.assertActive({ session });
             resultTrade = newTrade;
         });
 
-        session.endSession();
+        await session.endSession();
 
         // Notify Flutter client so the orders tab refreshes trades
         if (resultTrade.status === 'completed') {
@@ -1096,29 +1101,44 @@ const placeTrade = async (req, res) => {
             });
         }
 
-        // Register pending LIMIT orders in Redis order book (outside the DB transaction)
+        // Register pending LIMIT orders before releasing the distributed write
+        // lease. Settlement cannot cancel the Mongo row and clean Redis between
+        // commit and registration. Mongo remains authoritative if Redis is down.
         if (resultTrade.status === 'pending' && resultTrade.order_type === 'LIMIT') {
-            await orderBookService.addOrder(
-                resultTrade._id.toString(),
-                resultTrade.instrument_token,
-                resultTrade.price,
-                resultTrade.transaction_type
-            );
-
-            // Notify the user's Flutter client so Orders tab updates instantly
-            const livePriceService = require('../services/livePriceService');
-            livePriceService.broadcastToUser(resultTrade.user_id.toString(), {
-                type: 'trade_placed',
-                trade_id: resultTrade._id.toString(),
-                instrument_token: resultTrade.instrument_token,
-                tradingsymbol: resultTrade.tradingsymbol,
-                transaction_type: resultTrade.transaction_type,
-                quantity: resultTrade.quantity,
-                price: resultTrade.price,
-                order_type: resultTrade.order_type,
+            const stillPending = await Trade.exists({
+                _id: resultTrade._id,
                 status: 'pending',
+                deleted_at: null,
             });
+            if (stillPending) {
+                try {
+                    await orderBookService.addOrder(
+                        resultTrade._id.toString(),
+                        resultTrade.instrument_token,
+                        resultTrade.price,
+                        resultTrade.transaction_type
+                    );
+                } catch (redisError) {
+                    console.error(`⚠️ [OrderBook] Pending order ${resultTrade._id} will be repaired from MongoDB: ${redisError.message}`);
+                }
+
+                const livePriceService = require('../services/livePriceService');
+                livePriceService.broadcastToUser(resultTrade.user_id.toString(), {
+                    type: 'trade_placed',
+                    trade_id: resultTrade._id.toString(),
+                    instrument_token: resultTrade.instrument_token,
+                    tradingsymbol: resultTrade.tradingsymbol,
+                    transaction_type: resultTrade.transaction_type,
+                    quantity: resultTrade.quantity,
+                    price: resultTrade.price,
+                    order_type: resultTrade.order_type,
+                    status: 'pending',
+                });
+            }
         }
+
+        await tradeWriteLease?.release();
+        tradeWriteLease = null;
 
         const isPending = resultTrade.status === 'pending';
         const positionClosed = resultTrade.pnl !== 0;
@@ -1168,7 +1188,9 @@ const placeTrade = async (req, res) => {
             metricsEngine.onTradeExecuted(resultTrade.user_id.toString());
         } catch (_) {}
     } catch (error) {
-        session.endSession();
+        await session.endSession().catch(() => {});
+        await tradeWriteLease?.release();
+        tradeWriteLease = null;
 
         // Save rejected trade to rejection log for margin/FSL failures
         const isRejectable = error.message.includes('free margin') ||
@@ -1207,7 +1229,7 @@ const placeTrade = async (req, res) => {
             }
         }
 
-        let statusCode = 500;
+        let statusCode = error.status || 500;
         if (error.message === 'User not found') statusCode = 404;
         else if (error.message.includes('Option selling is not allowed') || error.message.includes('would create a short position')) statusCode = 403;
         else if (error.message.includes('Trading is currently disabled')) statusCode = 403;
@@ -1355,8 +1377,10 @@ getPositions = async (req, res) => {
                 { status: 'pending', deleted_at: null },
                 // Cancelled orders (visible in history)
                 { status: 'cancelled', deleted_at: null },
-                // Include ALL settled trades in history (soft-deleted by settlement):
-                // 1. Settlement closing trades (carry-forward positions closed at settlement price)
+                // Include all period-qualified settlement rows. Remarks are
+                // presentation text and must not be an API discriminator.
+                { status: 'completed', settlement_period_key: { $type: 'string' } },
+                // Backward-compatible legacy settlement remarks:
                 { status: 'completed', remarks: 'Settlement: position closed at settlement price' },
                 // 2. Flat positions fully closed during the week (buy = sell, just reset)
                 { status: 'completed', remarks: 'Settlement: week reset (flat position)' },
@@ -1446,7 +1470,7 @@ const cancelTrade = async (req, res) => {
 
         // Update status in DB
         trade.status = 'cancelled';
-        await trade.save();
+        await withTradeWriteLease('cancel_order', () => trade.save());
 
         // Remove from Redis order book
         await orderBookService.removeOrder(
@@ -1461,7 +1485,7 @@ const cancelTrade = async (req, res) => {
             data: trade
         });
     } catch (error) {
-        res.status(500).json({
+        res.status(error.status || 500).json({
             success: false,
             message: error.message,
             data: null
@@ -1488,7 +1512,7 @@ const deleteTrade = async (req, res) => {
         }
 
         trade.deleted_at = new Date();
-        await trade.save();
+        await withTradeWriteLease('delete_trade', () => trade.save());
 
         // If the trade was pending, also remove from Redis order book
         if (trade.status === 'pending') {
@@ -1515,7 +1539,7 @@ const deleteTrade = async (req, res) => {
             console.error('⚠️  [FCM] deleteTrade notification error:', fcmErr.message);
         }
     } catch (error) {
-        res.status(500).json({ success: false, message: error.message });
+        res.status(error.status || 500).json({ success: false, message: error.message });
     }
 };
 
@@ -1545,6 +1569,7 @@ const getBrokerageRules = async (req, res) => {
  * Body: { instrument_tokens: ['token1', 'token2', ...] }
  */
 const autoSquareOffExpired = async (req, res) => {
+    let tradeWriteLease = null;
     try {
         const userId = req.user?.id || req.master?.id;
         if (!userId) {
@@ -1556,130 +1581,129 @@ const autoSquareOffExpired = async (req, res) => {
             return res.status(400).json({ success: false, message: 'instrument_tokens array required' });
         }
 
-        const user = await User.findById(userId).populate('master_id');
-        if (!user) {
-            return res.status(404).json({ success: false, message: 'User not found' });
-        }
-
+        // Acquire before user, position, instrument, and price snapshots.
+        tradeWriteLease = await beginTradeWrite('legacy_carry_forward');
         const results = [];
         const errors = [];
 
-        for (const token of instrument_tokens) {
+        for (const rawToken of instrument_tokens) {
+            const token = rawToken.toString();
+            const session = await mongoose.startSession();
+            let committed = null;
             try {
-                // Get current net position
-                const posAgg = await Trade.aggregate([
-                    { $match: { user_id: new mongoose.Types.ObjectId(userId), instrument_token: token.toString(), status: 'completed', deleted_at: null } },
-                    { $group: {
-                        _id: null,
-                        total_buy_qty: { $sum: { $cond: [{ $eq: ['$transaction_type', 'BUY'] }, '$executed_quantity', 0] } },
-                        total_sell_qty: { $sum: { $cond: [{ $eq: ['$transaction_type', 'SELL'] }, '$executed_quantity', 0] } },
-                    }}
-                ]);
+                await session.withTransaction(async () => {
+                    committed = null;
+                    await tradeWriteLease.assertActive({ session });
+                    const user = await User.findById(userId).select('master_id admin_id').session(session).lean();
+                    if (!user) throw new Error('User not found');
 
-                const netQty = posAgg.length > 0 ? posAgg[0].total_buy_qty - posAgg[0].total_sell_qty : 0;
-                if (netQty === 0) continue;
+                    const posAgg = await Trade.aggregate([
+                        { $match: { user_id: new mongoose.Types.ObjectId(userId), instrument_token: token, status: 'completed', deleted_at: null } },
+                        { $group: {
+                            _id: null,
+                            total_buy_qty: { $sum: { $cond: [{ $eq: ['$transaction_type', 'BUY'] }, '$executed_quantity', 0] } },
+                            total_sell_qty: { $sum: { $cond: [{ $eq: ['$transaction_type', 'SELL'] }, '$executed_quantity', 0] } },
+                        }},
+                    ]).session(session);
+                    const netQty = posAgg.length > 0 ? posAgg[0].total_buy_qty - posAgg[0].total_sell_qty : 0;
+                    if (netQty === 0) return;
 
-                const inst = await KiteInstrument.findOne({ instrument_token: token.toString() }).lean();
-                if (!inst) { errors.push({ token, message: 'Instrument not found' }); continue; }
+                    const instrument = await KiteInstrument.findOne({ instrument_token: token }).session(session).lean();
+                    if (!instrument) throw new Error('Instrument not found');
+                    const closePrice = Number(instrument.settlement_price || instrument.last_price || 0);
+                    if (closePrice <= 0) throw new Error('No settlement price available');
 
-                // Use settlement/close price from DB (updated by refreshSettlementPrices)
-                const closePrice = inst.last_price;
-                if (!closePrice || closePrice <= 0) {
-                    errors.push({ token, tradingsymbol: inst.tradingsymbol, message: 'No settlement price available' });
-                    continue;
+                    const absQty = Math.abs(netQty);
+                    const closeSide = netQty > 0 ? 'SELL' : 'BUY';
+                    const reopenSide = netQty > 0 ? 'BUY' : 'SELL';
+                    const closingTrades = await Trade.find({
+                        user_id: user._id,
+                        instrument_token: token,
+                        status: 'completed',
+                        deleted_at: null,
+                        transaction_type: netQty > 0 ? 'BUY' : 'SELL',
+                    }).sort({ executed_at: 1 }).session(session).lean();
+
+                    let remainingQty = absQty;
+                    let totalCost = 0;
+                    for (const trade of closingTrades) {
+                        if (remainingQty <= 0) break;
+                        const used = Math.min(Number(trade.executed_quantity || 0), remainingQty);
+                        totalCost += used * Number(trade.executed_price || 0);
+                        remainingQty -= used;
+                    }
+                    if (remainingQty > 0) throw new Error('Position fills cannot be reconciled for carry forward');
+                    const avgEntryPrice = totalCost / absQty;
+                    const closePnl = netQty > 0
+                        ? (closePrice - avgEntryPrice) * absQty
+                        : (avgEntryPrice - closePrice) * absQty;
+                    const closeTime = new Date();
+
+                    await Trade.create([{
+                        user_id: user._id,
+                        master_id: user.master_id,
+                        admin_id: user.admin_id || null,
+                        instrument_token: token,
+                        tradingsymbol: instrument.tradingsymbol,
+                        exchange: instrument.exchange,
+                        transaction_type: closeSide,
+                        quantity: absQty,
+                        price: closePrice,
+                        order_type: 'MARKET',
+                        placed_by: 'SYSTEM',
+                        trade_type: 'carry_forward',
+                        status: 'completed',
+                        executed_at: closeTime,
+                        executed_price: closePrice,
+                        executed_quantity: absQty,
+                        pnl: Math.round(closePnl * 100) / 100,
+                        brokerage: 0,
+                        taxes: 0,
+                        net_amount: Math.round(closePnl * 100) / 100,
+                        remarks: 'Carry forward close — ATP adjustment',
+                    }, {
+                        user_id: user._id,
+                        master_id: user.master_id,
+                        admin_id: user.admin_id || null,
+                        instrument_token: token,
+                        tradingsymbol: instrument.tradingsymbol,
+                        exchange: instrument.exchange,
+                        transaction_type: reopenSide,
+                        quantity: absQty,
+                        price: closePrice,
+                        order_type: 'MARKET',
+                        placed_by: 'SYSTEM',
+                        trade_type: 'carry_forward',
+                        status: 'completed',
+                        executed_at: new Date(closeTime.getTime() + 1),
+                        executed_price: closePrice,
+                        executed_quantity: absQty,
+                        pnl: 0,
+                        brokerage: 0,
+                        taxes: 0,
+                        net_amount: 0,
+                        remarks: 'Carry forward reopen — ATP adjustment',
+                    }], { session, ordered: true });
+                    await tradeWriteLease.assertActive({ session });
+                    committed = {
+                        token,
+                        tradingsymbol: instrument.tradingsymbol,
+                        qty: absQty,
+                        close_price: closePrice,
+                        pnl: Math.round(closePnl * 100) / 100,
+                    };
+                });
+
+                if (committed) {
+                    const metricsEngine = require('../services/metricsEngine');
+                    await metricsEngine.onTradeExecuted(userId);
+                    results.push(committed);
                 }
-
-                const absQty = Math.abs(netQty);
-                const closeSide = netQty > 0 ? 'SELL' : 'BUY';
-                const reopenSide = netQty > 0 ? 'BUY' : 'SELL';
-                const now = new Date();
-
-                // Compute P&L for the closing trade (FIFO-based, same as placeTrade)
-                const closingTrades = await Trade.find({
-                    user_id: user._id,
-                    instrument_token: token.toString(),
-                    status: 'completed',
-                    deleted_at: null,
-                    transaction_type: netQty > 0 ? 'BUY' : 'SELL',
-                }).sort({ executed_at: 1 }).session(null);
-
-                let remainingQty = absQty;
-                let totalCost = 0;
-                for (const t of closingTrades) {
-                    if (remainingQty <= 0) break;
-                    const available = t.executed_quantity - (t._usedQty || 0);
-                    const used = Math.min(available, remainingQty);
-                    totalCost += used * t.executed_price;
-                    remainingQty -= used;
-                }
-                const avgEntryPrice = totalCost / absQty;
-                const closePnl = netQty > 0
-                    ? (closePrice - avgEntryPrice) * absQty
-                    : (avgEntryPrice - closePrice) * absQty;
-
-                // 1. CLOSE trade — settles the position at close price
-                const closeTrade = await Trade.create({
-                    user_id: user._id,
-                    master_id: user.master_id?._id || user.master_id,
-                    admin_id: user.admin_id,
-                    instrument_token: token.toString(),
-                    tradingsymbol: inst.tradingsymbol,
-                    exchange: inst.exchange,
-                    transaction_type: closeSide,
-                    quantity: absQty,
-                    price: closePrice,
-                    order_type: 'MARKET',
-                    placed_by: 'SYSTEM',
-                    trade_type: 'carry_forward',
-                    status: 'completed',
-                    executed_at: now,
-                    executed_price: closePrice,
-                    executed_quantity: absQty,
-                    pnl: Math.round(closePnl * 100) / 100,
-                    brokerage: 0,
-                    taxes: 0,
-                    net_amount: Math.round(closePnl * 100) / 100,
-                    remarks: 'Carry forward close — ATP adjustment',
-                });
-
-                // 2. REOPEN trade — reopens position at close price (new ATP = close price)
-                const reopenTrade = await Trade.create({
-                    user_id: user._id,
-                    master_id: user.master_id?._id || user.master_id,
-                    admin_id: user.admin_id,
-                    instrument_token: token.toString(),
-                    tradingsymbol: inst.tradingsymbol,
-                    exchange: inst.exchange,
-                    transaction_type: reopenSide,
-                    quantity: absQty,
-                    price: closePrice,
-                    order_type: 'MARKET',
-                    placed_by: 'SYSTEM',
-                    trade_type: 'carry_forward',
-                    status: 'completed',
-                    executed_at: now,
-                    executed_price: closePrice,
-                    executed_quantity: absQty,
-                    pnl: 0,
-                    brokerage: 0,
-                    taxes: 0,
-                    net_amount: 0,
-                    remarks: 'Carry forward reopen — ATP adjustment',
-                });
-
-                // Refresh metricsEngine for this user
-                const metricsEngine = require('../services/metricsEngine');
-                await metricsEngine.onTradeExecuted(userId);
-
-                results.push({
-                    token,
-                    tradingsymbol: inst.tradingsymbol,
-                    qty: absQty,
-                    close_price: closePrice,
-                    pnl: Math.round(closePnl * 100) / 100,
-                });
-            } catch (e) {
-                errors.push({ token, message: e.message });
+            } catch (error) {
+                if (error.code === 'TRADE_WRITE_LEASE_LOST') throw error;
+                errors.push({ token, message: error.message });
+            } finally {
+                await session.endSession();
             }
         }
 
@@ -1689,7 +1713,9 @@ const autoSquareOffExpired = async (req, res) => {
             data: { carried_forward: results, errors },
         });
     } catch (error) {
-        res.status(500).json({ success: false, message: error.message, data: null });
+        res.status(error.status || 500).json({ success: false, message: error.message, data: null });
+    } finally {
+        await tradeWriteLease?.release();
     }
 };
 

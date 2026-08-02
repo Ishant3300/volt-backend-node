@@ -7,6 +7,7 @@ const orderBookService = require('./orderBookService');
 const redisService = require('./redisService');
 const { calculateMargin } = require('./marginService');
 const firebaseService = require('./firebaseService');
+const { beginTradeWrite } = require('./tradeWriteFenceService');
 
 /**
  * Fetches live prices from Kite for a list of instrument tokens.
@@ -83,8 +84,11 @@ const processPendingOrders = async () => {
 
             if (shouldExecute) {
                 const session = await mongoose.startSession();
+                let tradeWriteLease = null;
                 try {
+                    tradeWriteLease = await beginTradeWrite('db_limit_execution');
                     await session.withTransaction(async () => {
+                        await tradeWriteLease.assertActive({ session });
                         // Idempotency: re-check status before executing
                         const freshTrade = await Trade.findById(trade._id).session(session);
                         if (!freshTrade || freshTrade.status !== 'pending') return;
@@ -252,8 +256,11 @@ const processPendingOrders = async () => {
                                 console.error(`[OrderExecution] Error logging transaction for trade ${freshTrade._id}:`, txErr.message);
                             }
                         }
+                        await tradeWriteLease.assertActive({ session });
                     }); // end session.withTransaction
                     session.endSession();
+                    await tradeWriteLease.release();
+                    tradeWriteLease = null;
 
                     executedCount++;
                     console.log(`✅ [OrderExecution/Fallback] Executed ${trade.transaction_type} LIMIT for ${trade.tradingsymbol} @ ${trade.price} (live: ${livePrice})`);
@@ -280,7 +287,10 @@ const processPendingOrders = async () => {
                     });
                 } catch (sessionErr) {
                     session.endSession();
-                    console.error(`❌ [OrderExecution] Session error for trade ${trade._id}:`, sessionErr.message);
+                    await tradeWriteLease?.release();
+                    if (sessionErr.code !== 'SETTLEMENT_IN_PROGRESS') {
+                        console.error(`❌ [OrderExecution] Session error for trade ${trade._id}:`, sessionErr.message);
+                    }
                 }
             }
         }

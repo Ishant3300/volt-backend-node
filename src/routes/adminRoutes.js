@@ -378,9 +378,18 @@ router.post('/bhavcopy/fetch', authenticateAdmin, async (req, res) => {
   try {
     const { date } = req.body; // optional: YYYY-MM-DD string
     const { fetchAndApplyBhavcopy } = require('../services/bhavcopyService');
-    const targetDate = date ? new Date(date) : undefined;
-    const result = await fetchAndApplyBhavcopy(targetDate);
-    res.json({ success: true, message: 'Bhavcopy fetch completed', data: { nse: result.matched, mcx: result.mcxFallback, bse: result.bseMatched, total: Object.keys(result.closePriceMap).length } });
+    const result = await fetchAndApplyBhavcopy(date || undefined);
+    res.json({
+      success: true,
+      message: 'Bhavcopy fetch completed',
+      data: {
+        nse: result.nseMatched,
+        mcx: result.mcxMatched,
+        nse_trading_date: result.nseTradingDate,
+        mcx_trading_date: result.mcxTradingDate,
+        total: Object.keys(result.closePriceMap).length,
+      },
+    });
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });
   }

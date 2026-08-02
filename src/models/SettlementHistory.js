@@ -6,6 +6,7 @@ const mongoose = require('mongoose');
 // Documents are NEVER updated or deleted.
 
 const fillSchema = new mongoose.Schema({
+  source_trade_id: { type: mongoose.Schema.Types.ObjectId, default: null },
   transaction_type: { type: String, enum: ['BUY', 'SELL'] },
   executed_quantity: { type: Number, default: 0 },
   executed_price: { type: Number, default: 0 },
@@ -19,6 +20,11 @@ const fillSchema = new mongoose.Schema({
 
 const settlementHistorySchema = new mongoose.Schema({
   settlement_run_id: { type: mongoose.Schema.Types.ObjectId, required: true },
+  settlement_period_key: { type: String, default: null },
+  settlement_trading_date: { type: Date, default: null },
+  // Exact source date and provenance for this instrument's official price.
+  settlement_price_date: { type: Date, default: null },
+  settlement_price_source: { type: String, default: null },
   settlement_date: { type: Date, required: true },
   period_from: { type: Date, default: null },
   period_to: { type: Date, required: true },
@@ -67,6 +73,10 @@ const settlementHistorySchema = new mongoose.Schema({
 
 settlementHistorySchema.index({ user_id: 1, period_to: -1 });
 settlementHistorySchema.index({ settlement_run_id: 1 });
+settlementHistorySchema.index(
+  { settlement_period_key: 1, user_id: 1, instrument_token: 1 },
+  { unique: true, partialFilterExpression: { settlement_period_key: { $type: 'string' } } }
+);
 settlementHistorySchema.index({ user_id: 1, instrument_token: 1, period_to: -1 });
 settlementHistorySchema.index({ master_id: 1, period_to: -1 });
 

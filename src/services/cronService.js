@@ -1,4 +1,5 @@
 const cron = require('node-cron');
+const mongoose = require('mongoose');
 const path = require('path');
 const { fork } = require('child_process');
 const User = require('../models/User');
@@ -7,6 +8,7 @@ const orderExecutionService = require('./orderExecutionService');
 const redisService = require('./redisService');
 const { snapshotWeeklySummary } = require('./weeklySummaryService');
 const livePriceService = require('./livePriceService');
+const { beginTradeWrite } = require('./tradeWriteFenceService');
 
 class CronService {
     constructor() {
@@ -135,6 +137,59 @@ class CronService {
             }
         }, { timezone: 'Asia/Kolkata' });
         this.jobs.push(mcxBhavcopyJob);
+
+        // ── Atomic Weekend Settlement ───────────────────────────────────
+        // Retry hourly after the 1:00 AM MCX fetch on Saturday. The durable
+        // period key guarantees that only one worker can commit the week; later
+        // invocations are no-ops after success and retries after price failures.
+        const weekendSettlementJob = cron.schedule('30 1-5 * * 6', async () => {
+            console.log('[CRON] Checking Saturday weekly settlement...');
+            try {
+                const settlementService = require('./settlementService');
+                const result = await settlementService.runSettlement({
+                    trigger: 'cron',
+                    waitForCompletion: true,
+                    refreshPrices: true,
+                });
+                if (result.success) {
+                    console.log(`[CRON] Settlement ${result.periodKey}: ${result.alreadyCompleted ? 'already completed' : 'completed successfully'}.`);
+                } else {
+                    console.error(`[CRON] Settlement ${result.periodKey || 'unknown'} failed: ${result.message}`);
+                }
+            } catch (error) {
+                console.error(`[CRON] Weekend settlement error: ${error.message}`);
+            }
+        }, { timezone: 'Asia/Kolkata' });
+        this.jobs.push(weekendSettlementJob);
+
+        // Recover a run stranded by process restart, network failure, or a crash
+        // after DB commit. Recovery uses the run's stored trading date rather
+        // than advancing to the current week.
+        const settlementRecoveryJob = cron.schedule('*/15 * * * *', async () => {
+            try {
+                const settlementService = require('./settlementService');
+                const result = await settlementService.recoverIncompleteSettlements({ ensureCurrentPeriod: true });
+                if (result.recovered) {
+                    console.log(`[CRON] Settlement recovery ${result.periodKey || ''}: ${result.message}`);
+                }
+            } catch (error) {
+                console.error(`[CRON] Settlement recovery error: ${error.message}`);
+            }
+        }, { timezone: 'Asia/Kolkata' });
+        this.jobs.push(settlementRecoveryJob);
+
+        // Every PM2 worker observes the durable committed generation and rebuilds
+        // its own metrics/live-price maps. On-demand risk checks also reconcile,
+        // while this poll keeps WebSocket-only clients current.
+        const settlementGenerationSyncJob = cron.schedule('*/15 * * * * *', async () => {
+            try {
+                const metricsEngine = require('./metricsEngine');
+                await metricsEngine.synchronizeSettlementGeneration({ maxAgeMs: 0, broadcast: true });
+            } catch (error) {
+                console.error(`[Settlement] Worker generation sync error: ${error.message}`);
+            }
+        }, { timezone: 'Asia/Kolkata' });
+        this.jobs.push(settlementGenerationSyncJob);
 
         // ── Expiry Auto Square-Off ───────────────────────────────────────
         // 3:35 PM IST (after NSE close) + 11:32 PM IST (after MCX close at 11:30 PM)
@@ -277,96 +332,131 @@ class CronService {
      * Auto square-off positions on instruments that expired today.
      * Uses LTP (not bid/ask) for the closing price.
      */
-    async autoSquareOffExpiredPositions() {
+    async autoSquareOffExpiredPositions(options = {}) {
         const Trade = require('../models/Trade');
         const KiteInstrument = require('../models/KiteInstrument');
         const metricsEngine = require('./metricsEngine');
-
-        const today = new Date();
-        today.setHours(0, 0, 0, 0);
-        const tomorrow = new Date(today);
-        tomorrow.setDate(tomorrow.getDate() + 1);
-
-        // Find instruments that expire today
-        const expiredInstruments = await KiteInstrument.find({
-            expiry: { $gte: today, $lt: tomorrow },
-            deleted_at: null,
-        }).select('instrument_token tradingsymbol exchange last_price').lean();
-
-        if (expiredInstruments.length === 0) {
-            console.log('   No instruments expiring today.');
-            return;
-        }
-
-        const expiredTokens = expiredInstruments.map(i => i.instrument_token.toString());
-        const priceMap = {};
-        for (const inst of expiredInstruments) {
-            // Use LTP from metricsEngine if available, else DB last_price
-            const ltp = metricsEngine._ltpMap?.get(inst.instrument_token.toString()) || inst.last_price;
-            priceMap[inst.instrument_token.toString()] = { price: ltp, symbol: inst.tradingsymbol, exchange: inst.exchange };
-        }
-
-        // Find all open positions on expired instruments
-        const openPositions = await Trade.aggregate([
-            { $match: { instrument_token: { $in: expiredTokens }, status: 'completed', deleted_at: null } },
-            { $group: {
-                _id: { user_id: '$user_id', instrument_token: '$instrument_token' },
-                net_qty: { $sum: { $cond: [{ $eq: ['$transaction_type', 'BUY'] }, '$executed_quantity', { $multiply: ['$executed_quantity', -1] }] } },
-            }},
-            { $match: { net_qty: { $ne: 0 } } },
-        ]);
-
-        if (openPositions.length === 0) {
-            console.log(`   ${expiredInstruments.length} instrument(s) expiring today, no open positions.`);
-            return;
-        }
-
-        console.log(`   Found ${openPositions.length} open position(s) on ${expiredInstruments.length} expiring instrument(s).`);
-
+        let lease = null;
+        let session = null;
         let squared = 0;
-        for (const pos of openPositions) {
-            const token = pos._id.instrument_token;
-            const userId = pos._id.user_id;
-            const instData = priceMap[token];
-            if (!instData || !instData.price || instData.price <= 0) continue;
 
-            const absQty = Math.abs(pos.net_qty);
-            const closeSide = pos.net_qty > 0 ? 'SELL' : 'BUY';
+        try {
+            lease = await beginTradeWrite('expiry_square_off');
+            session = await mongoose.startSession();
+            const today = options.now ? new Date(options.now) : new Date();
+            today.setHours(0, 0, 0, 0);
+            const tomorrow = new Date(today);
+            tomorrow.setDate(tomorrow.getDate() + 1);
 
+            const expiredInstruments = await KiteInstrument.find({
+                expiry: { $gte: today, $lt: tomorrow },
+                deleted_at: null,
+            }).select('instrument_token tradingsymbol exchange last_price').lean();
+
+            if (expiredInstruments.length === 0) {
+                console.log('   No instruments expiring today.');
+                return;
+            }
+
+            const expiredTokens = expiredInstruments.map(instrument => instrument.instrument_token.toString());
+            const priceMap = {};
+            for (const instrument of expiredInstruments) {
+                const token = instrument.instrument_token.toString();
+                const ltp = metricsEngine._ltpMap?.get(token) || instrument.last_price;
+                priceMap[token] = { price: ltp, symbol: instrument.tradingsymbol, exchange: instrument.exchange };
+            }
+
+            const openPositions = await Trade.aggregate([
+                { $match: { instrument_token: { $in: expiredTokens }, status: 'completed', deleted_at: null } },
+                { $group: {
+                    _id: { user_id: '$user_id', instrument_token: '$instrument_token' },
+                    net_qty: { $sum: { $cond: [{ $eq: ['$transaction_type', 'BUY'] }, '$executed_quantity', { $multiply: ['$executed_quantity', -1] }] } },
+                }},
+                { $match: { net_qty: { $ne: 0 } } },
+            ]);
+
+            if (openPositions.length === 0) {
+                console.log(`   ${expiredInstruments.length} instrument(s) expiring today, no open positions.`);
+                return;
+            }
+
+            console.log(`   Found ${openPositions.length} open position(s) on ${expiredInstruments.length} expiring instrument(s).`);
+            for (const candidate of openPositions) {
+                const token = candidate._id.instrument_token.toString();
+                const userId = candidate._id.user_id;
+                const instData = priceMap[token];
+                if (!instData?.price || instData.price <= 0) continue;
+
+                let committed = null;
+                try {
+                    await session.withTransaction(async () => {
+                        committed = null;
+                        await lease.assertActive({ session });
+                        const freshPosition = await Trade.aggregate([
+                            { $match: { user_id: userId, instrument_token: token, status: 'completed', deleted_at: null } },
+                            { $group: {
+                                _id: null,
+                                net_qty: { $sum: { $cond: [{ $eq: ['$transaction_type', 'BUY'] }, '$executed_quantity', { $multiply: ['$executed_quantity', -1] }] } },
+                            }},
+                        ]).session(session);
+                        const netQty = Number(freshPosition[0]?.net_qty || 0);
+                        if (netQty === 0) return;
+
+                        const user = await User.findById(userId).select('master_id admin_id').session(session).lean();
+                        if (!user) throw new Error(`User ${userId} not found`);
+                        const absQty = Math.abs(netQty);
+                        const closeSide = netQty > 0 ? 'SELL' : 'BUY';
+                        await Trade.create([{
+                            user_id: userId,
+                            master_id: user.master_id,
+                            admin_id: user.admin_id || null,
+                            instrument_token: token,
+                            tradingsymbol: instData.symbol,
+                            exchange: instData.exchange,
+                            transaction_type: closeSide,
+                            quantity: absQty,
+                            price: instData.price,
+                            order_type: 'MARKET',
+                            placed_by: 'SYSTEM',
+                            trade_type: 'margin_square_off',
+                            status: 'completed',
+                            executed_at: new Date(),
+                            executed_price: instData.price,
+                            executed_quantity: absQty,
+                            pnl: 0,
+                            remarks: `Auto square-off: instrument expired (${instData.symbol})`,
+                        }], { session });
+                        if (options.faultInjector) {
+                            await options.faultInjector({
+                                phase: 'before_final_lease_proof',
+                                lease,
+                                session,
+                                userId,
+                                instrumentToken: token,
+                            });
+                        }
+                        await lease.assertActive({ session });
+                        committed = { absQty, closeSide };
+                    });
+
+                    if (!committed) continue;
+                    await metricsEngine.onTradeExecuted(userId.toString());
+                    squared++;
+                    console.log(`   ✅ Squared off ${instData.symbol}: ${committed.closeSide} ${committed.absQty} @ ${instData.price} for user ${userId}`);
+                } catch (error) {
+                    if (error.code === 'TRADE_WRITE_LEASE_LOST') throw error;
+                    console.error(`   ❌ Failed to square off ${instData.symbol} for user ${userId}: ${error.message}`);
+                }
+            }
+
+            console.log(`   ✅ Auto squared off ${squared} position(s).`);
+        } finally {
             try {
-                const user = await User.findById(userId).select('master_id admin_id').lean();
-                if (!user) continue;
-
-                await Trade.create({
-                    user_id: userId,
-                    master_id: user.master_id,
-                    admin_id: user.admin_id || null,
-                    instrument_token: token,
-                    tradingsymbol: instData.symbol,
-                    exchange: instData.exchange,
-                    transaction_type: closeSide,
-                    quantity: absQty,
-                    price: instData.price,
-                    order_type: 'MARKET',
-                    placed_by: 'SYSTEM',
-                    trade_type: 'margin_square_off',
-                    status: 'completed',
-                    executed_at: new Date(),
-                    executed_price: instData.price,
-                    executed_quantity: absQty,
-                    pnl: 0,
-                    remarks: `Auto square-off: instrument expired (${instData.symbol})`,
-                });
-
-                await metricsEngine.onTradeExecuted(userId.toString());
-                squared++;
-                console.log(`   ✅ Squared off ${instData.symbol}: ${closeSide} ${absQty} @ ${instData.price} for user ${userId}`);
-            } catch (err) {
-                console.error(`   ❌ Failed to square off ${instData.symbol} for user ${userId}: ${err.message}`);
+                if (session) await session.endSession();
+            } finally {
+                await lease?.release();
             }
         }
-
-        console.log(`   ✅ Auto squared off ${squared} position(s).`);
     }
 }
 

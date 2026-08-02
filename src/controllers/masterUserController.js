@@ -8,53 +8,57 @@ const Message = require('../models/Message');
 const Trade = require('../models/Trade');
 const CreditTransaction = require('../models/CreditTransaction');
 const KiteInstrument = require('../models/KiteInstrument');
+const { beginTradeWrite } = require('../services/tradeWriteFenceService');
 
 /**
  * Square off all open positions for a user in the given segments.
  * Uses bid/ask from metricsEngine (same as orders page CMP).
  * Returns the number of positions squared off.
  */
-async function _squareOffUserSegments(userId, segments) {
+async function _squareOffUserSegments(userId, segments, options = {}) {
   const metricsEngine = require('../services/metricsEngine');
-  const metrics = await metricsEngine.getFreshMetrics(userId);
-  if (!metrics || !metrics.positions || metrics.positions.length === 0) return 0;
-
-  const segmentsUpper = segments.map(s => s.toUpperCase());
+  let lease = null;
+  let session = null;
   let squaredOff = 0;
 
-  for (const pos of metrics.positions) {
-    if (pos.net_qty === 0) continue;
+  try {
+    lease = await beginTradeWrite('intraday_square_off');
+    const startSession = options.startSession || (() => mongoose.startSession());
+    session = await startSession();
+    // The lease is deliberately acquired before every mutable position/price
+    // read so settlement cannot commit between this snapshot and our writes.
+    const [metrics, user] = await Promise.all([
+      metricsEngine.getFreshMetrics(userId),
+      User.findById(userId).select('master_id admin_id').lean(),
+    ]);
+    if (!user || !metrics?.positions?.length) return 0;
 
-    // Check if this position's segment matches any of the enabled segments
-    const posSeg = (pos.segment || '').toUpperCase();
-    const posExchange = (pos.exchange || '').toUpperCase();
-    const matches = segmentsUpper.some(s =>
-      s === posSeg || s === posExchange ||
-      (s === 'INDICES' && (posSeg === 'INDICES' || posExchange === 'GLOBAL')) ||
-      (s === 'GLOBAL' && (posSeg === 'INDICES' || posExchange === 'GLOBAL'))
-    );
-    if (!matches) continue;
+    const segmentsUpper = segments.map(segment => segment.toUpperCase());
+    const tradesToCreate = [];
+    for (const pos of metrics.positions) {
+      if (pos.net_qty === 0) continue;
 
-    const closeSide = pos.net_qty > 0 ? 'SELL' : 'BUY';
-    const absQty = Math.abs(pos.net_qty);
-    // Use bid for SELL (closing long), ask for BUY (closing short) — same as orders page
-    const closePrice = closeSide === 'SELL'
-      ? (metricsEngine._bidMap?.get(pos.instrument_token) || pos.ltp || pos.cmp)
-      : (metricsEngine._askMap?.get(pos.instrument_token) || pos.ltp || pos.cmp);
+      const posSeg = (pos.segment || '').toUpperCase();
+      const posExchange = (pos.exchange || '').toUpperCase();
+      const matches = segmentsUpper.some(segment =>
+        segment === posSeg || segment === posExchange
+        || (segment === 'INDICES' && (posSeg === 'INDICES' || posExchange === 'GLOBAL'))
+        || (segment === 'GLOBAL' && (posSeg === 'INDICES' || posExchange === 'GLOBAL'))
+      );
+      if (!matches) continue;
 
-    if (!closePrice || closePrice <= 0) continue;
+      const closeSide = pos.net_qty > 0 ? 'SELL' : 'BUY';
+      const absQty = Math.abs(pos.net_qty);
+      const closePrice = closeSide === 'SELL'
+        ? (metricsEngine._bidMap?.get(pos.instrument_token) || pos.ltp || pos.cmp)
+        : (metricsEngine._askMap?.get(pos.instrument_token) || pos.ltp || pos.cmp);
+      if (!closePrice || closePrice <= 0) continue;
 
-    // Calculate P&L: (exit - entry) × qty for longs, (entry - exit) × qty for shorts
-    const avgEntry = pos.net_qty > 0 ? pos.avg_buy_price : pos.avg_sell_price;
-    const closingPnl = pos.net_qty > 0
-      ? (closePrice - avgEntry) * absQty
-      : (avgEntry - closePrice) * absQty;
-
-    try {
-      const user = await User.findById(userId).select('master_id admin_id').lean();
-      if (!user) continue;
-
-      await Trade.create({
+      const avgEntry = pos.net_qty > 0 ? pos.avg_buy_price : pos.avg_sell_price;
+      const closingPnl = pos.net_qty > 0
+        ? (closePrice - avgEntry) * absQty
+        : (avgEntry - closePrice) * absQty;
+      tradesToCreate.push({
         user_id: userId,
         master_id: user.master_id,
         admin_id: user.admin_id || null,
@@ -74,18 +78,24 @@ async function _squareOffUserSegments(userId, segments) {
         pnl: Math.round(closingPnl * 100) / 100,
         remarks: `Intraday square-off: ${pos.segment} segment closed by admin`,
       });
+    }
 
-      squaredOff++;
-    } catch (e) {
-      console.error(`⚠️ [IntradaySquareoff] Error closing ${pos.tradingsymbol} for user ${userId}: ${e.message}`);
+    if (tradesToCreate.length === 0) return 0;
+    await session.withTransaction(async () => {
+      await lease.assertActive({ session });
+      await Trade.insertMany(tradesToCreate, { session, ordered: true });
+      await lease.assertActive({ session });
+    });
+    squaredOff = tradesToCreate.length;
+  } finally {
+    try {
+      if (session) await session.endSession();
+    } finally {
+      await lease?.release();
     }
   }
 
-  // Rebuild metrics after all square-offs
-  if (squaredOff > 0) {
-    await metricsEngine.onTradeExecuted(userId);
-  }
-
+  if (squaredOff > 0) await metricsEngine.onTradeExecuted(userId);
   return squaredOff;
 }
 

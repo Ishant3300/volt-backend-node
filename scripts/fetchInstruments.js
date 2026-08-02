@@ -314,6 +314,25 @@ function filterNearestExpiry(instruments) {
   return result;
 }
 
+function buildInstrumentUpsertOperation(inst) {
+  // Never copy Kite CSV last_price into an existing instrument. The daily CSV
+  // normally contains zero and used to erase the weekend settlement CMP.
+  const { instrument_token, lot_size, last_price: _ignoredCsvLastPrice, ...rest } = inst;
+  const setFields = { ...rest };
+  if (lot_size > 1) setFields.lot_size = lot_size;
+
+  return {
+    updateOne: {
+      filter: { instrument_token },
+      update: {
+        $set: setFields,
+        $setOnInsert: { instrument_token, ...(lot_size > 1 ? {} : { lot_size: 1 }) },
+      },
+      upsert: true,
+    },
+  };
+}
+
 // ══════════════════════════════════════════════════════════════════════════════
 // MAIN FUNCTION
 // ══════════════════════════════════════════════════════════════════════════════
@@ -394,35 +413,7 @@ async function fetchInstruments() {
 
     for (let i = 0; i < uniqueInstruments.length; i += BATCH_SIZE) {
       const batch = uniqueInstruments.slice(i, i + BATCH_SIZE);
-      const ops = batch.map(inst => {
-        const { instrument_token, lot_size, ...rest } = inst;
-        const setFields = { ...rest };
-
-        if (lot_size > 1) {
-          setFields.lot_size = lot_size;
-          return {
-            updateOne: {
-              filter: { instrument_token },
-              update: {
-                $set: setFields,
-                $setOnInsert: { instrument_token }
-              },
-              upsert: true
-            }
-          };
-        } else {
-          return {
-            updateOne: {
-              filter: { instrument_token },
-              update: {
-                $set: setFields,
-                $setOnInsert: { instrument_token, lot_size: 1 }
-              },
-              upsert: true
-            }
-          };
-        }
-      });
+      const ops = batch.map(buildInstrumentUpsertOperation);
 
       const res = await KiteInstrument.bulkWrite(ops, { ordered: false });
       upserted += res.upsertedCount || 0;
@@ -472,4 +463,12 @@ async function fetchInstruments() {
   }
 }
 
-fetchInstruments();
+if (require.main === module) fetchInstruments();
+
+module.exports = {
+  buildInstrumentUpsertOperation,
+  deduplicateByToken,
+  filterNearestExpiry,
+  generateDisplayName,
+  parseAndFilterInstruments,
+};

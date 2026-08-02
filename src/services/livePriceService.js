@@ -11,6 +11,8 @@ const KiteInstrument = require('../models/KiteInstrument');
 const KiteMarketQuote = require('../models/KiteMarketQuote');
 const { LOG_LIVE_TICKS, LOG_WS_BROADCAST } = require('../config/logFlags');
 const metricsEngine = require('./metricsEngine');
+const SettlementRun = require('../models/SettlementRun');
+const { dateRange, isWeekendInIndia } = require('../utils/settlementDates');
 
 class LivePriceService {
   constructor() {
@@ -29,7 +31,7 @@ class LivePriceService {
   /**
    * Initialize WebSocket server on the HTTP server
    */
-  init(server) {
+  init(server, options = {}) {
     this.wss = new WebSocket.Server({ noServer: true });
     console.log('📡 WebSocket server initialized (noServer mode)');
 
@@ -67,41 +69,56 @@ class LivePriceService {
       }));
     });
 
-    // Pre-load settlement prices from DB so reconnecting clients get correct prices
-    this._preloadSettlementPrices();
+    // DB-backed prices are loaded explicitly after connectDatabase/index sync in
+    // the startup sequence, before metricsEngine becomes ready.
 
-    // Connect to Kite WebSocket
-    this._connectToKite();
+    // The startup barrier can register WebSocket handlers before listening while
+    // deferring outbound Kite connectivity until DB, recovery, and metrics are ready.
+    if (options.connectKite !== false) this._connectToKite();
   }
 
   /**
-   * Pre-load last_price from KiteInstrument DB into _settlementPrices map.
-   * This ensures that when a Flutter client subscribes (or reconnects),
-   * it gets the correct settlement/close price even if the server was restarted
-   * and the in-memory maps are empty.
-   * Live ticks from Kite will clear these as they arrive.
+   * Pre-load the durable official settlement price during the weekend. The
+   * daily Kite instrument CSV can carry last_price=0, so settlement_price (or
+   * legacy ohlc_close) is authoritative until the next market session.
    */
-  async _preloadSettlementPrices() {
+  async _preloadSettlementPrices(options = {}) {
     try {
       if (!this._settlementPrices) this._settlementPrices = new Map();
+      const weekend = isWeekendInIndia(options.now || new Date());
+      if (!weekend) this._settlementPrices.clear();
+      const latestRun = weekend
+        ? await SettlementRun.findOne({ status: { $in: ['committed', 'finalizing', 'completed'] } }).sort({ trading_date: -1 }).select('trading_date').lean()
+        : null;
+      const activeRange = latestRun ? dateRange(latestRun.trading_date) : null;
 
       const instruments = await KiteInstrument.find({
         is_active: true,
-        last_price: { $gt: 0 },
         deleted_at: null,
-      }).select('instrument_token last_price').lean();
+        $or: [
+          { settlement_price: { $gt: 0 } },
+          { last_price: { $gt: 0 } },
+          { ohlc_close: { $gt: 0 } },
+        ],
+      }).select('instrument_token settlement_price settlement_price_date last_price ohlc_close').lean();
 
       let loaded = 0;
       for (const inst of instruments) {
         const tokenStr = inst.instrument_token.toString();
-        this._settlementPrices.set(tokenStr, inst.last_price);
-        // Also populate latestPrices so other lookups work
-        this.latestPrices.set(tokenStr, inst.last_price);
-        this.latestPrices.set(parseInt(tokenStr), inst.last_price);
+        const settlementDate = inst.settlement_price_date ? new Date(inst.settlement_price_date) : null;
+        const settlementIsCurrent = !activeRange || (settlementDate && settlementDate >= activeRange.start && settlementDate < activeRange.end);
+        const price = weekend
+          ? ((settlementIsCurrent ? inst.settlement_price : 0) || inst.ohlc_close || inst.last_price)
+          : inst.last_price;
+        if (!price || price <= 0) continue;
+
+        if (weekend) this._settlementPrices.set(tokenStr, price);
+        this.latestPrices.set(tokenStr, price);
+        this.latestPrices.set(Number(tokenStr), price);
         loaded++;
       }
 
-      console.log(`📊 [Settlement] Pre-loaded ${loaded} settlement prices from DB into memory.`);
+      console.log(`📊 [Settlement] Pre-loaded ${loaded} ${weekend ? 'weekend settlement' : 'latest'} prices from DB.`);
     } catch (e) {
       console.error(`❌ [Settlement] Error pre-loading prices from DB: ${e.message}`);
     }
@@ -368,19 +385,13 @@ class LivePriceService {
           if (t && t.instrument_token && t.last_price) {
             const tokenStr = t.instrument_token.toString();
 
-            // If settlement prices exist, check if market is now open
-            // (genuine ticks = market is trading again → clear ALL settlement prices)
-            if (this._settlementPrices && this._settlementPrices.size > 0) {
-              const settlPrice = this._settlementPrices.get(tokenStr);
-              if (settlPrice) {
-                const priceDiff = Math.abs(t.last_price - settlPrice) / settlPrice;
-                if (priceDiff > 0.005) {
-                  // Price moved >0.5% from settlement — market is open
-                  // Clear ALL settlement prices (not just this token)
-                  console.log(`📊 Market open detected (${tokenStr}: ${settlPrice} → ${t.last_price}). Clearing all settlement prices.`);
-                  this._settlementPrices.clear();
-                }
-              }
+            // Weekend subscription snapshots must not overwrite official prices.
+            // On the first weekday tick, release every lock unconditionally — a
+            // real session can open at the exact same price as settlement.
+            if (this._settlementPrices && this._settlementPrices.size > 0 && !isWeekendInIndia()) {
+              console.log('📊 Weekday market tick detected. Clearing weekend settlement-price locks.');
+              this._settlementPrices.clear();
+              metricsEngine.clearSettledTokens();
             }
 
             // If settlement price still exists for this specific token, skip watchlist update

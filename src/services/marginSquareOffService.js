@@ -1,21 +1,16 @@
 /**
- * Margin Square Off Service
- * Monitors user equity in real-time via metricsEngine and auto-squares off
- * all positions when equity drops below the configured percentage of credit.
- *
- * Example: credit=100000, percentage=50 → threshold = 50000
- *          If equity < 50000, all positions are squared off.
+ * Tick-driven, transactionally fenced margin square-off service.
  */
-const User = require('../models/User');
-const Trade = require('../models/Trade');
 const mongoose = require('mongoose');
 const Transaction = require('../models/Transaction');
+const Trade = require('../models/Trade');
+const User = require('../models/User');
+const { beginTradeWrite } = require('./tradeWriteFenceService');
 
 let _livePriceService = null;
-// Track which users are currently being squared off to prevent duplicate triggers
 const _squaringOff = new Set();
 
-const init = (livePriceService) => {
+const init = livePriceService => {
   _livePriceService = livePriceService;
   console.log('🛡️  [MarginSquareOff] Service initialized (tick-driven via metricsEngine)');
 };
@@ -24,100 +19,114 @@ const shutdown = () => {
   console.log('🛡️  [MarginSquareOff] Service shut down');
 };
 
+function shouldSquareOff(user, metrics, log = false) {
+  if (!user || !metrics) return false;
+  const credit = Number(user.credits || 0);
+  const equity = Number(metrics.equity || 0);
+
+  if (user.margin_square_off && equity < 0) {
+    if (log) console.log(`🛡️  [MarginSquareOff] User ${user.username}: equity=₹${equity.toFixed(2)} < 0 (toggle ON), squaring off`);
+    return true;
+  }
+
+  if (user.margin_square_off_percentage > 0 && credit > 0) {
+    const percentage = user.margin_square_off_percentage;
+    const threshold = credit * (1 - percentage / 100);
+    if (equity < threshold) {
+      if (log) console.log(`🛡️  [MarginSquareOff] User ${user.username}: equity=₹${equity.toFixed(2)} < threshold=₹${threshold.toFixed(2)} (${percentage}% of ₹${credit}), squaring off`);
+      return true;
+    }
+  }
+  return false;
+}
+
 /**
- * Called by metricsEngine after computing metrics for a user.
- * Checks if margin square off should trigger based on the percentage threshold.
+ * Called by metricsEngine after computing metrics for a user. The tick metrics
+ * are only a trigger; the fenced path takes a fresh snapshot before writing.
  */
 const checkUser = async (userId, metrics) => {
-  if (_squaringOff.has(userId)) return; // Already processing
+  if (_squaringOff.has(userId)) return;
 
   try {
-    const user = await User.findById(userId).select('margin_square_off margin_square_off_percentage credits master_id server_id username active_status deleted_at').lean();
-    if (!user) return;
-    if (!user.active_status || user.deleted_at) return;
-    if (!user.margin_square_off && !(user.margin_square_off_percentage > 0)) return; // Neither feature enabled
+    const user = await User.findById(userId)
+      .select('margin_square_off margin_square_off_percentage credits master_id server_id username active_status deleted_at')
+      .lean();
+    if (!user || !user.active_status || user.deleted_at) return;
+    if (!user.margin_square_off && !(user.margin_square_off_percentage > 0)) return;
+    if (!metrics?.positions?.length || !shouldSquareOff(user, metrics, true)) return;
 
-    const credit = user.credits || 0;
-    const equity = metrics.equity;
-    let shouldSquareOff = false;
-
-    // Condition 1: Toggle ON + equity went negative → immediate square off
-    if (user.margin_square_off && equity < 0) {
-      console.log(`🛡️  [MarginSquareOff] User ${user.username}: equity=₹${equity.toFixed(2)} < 0 (toggle ON), squaring off`);
-      shouldSquareOff = true;
+    _squaringOff.add(userId);
+    try {
+      await _squareOffAllPositions(user);
+    } finally {
+      _squaringOff.delete(userId);
     }
-
-    // Condition 2: Percentage set + equity below threshold → square off
-    if (!shouldSquareOff && user.margin_square_off_percentage > 0 && credit > 0) {
-      const percentage = user.margin_square_off_percentage;
-      const threshold = credit * (1 - percentage / 100);
-      if (equity < threshold) {
-        console.log(`🛡️  [MarginSquareOff] User ${user.username}: equity=₹${equity.toFixed(2)} < threshold=₹${threshold.toFixed(2)} (${percentage}% of ₹${credit}), squaring off`);
-        shouldSquareOff = true;
-      }
-    }
-
-    if (shouldSquareOff && metrics.positions && metrics.positions.length > 0) {
-      _squaringOff.add(userId);
-
-      // Capture prices at the moment the condition triggered (before any async delay)
-      const priceSnapshot = {};
-      for (const pos of metrics.positions) {
-        if (pos.net_qty !== 0) {
-          priceSnapshot[pos.instrument_token] = {
-            bid: pos.bid_price || pos.cmp || pos.ltp,
-            ask: pos.ask_price || pos.cmp || pos.ltp,
-            ltp: pos.ltp,
-          };
-        }
-      }
-
-      try {
-        await _squareOffAllPositions(user, metrics.positions, priceSnapshot);
-      } finally {
-        _squaringOff.delete(userId);
-      }
-    }
-  } catch (err) {
+  } catch (error) {
     _squaringOff.delete(userId);
-    console.error(`🛡️  [MarginSquareOff] Error checking user ${userId}:`, err.message);
+    console.error(`🛡️  [MarginSquareOff] Error checking user ${userId}:`, error.message);
   }
 };
 
-const _squareOffAllPositions = async (user, positions, priceSnapshot) => {
-  const session = await mongoose.startSession();
+async function _squareOffAllPositions(triggerUser) {
+  let lease = null;
+  let session = null;
+  let positionsSquared = 0;
+
   try {
+    // Acquire before the authoritative metrics and price snapshot. Settlement
+    // cannot drain writers and commit while this decision remains in flight.
+    lease = await beginTradeWrite('margin_square_off');
+    const metricsEngine = require('./metricsEngine');
+    const [user, freshMetrics] = await Promise.all([
+      User.findById(triggerUser._id)
+        .select('margin_square_off margin_square_off_percentage credits master_id server_id username active_status deleted_at')
+        .lean(),
+      metricsEngine.getFreshMetrics(triggerUser._id.toString()),
+    ]);
+
+    if (!user || !user.active_status || user.deleted_at || !freshMetrics?.positions?.length) return 0;
+    if (!shouldSquareOff(user, freshMetrics)) return 0;
+
+    const positions = freshMetrics.positions.filter(position => Number(position.net_qty || 0) !== 0);
+    if (positions.length === 0) return 0;
+
+    const priceSnapshot = new Map();
+    for (const position of positions) {
+      priceSnapshot.set(position.instrument_token.toString(), {
+        bid: Number(position.bid_price || position.cmp || position.ltp || 0),
+        ask: Number(position.ask_price || position.cmp || position.ltp || 0),
+        ltp: Number(position.ltp || 0),
+      });
+    }
+
+    session = await mongoose.startSession();
     await session.withTransaction(async () => {
+      await lease.assertActive({ session });
       const freshUser = await User.findById(user._id).session(session);
-      if (!freshUser) return;
+      if (!freshUser) throw new Error(`Margin square-off user ${user._id} no longer exists`);
 
-      for (const pos of positions) {
-        const netQty = pos.net_qty;
-        if (netQty === 0) continue;
-
+      for (const position of positions) {
+        const netQty = Number(position.net_qty || 0);
         const closeType = netQty > 0 ? 'SELL' : 'BUY';
         const closeQty = Math.abs(netQty);
-
-        // Use the price snapshot captured at detection time (not current live price)
-        const snapshot = priceSnapshot[pos.instrument_token] || {};
-        let closePrice;
-        if (closeType === 'SELL') {
-          closePrice = snapshot.bid || pos.ltp || (netQty > 0 ? pos.avg_buy_price : pos.avg_sell_price);
-        } else {
-          closePrice = snapshot.ask || pos.ltp || (netQty > 0 ? pos.avg_buy_price : pos.avg_sell_price);
+        const snapshot = priceSnapshot.get(position.instrument_token.toString()) || {};
+        const closePrice = closeType === 'SELL'
+          ? Number(snapshot.bid || snapshot.ltp || position.avg_buy_price || 0)
+          : Number(snapshot.ask || snapshot.ltp || position.avg_sell_price || 0);
+        if (!Number.isFinite(closePrice) || closePrice <= 0) {
+          throw new Error(`No valid fenced square-off price for ${position.tradingsymbol}`);
         }
 
-        let pnl = 0;
-        if (netQty > 0) pnl = (closePrice - pos.avg_buy_price) * closeQty;
-        else pnl = (pos.avg_sell_price - closePrice) * closeQty;
-
+        const pnl = netQty > 0
+          ? (closePrice - position.avg_buy_price) * closeQty
+          : (position.avg_sell_price - closePrice) * closeQty;
         const newTrade = new Trade({
           user_id: freshUser._id,
           master_id: freshUser.master_id,
           admin_id: freshUser.server_id,
-          instrument_token: pos.instrument_token,
-          tradingsymbol: pos.tradingsymbol,
-          exchange: pos.exchange,
+          instrument_token: position.instrument_token,
+          tradingsymbol: position.tradingsymbol,
+          exchange: position.exchange,
           transaction_type: closeType,
           quantity: closeQty,
           price: closePrice,
@@ -128,19 +137,18 @@ const _squareOffAllPositions = async (user, positions, priceSnapshot) => {
           executed_at: new Date(),
           executed_price: closePrice,
           executed_quantity: closeQty,
-          pnl: pnl,
+          pnl,
           brokerage: 0,
           taxes: 0,
           net_amount: pnl,
-          remarks: 'MARGIN_SQUARE_OFF'
+          remarks: 'MARGIN_SQUARE_OFF',
         });
         await newTrade.save({ session });
 
-        const balanceBefore = freshUser.equity;
-        freshUser.equity += pnl;
-
-        const tx = new Transaction({
-          transactionId: `TXN_${Date.now()}_${Math.random().toString(36).substr(2, 6)}_MSO`,
+        const balanceBefore = Number(freshUser.equity || 0);
+        freshUser.equity = balanceBefore + pnl;
+        const transaction = new Transaction({
+          transactionId: `TXN_${Date.now()}_${Math.random().toString(36).slice(2, 8)}_MSO`,
           userId: freshUser._id,
           userModel: 'User',
           type: closeType,
@@ -151,75 +159,73 @@ const _squareOffAllPositions = async (user, positions, priceSnapshot) => {
           balanceBefore,
           balanceAfter: freshUser.equity,
           metadata: {
-            tradingsymbol: pos.tradingsymbol,
+            tradingsymbol: position.tradingsymbol,
             quantity: closeQty,
             executedPrice: closePrice,
             order_type: 'MARKET',
             realisedPnl: pnl,
             reason: 'MARGIN_SQUARE_OFF',
-            positionClosed: true
-          }
+            positionClosed: true,
+          },
         });
-        await tx.save({ session });
+        await transaction.save({ session });
+        positionsSquared++;
 
-        console.log(`🛡️  [MarginSquareOff] Squared off ${pos.tradingsymbol}: ${closeType} ${closeQty} @ ₹${closePrice.toFixed(2)}, P&L: ₹${pnl.toFixed(2)}`);
+        console.log(`🛡️  [MarginSquareOff] Squared off ${position.tradingsymbol}: ${closeType} ${closeQty} @ ₹${closePrice.toFixed(2)}, P&L: ₹${pnl.toFixed(2)}`);
       }
 
+      await lease.assertActive({ session });
       await freshUser.save({ session });
     });
 
-    session.endSession();
-
-    // Rebuild metricsEngine cache for this user
-    try {
-      const metricsEngine = require('./metricsEngine');
-      await metricsEngine.onTradeExecuted(user._id.toString());
-    } catch (_) {}
-
-    // Notify user via WebSocket
-    if (_livePriceService) {
-      _livePriceService.broadcastToUser(user._id.toString(), {
-        type: 'margin_square_off',
-        message: `Your positions have been auto-squared off. Equity dropped below ${user.margin_square_off_percentage}% of your credit.`
-      });
-
-      // Also notify all admin and master connections viewing this user
-      // so their Position tab refreshes immediately
-      if (_livePriceService.wss) {
-        const squareOffMsg = JSON.stringify({
-          type: 'trade_executed',
-          user_id: user._id.toString(),
-          tradingsymbol: 'ALL',
-          transaction_type: 'SQUARE_OFF',
-          quantity: 0,
-          status: 'completed',
-          message: `Margin square-off: all positions closed for ${user.username}`,
-        });
-        _livePriceService.wss.clients.forEach(client => {
-          if (client.readyState === 1) {
-            // Send to admin clients and any connection authenticated as this user
-            if (client.isAdmin || client.userId === user._id.toString() || client.userId === user.master_id?.toString()) {
-              client.send(squareOffMsg);
-            }
-          }
-        });
-      }
+    await metricsEngine.onTradeExecuted(user._id.toString());
+    notifySquareOff(user);
+    return positionsSquared;
+  } catch (error) {
+    if (error.code !== 'SETTLEMENT_IN_PROGRESS') {
+      console.error(`🛡️  [MarginSquareOff] Failed to square off for ${triggerUser.username}:`, error.message);
     }
-
-    // Notify via FCM
-    try {
-      const firebaseService = require('./firebaseService');
-      firebaseService.sendNotification(user._id.toString(), 'admin_order_execution', {
-        title: 'Margin Square Off',
-        body: `All positions squared off. Equity dropped below ${user.margin_square_off_percentage}% threshold.`,
-        data: { reason: 'margin_square_off' }
-      });
-    } catch (_) {}
-
-  } catch (err) {
-    session.endSession();
-    console.error(`🛡️  [MarginSquareOff] Failed to square off for ${user.username}:`, err.message);
+    return 0;
+  } finally {
+    if (session) await session.endSession();
+    await lease?.release();
   }
-};
+}
+
+function notifySquareOff(user) {
+  if (_livePriceService) {
+    _livePriceService.broadcastToUser(user._id.toString(), {
+      type: 'margin_square_off',
+      message: `Your positions have been auto-squared off. Equity dropped below ${user.margin_square_off_percentage}% of your credit.`,
+    });
+
+    if (_livePriceService.wss) {
+      const message = JSON.stringify({
+        type: 'trade_executed',
+        user_id: user._id.toString(),
+        tradingsymbol: 'ALL',
+        transaction_type: 'SQUARE_OFF',
+        quantity: 0,
+        status: 'completed',
+        message: `Margin square-off: all positions closed for ${user.username}`,
+      });
+      _livePriceService.wss.clients.forEach(client => {
+        if (client.readyState === 1
+          && (client.isAdmin || client.userId === user._id.toString() || client.userId === user.master_id?.toString())) {
+          client.send(message);
+        }
+      });
+    }
+  }
+
+  try {
+    const firebaseService = require('./firebaseService');
+    firebaseService.sendNotification(user._id.toString(), 'admin_order_execution', {
+      title: 'Margin Square Off',
+      body: `All positions squared off. Equity dropped below ${user.margin_square_off_percentage}% threshold.`,
+      data: { reason: 'margin_square_off' },
+    });
+  } catch (_) {}
+}
 
 module.exports = { init, shutdown, checkUser };

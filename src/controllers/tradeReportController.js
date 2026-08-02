@@ -101,8 +101,12 @@ const getTradeReport = async (req, res) => {
     }).lean();
 
     const ledgerRows = [];
+    const seenSourceTradeIds = new Set();
     for (const s of snapshots) {
       for (const f of (s.fills || [])) {
+        const sourceTradeId = f.source_trade_id?.toString();
+        if (sourceTradeId && seenSourceTradeIds.has(sourceTradeId)) continue;
+        if (sourceTradeId) seenSourceTradeIds.add(sourceTradeId);
         if (!f.executed_at) continue;
         const at = new Date(f.executed_at);
         if (at < fromDate || at > toDate) continue;
@@ -390,10 +394,24 @@ const getTradeReport = async (req, res) => {
         ...cfUserFilter,
         status: 'completed',
         trade_type: 'carry_forward',
-        remarks: 'Settlement: position carried forward at close price',
-        $or: [
-          { deleted_at: null },                        // still open
-          { deleted_at: { $gt: fromDate } },           // settled after the report window started
+        executed_at: { $lte: toDate },
+        $and: [
+          {
+            $or: [
+              {
+                settlement_run_id: { $ne: null },
+                settlement_period_key: { $type: 'string' },
+              },
+              // Read-only compatibility for pre-migration rows.
+              { remarks: 'Settlement: position carried forward at close price' },
+            ],
+          },
+          {
+            $or: [
+              { deleted_at: null },
+              { deleted_at: { $gt: fromDate } },
+            ],
+          },
         ],
       }).lean();
 
