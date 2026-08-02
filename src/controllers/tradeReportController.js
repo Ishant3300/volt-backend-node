@@ -222,10 +222,13 @@ const getTradeReport = async (req, res) => {
       const avgSellPrice = totalSellQty > 0 ? totalSellVol / totalSellQty : 0;
 
       const matchedQty = Math.min(totalBuyQty, totalSellQty);
-      // Use sum of per-trade FIFO P&L (stored by backend at execution time) — not the
-      // average-based (avgSell - avgBuy) × matchedQty formula which gives wrong results
-      // when multiple buys/sells happen at different prices within the period.
-      const pnl = g.all_trades.reduce((sum, t) => sum + (t.pnl || 0), 0);
+
+      // ── FIFO P&L Recomputation ──
+      // Recompute P&L using FIFO matching instead of stored per-trade pnl values.
+      // This correctly handles cases where:
+      //   - Per-trade pnl was computed against a running average that included prior-week buys
+      //   - Settlement close pnl was computed against overall avg instead of remaining FIFO cost
+      const pnl = _computeFifoPnl(g.all_trades);
 
       // Brokerage: for ledger (settled) rows use the stored value captured at settlement time.
       // For live rows recalculate, but only with rules that were effective at the trade date
@@ -570,5 +573,86 @@ const getSettlementHistory = async (req, res) => {
     res.status(500).json({ success: false, message: error.message });
   }
 };
+
+/**
+ * FIFO P&L computation for a single instrument's fills within a report period.
+ * Processes fills chronologically: each closing trade consumes the earliest available
+ * opening trades. Handles both long (buy→sell) and short (sell→buy) positions.
+ * Also updates the `pnl` field on each closing trade object for per-row PDF display.
+ *
+ * @param {Array} allTrades - chronological fills with {type, buy_qty, sell_qty, rate, ...}
+ * @returns {number} total FIFO P&L for this instrument
+ */
+function _computeFifoPnl(allTrades) {
+  // Sort chronologically
+  const sorted = [...allTrades].sort((a, b) => new Date(a.date) - new Date(b.date));
+
+  // First pass: determine net direction to know which side is "opening" vs "closing"
+  let netQty = 0;
+  for (const t of sorted) {
+    netQty += (t.buy_qty || 0) - (t.sell_qty || 0);
+  }
+  // We don't use net direction to decide FIFO order — instead we use running position.
+  // A trade that ADDS to position is opening; one that REDUCES is closing.
+
+  // FIFO queue of opening lots: [{qty, price, side: 'BUY'|'SELL'}]
+  const openQueue = [];
+  let runningNet = 0; // positive = long, negative = short
+  let totalPnl = 0;
+
+  for (const trade of sorted) {
+    const isBuy = (trade.buy_qty || 0) > 0;
+    const qty = isBuy ? trade.buy_qty : (trade.sell_qty || 0);
+    if (qty <= 0) { trade.pnl = 0; continue; }
+
+    const price = trade.rate || 0;
+    const prevNet = runningNet;
+    const newNet = isBuy ? runningNet + qty : runningNet - qty;
+
+    // Determine if this trade opens, closes, or both (reversal)
+    const isOpening = (isBuy && prevNet >= 0) || (!isBuy && prevNet <= 0);
+    const isClosing = (isBuy && prevNet < 0) || (!isBuy && prevNet > 0);
+
+    if (isOpening && !isClosing) {
+      // Pure opening trade — no P&L
+      openQueue.push({ qty, price, side: isBuy ? 'BUY' : 'SELL' });
+      trade.pnl = 0;
+    } else if (isClosing) {
+      // Closing trade (may partially reverse into new position)
+      let remainingToClose = Math.min(qty, Math.abs(prevNet));
+      let tradePnl = 0;
+
+      while (remainingToClose > 0 && openQueue.length > 0) {
+        const oldest = openQueue[0];
+        const matched = Math.min(remainingToClose, oldest.qty);
+
+        if (oldest.side === 'BUY') {
+          // Closing a long: profit = (sell_price - buy_cost) × qty
+          tradePnl += (price - oldest.price) * matched;
+        } else {
+          // Closing a short: profit = (sell_cost - buy_price) × qty
+          tradePnl += (oldest.price - price) * matched;
+        }
+
+        oldest.qty -= matched;
+        remainingToClose -= matched;
+        if (oldest.qty <= 0) openQueue.shift();
+      }
+
+      trade.pnl = Math.round(tradePnl * 100) / 100;
+      totalPnl += tradePnl;
+
+      // If this trade reverses direction (qty > |prevNet|), the excess opens new position
+      const excess = qty - Math.abs(prevNet);
+      if (excess > 0) {
+        openQueue.push({ qty: excess, price, side: isBuy ? 'BUY' : 'SELL' });
+      }
+    }
+
+    runningNet = newNet;
+  }
+
+  return Math.round(totalPnl * 100) / 100;
+}
 
 module.exports = { getTradeReport, getOpenPositions, getSettlementHistory };
