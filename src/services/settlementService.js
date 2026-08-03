@@ -162,6 +162,12 @@ function normalizePriceDates(priceDates, tradingDate) {
   };
 }
 
+function settlementHistoryRunId(run) {
+  const value = run?.history_run_id || run?.stats?.legacy_settlement_run_id || run?._id;
+  if (!value || !mongoose.Types.ObjectId.isValid(value)) return null;
+  return new mongoose.Types.ObjectId(value);
+}
+
 function expectedPriceDateForInstrument(run, instrument) {
   if (instrument?.exchange === 'MCX') return run.price_dates?.mcx;
   if (['NFO', 'NSE', 'BFO', 'BSE'].includes(instrument?.exchange)) return run.price_dates?.nse;
@@ -177,6 +183,364 @@ function hasOfficialSettlementAuthority(instrument) {
   return false;
 }
 
+async function inspectLegacySettlement({ historyRunId, periodKey }) {
+  const rows = await SettlementHistory.find({ settlement_run_id: historyRunId }).lean();
+  const failures = [];
+  if (rows.length === 0) {
+    return {
+      eligible: false,
+      stats: { ledger_rows: 0 },
+      verification: {
+        adopted_existing_history: false,
+        legacy_history_run_id: historyRunId.toString(),
+        failures: [{ type: 'legacy_history_missing' }],
+      },
+    };
+  }
+
+  const settlementTimes = [...new Set(rows.map(row => new Date(row.settlement_date).getTime()))];
+  if (settlementTimes.some(value => !Number.isFinite(value)) || settlementTimes.length !== 1) {
+    failures.push({ type: 'legacy_settlement_timestamp_mismatch', count: settlementTimes.length });
+  }
+  const settlementAt = new Date(Math.max(...settlementTimes.filter(Number.isFinite)));
+  const affectedUserIds = [...new Set(rows.map(row => row.user_id.toString()))];
+  const ledgerKeys = new Set();
+  const expectedCarry = new Map();
+
+  for (const row of rows) {
+    const key = `${row.user_id}::${row.instrument_token}`;
+    if (ledgerKeys.has(key)) failures.push({ type: 'duplicate_legacy_ledger_position', key });
+    ledgerKeys.add(key);
+
+    const netPnl = Number(row.net_pnl);
+    const calculatedNetPnl = Number(row.realized_pnl || 0)
+      + Number(row.settlement_pnl || 0)
+      - Number(row.brokerage || 0);
+    if (!Number.isFinite(netPnl) || !Number.isFinite(calculatedNetPnl)
+      || Math.abs(netPnl - calculatedNetPnl) >= MONEY_TOLERANCE) {
+      failures.push({ type: 'invalid_legacy_ledger_pnl', key });
+    }
+    if (!Array.isArray(row.fills) || row.fills.length === 0) {
+      failures.push({ type: 'legacy_ledger_fills_missing', key });
+    }
+
+    const quantity = Number(row.carry_forward_qty || 0);
+    if (quantity < 0 || !Number.isFinite(quantity)) {
+      failures.push({ type: 'invalid_legacy_carry_forward', key });
+      continue;
+    }
+    if (quantity === 0) continue;
+
+    const price = Number(row.carry_forward_price || row.settlement_price || 0);
+    const side = row.carry_forward_side;
+    const expectedClosingSide = side === 'BUY' ? 'SELL' : 'BUY';
+    if (!['BUY', 'SELL'].includes(side) || price <= 0
+      || Math.abs(price - Number(row.settlement_price || 0)) >= MONEY_TOLERANCE
+      || Number(row.closing_qty || 0) !== quantity
+      || row.closing_side !== expectedClosingSide) {
+      failures.push({ type: 'invalid_legacy_carry_forward', key });
+      continue;
+    }
+    expectedCarry.set(key, { quantity, price, side });
+  }
+
+  const [activeTrades, preSettlementActiveTrades, stalePendingCount, cumulativeHistory, users] = await Promise.all([
+    Trade.find({
+      user_id: { $in: affectedUserIds },
+      status: 'completed',
+      deleted_at: null,
+    }).select('_id user_id instrument_token tradingsymbol transaction_type executed_quantity executed_price trade_type createdAt').lean(),
+    Trade.find({
+      status: 'completed',
+      deleted_at: null,
+      createdAt: { $lte: settlementAt },
+    }).select('_id user_id instrument_token tradingsymbol transaction_type executed_quantity executed_price trade_type createdAt').lean(),
+    Trade.countDocuments({
+      status: 'pending',
+      deleted_at: null,
+      createdAt: { $lte: settlementAt },
+    }),
+    SettlementHistory.find({ user_id: { $in: affectedUserIds } })
+      .select('user_id settlement_run_id net_pnl')
+      .lean(),
+    User.find({ _id: { $in: affectedUserIds }, deleted_at: null })
+      .select('_id settled_pnl')
+      .lean(),
+  ]);
+
+  const activeByKey = new Map();
+  for (const trade of activeTrades) {
+    const key = `${trade.user_id}::${trade.instrument_token}`;
+    if (!activeByKey.has(key)) activeByKey.set(key, []);
+    activeByKey.get(key).push(trade);
+  }
+
+  const matchedCarryIds = new Set();
+  let matchedCarryPositions = 0;
+  for (const [key, expected] of expectedCarry) {
+    const matching = (activeByKey.get(key) || []).filter(trade =>
+      trade.trade_type === 'carry_forward'
+      && trade.transaction_type === expected.side
+      && Number(trade.executed_quantity) === expected.quantity
+      && Math.abs(Number(trade.executed_price) - expected.price) < MONEY_TOLERANCE
+      && new Date(trade.createdAt) >= settlementAt
+    );
+    if (matching.length !== 1) {
+      failures.push({ type: 'legacy_carry_forward_mismatch', key, matching_rows: matching.length });
+    } else {
+      matchedCarryPositions++;
+      matchedCarryIds.add(matching[0]._id.toString());
+    }
+  }
+
+  // The legacy engine wrote the full ledger and all settled-P&L increments
+  // before it reset any source trade or created any carry-forward. Looking at
+  // every pre-settlement active row (not only ledger users) prevents a partial
+  // ledger from defining its own supposedly-complete reconciliation universe.
+  const unresolvedLegacyTrades = preSettlementActiveTrades
+    .filter(trade => !matchedCarryIds.has(trade._id.toString()));
+  const sourceRowsRemaining = unresolvedLegacyTrades.filter(trade =>
+    ledgerKeys.has(`${trade.user_id}::${trade.instrument_token}`)
+  );
+  const legacyExceptions = unresolvedLegacyTrades
+    .filter(trade => !ledgerKeys.has(`${trade.user_id}::${trade.instrument_token}`))
+    .map(trade => ({
+      trade_id: trade._id.toString(),
+      user_id: trade.user_id.toString(),
+      instrument_token: trade.instrument_token.toString(),
+      tradingsymbol: trade.tradingsymbol,
+    }));
+
+  if (sourceRowsRemaining.length > 0) {
+    failures.push({ type: 'legacy_source_rows_still_active', count: sourceRowsRemaining.length });
+  }
+  if (legacyExceptions.length > 0) {
+    failures.push({ type: 'legacy_unsettled_positions', count: legacyExceptions.length });
+  }
+  if (stalePendingCount > 0) {
+    failures.push({ type: 'legacy_pending_rows_still_active', count: stalePendingCount });
+  }
+
+  // settled_pnl is cumulative. Rebuild its independently observable expected
+  // value by rounding each immutable settlement run's per-user delta exactly as
+  // the legacy writer did, then compare it with the current user record.
+  const pnlByUserRun = new Map();
+  for (const row of cumulativeHistory) {
+    const key = `${row.user_id}::${row.settlement_run_id}`;
+    const netPnl = Number(row.net_pnl);
+    if (!Number.isFinite(netPnl)) {
+      failures.push({ type: 'invalid_cumulative_legacy_pnl', key });
+      continue;
+    }
+    pnlByUserRun.set(key, (pnlByUserRun.get(key) || 0) + netPnl);
+  }
+  const expectedSettledPnl = new Map(affectedUserIds.map(userId => [userId, 0]));
+  for (const [key, delta] of pnlByUserRun) {
+    const userId = key.split('::')[0];
+    expectedSettledPnl.set(userId, (expectedSettledPnl.get(userId) || 0) + roundMoney(delta));
+  }
+  const actualSettledPnl = new Map(users.map(user => [user._id.toString(), roundMoney(user.settled_pnl || 0)]));
+  const settledPnlMismatches = [];
+  for (const userId of affectedUserIds) {
+    const expected = roundMoney(expectedSettledPnl.get(userId) || 0);
+    const actual = actualSettledPnl.get(userId);
+    if (actual === undefined || Math.abs(actual - expected) >= MONEY_TOLERANCE) {
+      settledPnlMismatches.push({ user_id: userId, expected, actual: actual ?? null });
+    }
+  }
+  if (settledPnlMismatches.length > 0) {
+    failures.push({ type: 'legacy_settled_pnl_mismatch', count: settledPnlMismatches.length });
+  }
+
+  const eligible = failures.length === 0;
+  return {
+    eligible,
+    settlementAt,
+    stats: {
+      ledger_rows: rows.length,
+      users_affected: affectedUserIds.length,
+      carry_forward_positions: expectedCarry.size,
+      matched_carry_forward_positions: matchedCarryPositions,
+      stale_pending_orders: stalePendingCount,
+      active_source_rows: sourceRowsRemaining.length,
+      legacy_exceptions: legacyExceptions.length,
+      settled_pnl_mismatches: settledPnlMismatches.length,
+      legacy_settlement_run_id: historyRunId.toString(),
+    },
+    verification: {
+      adopted_existing_history: eligible,
+      legacy_history_run_id: historyRunId.toString(),
+      period_key: periodKey,
+      ledger_integrity_verified: !failures.some(item => [
+        'duplicate_legacy_ledger_position',
+        'invalid_legacy_ledger_pnl',
+        'legacy_ledger_fills_missing',
+      ].includes(item.type)),
+      carry_forward_set_verified: matchedCarryPositions === expectedCarry.size
+        && !failures.some(item => item.type === 'invalid_legacy_carry_forward'),
+      complete_position_universe_verified: legacyExceptions.length === 0,
+      pending_order_reset_verified: stalePendingCount === 0,
+      source_trade_reset_verified: sourceRowsRemaining.length === 0,
+      settled_pnl_verified: settledPnlMismatches.length === 0,
+      financial_writes_replayed: false,
+      financial_atomicity: eligible ? 'legacy_observable_state_reconciled' : 'legacy_not_provable',
+      manual_review_required: !eligible,
+      legacy_exceptions: legacyExceptions,
+      settled_pnl_mismatches: settledPnlMismatches,
+      failures,
+    },
+  };
+}
+
+async function reconcileBlockedLegacySettlement(run, options = {}) {
+  if (run?.status !== 'blocked' || run?.adopted_legacy_history !== true) {
+    return null;
+  }
+  const historyRunId = settlementHistoryRunId(run);
+  if (!historyRunId) return null;
+
+  const now = options.now || new Date();
+  const lockOwner = createLockOwner();
+  const claimed = await SettlementRun.findOneAndUpdate({
+    _id: run._id,
+    status: 'blocked',
+    adopted_legacy_history: true,
+    $or: [
+      { lock_owner: null },
+      { lock_owner: { $exists: false } },
+      { lease_expires_at: null },
+      { lease_expires_at: { $lte: now } },
+    ],
+  }, {
+    $set: { lock_owner: lockOwner, lease_expires_at: leaseExpiry() },
+    $inc: { attempts: 1 },
+  }, { new: true }).lean();
+
+  if (!claimed) {
+    const current = await SettlementRun.findById(run._id).lean();
+    if (current?.status === 'completed') {
+      return {
+        success: true,
+        recovered: true,
+        completed: true,
+        alreadyCompleted: true,
+        periodKey: current.period_key,
+        runId: current._id.toString(),
+        message: `Legacy settlement ${current.period_key} already adopted`,
+      };
+    }
+    return {
+      success: false,
+      recovered: false,
+      busy: true,
+      periodKey: run.period_key,
+      runId: run._id.toString(),
+      message: `Legacy settlement ${run.period_key} reconciliation is owned by another worker`,
+    };
+  }
+
+  let fence = null;
+  try {
+    fence = await acquireSettlementFence(lockOwner);
+    const audit = await inspectLegacySettlement({ historyRunId, periodKey: run.period_key });
+    if (options.faultInjector) {
+      await options.faultInjector({ phase: 'after_legacy_audit', audit, run: claimed });
+    }
+    if (!audit.eligible) {
+      const error = `Legacy settlement ${historyRunId} failed observable-state reconciliation`;
+      await SettlementRun.updateOne({ _id: run._id, status: 'blocked', lock_owner: lockOwner }, {
+        $set: {
+          lock_owner: null,
+          lease_expires_at: now,
+          failed_at: now,
+          error,
+          stats: audit.stats,
+          verification: audit.verification,
+        },
+      });
+      return {
+        success: false,
+        recovered: false,
+        blocked: true,
+        periodKey: run.period_key,
+        runId: run._id.toString(),
+        message: error,
+      };
+    }
+
+    const completedAt = new Date();
+    const completed = await SettlementRun.updateOne({
+      _id: run._id,
+      status: 'blocked',
+      lock_owner: lockOwner,
+      adopted_legacy_history: true,
+    }, {
+      $set: {
+        status: 'completed',
+        history_run_id: historyRunId,
+        committed_at: audit.settlementAt,
+        completed_at: completedAt,
+        failed_at: null,
+        lock_owner: null,
+        lease_expires_at: completedAt,
+        error: null,
+        stats: audit.stats,
+        verification: audit.verification,
+      },
+    });
+    if (completed.matchedCount !== 1) {
+      throw new Error(`Legacy settlement ${run.period_key} reconciliation ownership was lost`);
+    }
+
+    try {
+      const metricsEngine = require('./metricsEngine');
+      await metricsEngine.synchronizeSettlementGeneration({
+        runId: run._id,
+        force: true,
+        broadcast: true,
+        applyPrices: options.applySettlementPrices ?? isWeekendInIndia(options.now || new Date()),
+      });
+    } catch (error) {
+      // Coordinator adoption is durable; normal generation polling retries cache
+      // synchronization without replaying any legacy financial write.
+      console.error(`[Settlement] Adopted legacy generation sync failed: ${error.message}`);
+    }
+
+    return {
+      success: true,
+      recovered: true,
+      completed: true,
+      adoptedLegacy: true,
+      periodKey: run.period_key,
+      runId: run._id.toString(),
+      message: `Legacy settlement ${run.period_key} adopted after observable-state reconciliation`,
+      verification: audit.verification,
+    };
+  } catch (error) {
+    // Keep the run fail-closed, but release this worker's coordinator claim so
+    // a transient audit/fence failure can be retried safely on the next pass.
+    const failedAt = new Date();
+    const errorMessage = error instanceof Error ? error.message : String(error);
+    await SettlementRun.updateOne({
+      _id: run._id,
+      status: 'blocked',
+      lock_owner: lockOwner,
+    }, {
+      $set: {
+        lock_owner: null,
+        lease_expires_at: failedAt,
+        failed_at: failedAt,
+        error: `Legacy settlement ${run.period_key} reconciliation failed unexpectedly: ${errorMessage}`,
+      },
+    }).catch(cleanupError => {
+      console.error(`[Settlement] Failed to release legacy reconciliation claim: ${cleanupError.message}`);
+    });
+    throw error;
+  } finally {
+    await fence?.release().catch(() => {});
+  }
+}
+
 async function adoptLegacySettlement(periodKey, tradingDate, trigger, priceDates) {
   const { start, end } = indiaDayRangeUtc(tradingDate);
   const legacy = await SettlementHistory.findOne({
@@ -185,15 +549,12 @@ async function adoptLegacySettlement(periodKey, tradingDate, trigger, priceDates
   }).sort({ settlement_date: -1 }).lean();
   if (!legacy) return null;
 
-  // Legacy writes were not atomic and did not persist a durable credit/order
-  // reconciliation marker. Matching carry-forward rows alone cannot prove that
-  // credits, old fills, and pending cancellations all committed. Fail closed so
-  // an ambiguous legacy week can never be adopted as a completed financial run.
-  const rows = await SettlementHistory.find({ settlement_run_id: legacy.settlement_run_id }).lean();
-  const errorMessage = `Legacy settlement ${legacy.settlement_run_id} exists for ${periodKey} but cannot be proven atomic; manual reconciliation is required`;
-
+  const historyRunId = legacy.settlement_run_id;
+  const rows = await SettlementHistory.find({ settlement_run_id: historyRunId }).lean();
+  const errorMessage = `Legacy settlement ${historyRunId} is awaiting observable-state reconciliation`;
+  let run;
   try {
-    return await SettlementRun.create({
+    run = await SettlementRun.create({
       period_key: periodKey,
       trading_date: tradingDate,
       trade_cutoff_at: indiaDayRangeUtc(tradingDate).end,
@@ -205,20 +566,27 @@ async function adoptLegacySettlement(periodKey, tradingDate, trigger, priceDates
       failed_at: new Date(),
       error: errorMessage,
       adopted_legacy_history: true,
+      history_run_id: historyRunId,
       stats: {
         ledger_rows: rows.length,
         users_affected: new Set(rows.map(row => row.user_id.toString())).size,
-        legacy_settlement_run_id: legacy.settlement_run_id.toString(),
+        legacy_settlement_run_id: historyRunId.toString(),
       },
       verification: {
         adopted_existing_history: false,
-        reason: 'legacy financial writes are not transactionally reconcilable',
+        reason: 'observable-state reconciliation pending',
       },
     });
   } catch (error) {
     if (error?.code !== 11000) throw error;
-    return SettlementRun.findOne({ period_key: periodKey });
+    run = await SettlementRun.findOne({ period_key: periodKey });
   }
+
+  if (run?.status === 'blocked' && run.adopted_legacy_history === true) {
+    await reconcileBlockedLegacySettlement(run, { applySettlementPrices: isWeekendInIndia() });
+    return SettlementRun.findById(run._id);
+  }
+  return run;
 }
 
 /** Acquire execution or finalization ownership atomically. */
@@ -1066,14 +1434,15 @@ async function commitSettlementTransaction({ run, lockOwner, tradingDate, faultI
 async function loadCommittedSettlementPrices(runOrId, legacyTradingDate) {
   const run = runOrId?._id
     ? runOrId
-    : await SettlementRun.findById(runOrId).select('_id trading_date price_dates').lean();
+    : await SettlementRun.findById(runOrId).select('_id trading_date price_dates history_run_id stats').lean();
   if (!run) throw new Error(`Settlement run ${runOrId} not found`);
 
   // Position prices come from the immutable ledger committed in the same
   // transaction as trade replacement. Instrument rows are only a watchlist
   // supplement and can never override a committed position price.
+  const historyRunId = settlementHistoryRunId(run);
   const snapshots = await SettlementHistory.find({
-    settlement_run_id: run._id,
+    settlement_run_id: historyRunId,
     carry_forward_qty: { $gt: 0 },
     settlement_price: { $gt: 0 },
   }).select('instrument_token settlement_price').lean();
@@ -1308,6 +1677,13 @@ async function recoverIncompleteSettlements(options = {}) {
 
   if (run) {
     if (run.status === 'blocked') {
+      if (run.adopted_legacy_history === true) {
+        const reconciled = await reconcileBlockedLegacySettlement(run, {
+          now,
+          applySettlementPrices: options.applySettlementPrices,
+        });
+        if (reconciled) return reconciled;
+      }
       return {
         success: false,
         recovered: false,
@@ -1369,9 +1745,12 @@ module.exports = {
     buildPositionGroups,
     commitSettlementTransaction,
     finalizeCommittedRun,
+    inspectLegacySettlement,
     loadCommittedSettlementPrices,
     materializeCalendarFailure,
     normalizePriceDates,
+    reconcileBlockedLegacySettlement,
+    settlementHistoryRunId,
     verifySettlementInvariants,
   },
 };

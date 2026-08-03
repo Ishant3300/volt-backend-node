@@ -720,7 +720,7 @@ class MetricsEngine {
       const runQuery = options.runId
         ? { _id: options.runId, status: { $in: ['committed', 'finalizing', 'completed'] } }
         : { status: { $in: ['committed', 'finalizing', 'completed'] } };
-      const query = SettlementRun.findOne(runQuery).select('_id period_key trading_date price_dates committed_at status');
+      const query = SettlementRun.findOne(runQuery).select('_id period_key trading_date price_dates committed_at status history_run_id stats');
       if (!options.runId) query.sort({ committed_at: -1, trading_date: -1 });
       const run = await query.lean();
       this._lastSettlementCheckAt = Date.now();
@@ -738,7 +738,8 @@ class MetricsEngine {
         return { changed: false, runId, pricesApplied: false };
       }
 
-      const snapshots = await SettlementHistory.find({ settlement_run_id: run._id })
+      const historyRunId = run.history_run_id || run.stats?.legacy_settlement_run_id || run._id;
+      const snapshots = await SettlementHistory.find({ settlement_run_id: historyRunId })
         .select('user_id instrument_token settlement_price carry_forward_qty')
         .lean();
       const affectedUserIds = [...new Set(snapshots.map(snapshot => snapshot.user_id.toString()))];

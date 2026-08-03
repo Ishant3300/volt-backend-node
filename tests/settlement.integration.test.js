@@ -311,6 +311,157 @@ async function createOwnedRun(scenario, owner, periodKey) {
   });
 }
 
+async function materializeLegacySettlement(scenario, options = {}) {
+  const legacyRunId = new mongoose.Types.ObjectId();
+  const settlementAt = new Date(scenario.cutoff.getTime() + (8 * 60 * 60 * 1000));
+  const nfoSources = await Trade.find({
+    user_id: scenario.users[0]._id,
+    instrument_token: scenario.nfoToken,
+    status: 'completed',
+    deleted_at: null,
+  }).sort({ executed_at: 1 }).lean();
+  const mcxSources = await Trade.find({
+    user_id: scenario.users[1]._id,
+    instrument_token: scenario.mcxToken,
+    status: 'completed',
+    deleted_at: null,
+  }).sort({ executed_at: 1 }).lean();
+  const toLegacyFill = trade => ({
+    transaction_type: trade.transaction_type,
+    executed_quantity: trade.executed_quantity,
+    executed_price: trade.executed_price,
+    executed_at: trade.executed_at,
+    pnl: trade.pnl || 0,
+    brokerage: 0,
+    order_type: trade.order_type,
+    placed_by: trade.placed_by,
+    trade_type: trade.trade_type,
+  });
+
+  await SettlementHistory.create([{
+    settlement_run_id: legacyRunId,
+    settlement_date: settlementAt,
+    period_from: nfoSources[0].executed_at,
+    period_to: settlementAt,
+    user_id: scenario.users[0]._id,
+    master_id: scenario.master._id,
+    admin_id: scenario.adminId,
+    exchange: 'NFO',
+    tradingsymbol: scenario.instruments[0].tradingsymbol,
+    instrument_token: scenario.nfoToken,
+    fills: nfoSources.map(toLegacyFill),
+    total_buy_qty: 10,
+    total_buy_value: 1000,
+    avg_buy_price: 100,
+    total_sell_qty: 4,
+    total_sell_value: 480,
+    avg_sell_price: 120,
+    settlement_price: 130,
+    closing_qty: 6,
+    closing_side: 'SELL',
+    realized_pnl: 80,
+    settlement_pnl: 180,
+    total_pnl: 260,
+    brokerage: 0,
+    net_pnl: 260,
+    carry_forward_qty: 6,
+    carry_forward_price: 130,
+    carry_forward_side: 'BUY',
+  }, {
+    settlement_run_id: legacyRunId,
+    settlement_date: settlementAt,
+    period_from: mcxSources[0].executed_at,
+    period_to: settlementAt,
+    user_id: scenario.users[1]._id,
+    master_id: scenario.master._id,
+    admin_id: scenario.adminId,
+    exchange: 'MCX',
+    tradingsymbol: scenario.instruments[1].tradingsymbol,
+    instrument_token: scenario.mcxToken,
+    fills: mcxSources.map(toLegacyFill),
+    total_buy_qty: 0,
+    total_buy_value: 0,
+    avg_buy_price: 0,
+    total_sell_qty: 20,
+    total_sell_value: 4000,
+    avg_sell_price: 200,
+    settlement_price: 180,
+    closing_qty: 20,
+    closing_side: 'BUY',
+    realized_pnl: 0,
+    settlement_pnl: 400,
+    total_pnl: 400,
+    brokerage: 0,
+    net_pnl: 400,
+    carry_forward_qty: 20,
+    carry_forward_price: 180,
+    carry_forward_side: 'SELL',
+  }]);
+
+  if (options.applySettledPnl !== false) {
+    await User.bulkWrite([{
+      updateOne: {
+        filter: { _id: scenario.users[0]._id },
+        update: { $inc: { settled_pnl: 260 } },
+      },
+    }, {
+      updateOne: {
+        filter: { _id: scenario.users[1]._id },
+        update: { $inc: { settled_pnl: 400 } },
+      },
+    }]);
+  }
+
+  await Trade.updateMany({ status: 'completed', deleted_at: null }, {
+    $set: { deleted_at: settlementAt, remarks: 'Settlement: week reset' },
+  });
+  await Trade.create([{
+    user_id: scenario.users[0]._id,
+    master_id: scenario.master._id,
+    admin_id: scenario.adminId,
+    instrument_token: scenario.nfoToken,
+    tradingsymbol: scenario.instruments[0].tradingsymbol,
+    exchange: 'NFO',
+    transaction_type: 'BUY',
+    quantity: 6,
+    price: 130,
+    order_type: 'MARKET',
+    placed_by: 'SYSTEM',
+    trade_type: 'carry_forward',
+    status: 'completed',
+    executed_at: new Date(settlementAt.getTime() + 1000),
+    executed_price: 130,
+    executed_quantity: 6,
+    pnl: 0,
+    createdAt: new Date(settlementAt.getTime() + 1),
+  }, {
+    user_id: scenario.users[1]._id,
+    master_id: scenario.master._id,
+    admin_id: scenario.adminId,
+    instrument_token: scenario.mcxToken,
+    tradingsymbol: scenario.instruments[1].tradingsymbol,
+    exchange: 'MCX',
+    transaction_type: 'SELL',
+    quantity: 20,
+    price: 180,
+    order_type: 'MARKET',
+    placed_by: 'SYSTEM',
+    trade_type: 'carry_forward',
+    status: 'completed',
+    executed_at: new Date(settlementAt.getTime() + 1000),
+    executed_price: 180,
+    executed_quantity: 20,
+    pnl: 0,
+    createdAt: new Date(settlementAt.getTime() + 1),
+  }]);
+
+  return {
+    legacyRunId,
+    settlementAt,
+    sourceTradeIds: [...nfoSources, ...mcxSources].map(trade => trade._id),
+  };
+}
+
 describeIntegration('isolated replica-set weekend settlement', () => {
   beforeAll(async () => {
     if (!process.env.MONGO_URI) throw new Error('MONGO_URI is required for isolated integration tests');
@@ -575,6 +726,261 @@ describeIntegration('isolated replica-set weekend settlement', () => {
     expect(await SettlementHistory.countDocuments({})).toBe(0);
     expect(await Trade.countDocuments({ settlement_period_key: '2026-07-31' })).toBe(0);
     expect((await User.findById(scenario.users[0]._id).lean()).settled_pnl).toBe(0);
+  });
+
+  test('a verified legacy settlement is adopted without replaying financial writes', async () => {
+    const scenario = await seedScenario({ includeFlat: false, includePending: false, prefix: 'legacyauto' });
+    const legacy = await materializeLegacySettlement(scenario);
+    const before = {
+      history: await SettlementHistory.find({}).sort({ _id: 1 }).lean(),
+      trades: await Trade.find({}).sort({ _id: 1 }).lean(),
+      users: await User.find({ _id: { $in: scenario.users.map(user => user._id) } })
+        .select('_id credits settled_pnl')
+        .sort({ _id: 1 })
+        .lean(),
+    };
+
+    const result = await settlementService.runSettlement({
+      trigger: 'recovery',
+      tradingDate: scenario.tradingDate,
+      priceDates: { nse: scenario.tradingDate, mcx: scenario.tradingDate },
+      refreshPrices: false,
+      applySettlementPrices: false,
+      waitForCompletion: true,
+    });
+
+    expect(result).toMatchObject({
+      success: true,
+      started: false,
+      alreadyCompleted: true,
+      periodKey: '2026-07-31',
+    });
+    const run = await SettlementRun.findOne({ period_key: '2026-07-31' }).lean();
+    expect(run).toMatchObject({
+      status: 'completed',
+      adopted_legacy_history: true,
+    });
+    expect(run.history_run_id.toString()).toBe(legacy.legacyRunId.toString());
+    expect(run.verification).toMatchObject({
+      adopted_existing_history: true,
+      ledger_integrity_verified: true,
+      carry_forward_set_verified: true,
+      complete_position_universe_verified: true,
+      pending_order_reset_verified: true,
+      source_trade_reset_verified: true,
+      settled_pnl_verified: true,
+      financial_writes_replayed: false,
+    });
+    expect(await SettlementHistory.find({}).sort({ _id: 1 }).lean()).toEqual(before.history);
+    expect(await Trade.find({}).sort({ _id: 1 }).lean()).toEqual(before.trades);
+    expect(await User.find({ _id: { $in: scenario.users.map(user => user._id) } })
+      .select('_id credits settled_pnl')
+      .sort({ _id: 1 })
+      .lean()).toEqual(before.users);
+    expect(await SettlementHistory.countDocuments({ settlement_run_id: run._id })).toBe(0);
+  });
+
+  test('startup reconciles the already-materialized legacy block and releases writers', async () => {
+    const scenario = await seedScenario({ includeFlat: false, includePending: false, prefix: 'legacyblocked' });
+    const legacy = await materializeLegacySettlement(scenario);
+    const blocked = await SettlementRun.create({
+      period_key: '2026-07-31',
+      trading_date: scenario.tradingDate,
+      trade_cutoff_at: scenario.cutoff,
+      price_dates: { nse: scenario.tradingDate, mcx: scenario.tradingDate },
+      status: 'blocked',
+      trigger: 'recovery',
+      attempts: 0,
+      started_at: legacy.settlementAt,
+      failed_at: new Date(),
+      error: 'legacy financial writes are not transactionally reconcilable',
+      adopted_legacy_history: true,
+      stats: { legacy_settlement_run_id: legacy.legacyRunId.toString() },
+    });
+
+    await expect(tradeWriteFenceService.beginTradeWrite('before_legacy_reconciliation')).rejects.toMatchObject({
+      code: 'SETTLEMENT_IN_PROGRESS',
+    });
+    const recovered = await settlementService.recoverIncompleteSettlements({
+      now: new Date('2026-08-03T04:30:00.000Z'),
+      applySettlementPrices: false,
+    });
+    expect(recovered).toMatchObject({
+      success: true,
+      recovered: true,
+      completed: true,
+      adoptedLegacy: true,
+      runId: blocked._id.toString(),
+    });
+    expect(await SettlementRun.findById(blocked._id).lean()).toMatchObject({
+      status: 'completed',
+      adopted_legacy_history: true,
+    });
+
+    const lease = await tradeWriteFenceService.beginTradeWrite('after_legacy_reconciliation');
+    await lease.release();
+  });
+
+  test('legacy reconciliation stays blocked when an expected carry-forward is missing', async () => {
+    const scenario = await seedScenario({ includeFlat: false, includePending: false, prefix: 'legacyinvalid' });
+    const legacy = await materializeLegacySettlement(scenario);
+    await Trade.deleteOne({
+      user_id: scenario.users[0]._id,
+      instrument_token: scenario.nfoToken,
+      status: 'completed',
+      deleted_at: null,
+    });
+    const blocked = await SettlementRun.create({
+      period_key: '2026-07-31',
+      trading_date: scenario.tradingDate,
+      trade_cutoff_at: scenario.cutoff,
+      price_dates: { nse: scenario.tradingDate, mcx: scenario.tradingDate },
+      status: 'blocked',
+      trigger: 'recovery',
+      attempts: 0,
+      started_at: legacy.settlementAt,
+      error: 'legacy reconciliation pending',
+      adopted_legacy_history: true,
+      stats: { legacy_settlement_run_id: legacy.legacyRunId.toString() },
+    });
+
+    const recovered = await settlementService.recoverIncompleteSettlements({
+      now: new Date('2026-08-03T04:30:00.000Z'),
+      applySettlementPrices: false,
+    });
+    expect(recovered).toMatchObject({
+      success: false,
+      recovered: false,
+      blocked: true,
+      runId: blocked._id.toString(),
+    });
+    const stillBlocked = await SettlementRun.findById(blocked._id).lean();
+    expect(stillBlocked.status).toBe('blocked');
+    expect(stillBlocked.verification.failures).toEqual(expect.arrayContaining([
+      expect.objectContaining({ type: 'legacy_carry_forward_mismatch' }),
+    ]));
+    await expect(tradeWriteFenceService.beginTradeWrite('invalid_legacy_writer')).rejects.toMatchObject({
+      code: 'SETTLEMENT_IN_PROGRESS',
+    });
+  });
+
+  test('legacy reconciliation stays blocked when cumulative settled P&L cannot be proven', async () => {
+    const scenario = await seedScenario({ includeFlat: false, includePending: false, prefix: 'legacypnl' });
+    const legacy = await materializeLegacySettlement(scenario, { applySettledPnl: false });
+    const blocked = await SettlementRun.create({
+      period_key: '2026-07-31',
+      trading_date: scenario.tradingDate,
+      trade_cutoff_at: scenario.cutoff,
+      price_dates: { nse: scenario.tradingDate, mcx: scenario.tradingDate },
+      status: 'blocked',
+      trigger: 'recovery',
+      attempts: 0,
+      started_at: legacy.settlementAt,
+      error: 'legacy reconciliation pending',
+      adopted_legacy_history: true,
+      history_run_id: legacy.legacyRunId,
+    });
+
+    const recovered = await settlementService.recoverIncompleteSettlements({
+      now: new Date('2026-08-03T04:30:00.000Z'),
+      applySettlementPrices: false,
+    });
+
+    expect(recovered).toMatchObject({ success: false, recovered: false, blocked: true });
+    const stillBlocked = await SettlementRun.findById(blocked._id).lean();
+    expect(stillBlocked.status).toBe('blocked');
+    expect(stillBlocked.verification.settled_pnl_verified).toBe(false);
+    expect(stillBlocked.verification.failures).toEqual(expect.arrayContaining([
+      expect.objectContaining({ type: 'legacy_settled_pnl_mismatch', count: 2 }),
+    ]));
+  });
+
+  test('legacy reconciliation stays blocked for a pre-settlement position omitted from history', async () => {
+    const scenario = await seedScenario({ includeFlat: false, includePending: false, prefix: 'legacyomitted' });
+    const legacy = await materializeLegacySettlement(scenario);
+    await Trade.create({
+      user_id: scenario.users[0]._id,
+      master_id: scenario.master._id,
+      admin_id: scenario.adminId,
+      instrument_token: 'legacy-unsettled-token',
+      tradingsymbol: 'EXPIRED26MAYFUT',
+      exchange: 'NFO',
+      transaction_type: 'BUY',
+      quantity: 1,
+      price: 100,
+      order_type: 'MARKET',
+      status: 'completed',
+      executed_at: new Date(legacy.settlementAt.getTime() - 2000),
+      executed_price: 100,
+      executed_quantity: 1,
+      pnl: 0,
+      createdAt: new Date(legacy.settlementAt.getTime() - 3000),
+    });
+    const blocked = await SettlementRun.create({
+      period_key: '2026-07-31',
+      trading_date: scenario.tradingDate,
+      trade_cutoff_at: scenario.cutoff,
+      price_dates: { nse: scenario.tradingDate, mcx: scenario.tradingDate },
+      status: 'blocked',
+      trigger: 'recovery',
+      attempts: 0,
+      started_at: legacy.settlementAt,
+      error: 'legacy reconciliation pending',
+      adopted_legacy_history: true,
+      history_run_id: legacy.legacyRunId,
+    });
+
+    const recovered = await settlementService.recoverIncompleteSettlements({
+      now: new Date('2026-08-03T04:30:00.000Z'),
+      applySettlementPrices: false,
+    });
+
+    expect(recovered).toMatchObject({ success: false, recovered: false, blocked: true });
+    const stillBlocked = await SettlementRun.findById(blocked._id).lean();
+    expect(stillBlocked.status).toBe('blocked');
+    expect(stillBlocked.verification.complete_position_universe_verified).toBe(false);
+    expect(stillBlocked.verification.legacy_exceptions).toEqual(expect.arrayContaining([
+      expect.objectContaining({ tradingsymbol: 'EXPIRED26MAYFUT' }),
+    ]));
+    expect(stillBlocked.verification.failures).toEqual(expect.arrayContaining([
+      expect.objectContaining({ type: 'legacy_unsettled_positions', count: 1 }),
+    ]));
+  });
+
+  test('legacy reconciliation releases its coordinator claim and owned fence after an unexpected audit failure', async () => {
+    const scenario = await seedScenario({ includeFlat: false, includePending: false, prefix: 'legacyretry' });
+    const legacy = await materializeLegacySettlement(scenario);
+    const blocked = await SettlementRun.create({
+      period_key: '2026-07-31',
+      trading_date: scenario.tradingDate,
+      trade_cutoff_at: scenario.cutoff,
+      price_dates: { nse: scenario.tradingDate, mcx: scenario.tradingDate },
+      status: 'blocked',
+      trigger: 'recovery',
+      attempts: 0,
+      started_at: legacy.settlementAt,
+      error: 'legacy reconciliation pending',
+      adopted_legacy_history: true,
+      history_run_id: legacy.legacyRunId,
+    });
+    await SettlementFence.create({
+      _id: 'global',
+      lock_owner: 'another-settlement-worker',
+      locked_until: new Date(Date.now() + (5 * 60 * 1000)),
+    });
+    const failureStartedAt = Date.now();
+
+    await expect(settlementService._private.reconcileBlockedLegacySettlement(blocked, {
+      now: new Date('2026-08-03T04:30:00.000Z'),
+      applySettlementPrices: false,
+    })).rejects.toMatchObject({ code: 'SETTLEMENT_IN_PROGRESS' });
+
+    const released = await SettlementRun.findById(blocked._id).lean();
+    expect(released.status).toBe('blocked');
+    expect(released.lock_owner).toBeNull();
+    expect(released.lease_expires_at.getTime()).toBeGreaterThanOrEqual(failureStartedAt);
+    expect(released.error).toContain('reconciliation failed unexpectedly');
+    expect(await SettlementFence.countDocuments({ lock_owner: 'another-settlement-worker' })).toBe(1);
   });
 
   test('a blocked earlier period fences writers and prevents creation of a later period', async () => {

@@ -42,6 +42,10 @@ const settlementRunSchema = new mongoose.Schema({
   stats: { type: mongoose.Schema.Types.Mixed, default: {} },
   verification: { type: mongoose.Schema.Types.Mixed, default: {} },
   adopted_legacy_history: { type: Boolean, default: false },
+  // Legacy ledgers used their own generated run identifier before durable
+  // SettlementRun records existed. Keep that immutable history identity rather
+  // than rewriting ledger rows during one-time adoption.
+  history_run_id: { type: mongoose.Schema.Types.ObjectId, default: null },
 }, { timestamps: true });
 
 settlementRunSchema.index({ status: 1, lease_expires_at: 1 });
