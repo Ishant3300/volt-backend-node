@@ -93,8 +93,77 @@ const processPendingOrders = async () => {
                         const freshTrade = await Trade.findById(trade._id).session(session);
                         if (!freshTrade || freshTrade.status !== 'pending') return;
 
-                        // Calculate realised P&L if this trade closes a position
+                        // Calculate realised P&L using FIFO (matches /trade/report PDF logic)
                         let realisedPnl = 0;
+
+                        // Fetch all previous completed trades chronologically for FIFO queue
+                        const prevTrades = await Trade.find({
+                            user_id: freshTrade.user_id,
+                            instrument_token: freshTrade.instrument_token,
+                            status: 'completed',
+                            deleted_at: null
+                        }).sort({ executed_at: 1 }).session(session);
+
+                        // Build FIFO queue of open lots (supports both long and short)
+                        const fifoQueue = [];
+                        let netQtyFromPrev = 0; // positive = long, negative = short
+
+                        for (const pt of prevTrades) {
+                            const isBuy = pt.transaction_type === 'BUY';
+                            const qty = pt.executed_quantity;
+                            const price = pt.executed_price;
+                            const prevNet = netQtyFromPrev;
+
+                            const isOpening = (isBuy && prevNet >= 0) || (!isBuy && prevNet <= 0);
+                            const isClosing = (isBuy && prevNet < 0) || (!isBuy && prevNet > 0);
+
+                            if (isOpening && !isClosing) {
+                                fifoQueue.push({ qty, price, side: isBuy ? 'BUY' : 'SELL' });
+                            } else if (isClosing) {
+                                let remaining = Math.min(qty, Math.abs(prevNet));
+                                while (remaining > 0 && fifoQueue.length > 0) {
+                                    const front = fifoQueue[0];
+                                    const matched = Math.min(remaining, front.qty);
+                                    front.qty -= matched;
+                                    remaining -= matched;
+                                    if (front.qty <= 0) fifoQueue.shift();
+                                }
+                                const excess = qty - Math.abs(prevNet);
+                                if (excess > 0) {
+                                    fifoQueue.push({ qty: excess, price, side: isBuy ? 'BUY' : 'SELL' });
+                                }
+                            }
+
+                            netQtyFromPrev += isBuy ? qty : -qty;
+                        }
+
+                        // Compute FIFO P&L for this closing trade
+                        if (freshTrade.transaction_type === 'SELL' && netQtyFromPrev > 0) {
+                            const closingQty = Math.min(freshTrade.quantity, netQtyFromPrev);
+                            let remaining = closingQty;
+                            while (remaining > 0 && fifoQueue.length > 0) {
+                                const front = fifoQueue[0];
+                                const matched = Math.min(remaining, front.qty);
+                                realisedPnl += (freshTrade.price - front.price) * matched;
+                                front.qty -= matched;
+                                remaining -= matched;
+                                if (front.qty <= 0) fifoQueue.shift();
+                            }
+                        } else if (freshTrade.transaction_type === 'BUY' && netQtyFromPrev < 0) {
+                            const closingQty = Math.min(freshTrade.quantity, Math.abs(netQtyFromPrev));
+                            let remaining = closingQty;
+                            while (remaining > 0 && fifoQueue.length > 0) {
+                                const front = fifoQueue[0];
+                                const matched = Math.min(remaining, front.qty);
+                                realisedPnl += (front.price - freshTrade.price) * matched;
+                                front.qty -= matched;
+                                remaining -= matched;
+                                if (front.qty <= 0) fifoQueue.shift();
+                            }
+                        }
+                        realisedPnl = Math.round(realisedPnl * 100) / 100;
+
+                        // Aggregate still needed for margin calculation and free margin check
                         const existingAgg = await Trade.aggregate([
                             {
                                 $match: {
@@ -112,43 +181,10 @@ const processPendingOrders = async () => {
                                     },
                                     total_sell_qty: {
                                         $sum: { $cond: [{ $eq: ['$transaction_type', 'SELL'] }, '$executed_quantity', 0] }
-                                    },
-                                    total_buy_value: {
-                                        $sum: {
-                                            $cond: [
-                                                { $eq: ['$transaction_type', 'BUY'] },
-                                                { $multiply: ['$executed_quantity', '$executed_price'] },
-                                                0
-                                            ]
-                                        }
-                                    },
-                                    total_sell_value: {
-                                        $sum: {
-                                            $cond: [
-                                                { $eq: ['$transaction_type', 'SELL'] },
-                                                { $multiply: ['$executed_quantity', '$executed_price'] },
-                                                0
-                                            ]
-                                        }
                                     }
                                 }
                             }
                         ]).session(session);
-
-                        if (existingAgg.length > 0) {
-                            const agg = existingAgg[0];
-                            const prevNetQty = agg.total_buy_qty - agg.total_sell_qty;
-                            const avgBuyPrice = agg.total_buy_qty > 0 ? agg.total_buy_value / agg.total_buy_qty : 0;
-                            const avgSellPrice = agg.total_sell_qty > 0 ? agg.total_sell_value / agg.total_sell_qty : 0;
-
-                            if (freshTrade.transaction_type === 'SELL' && prevNetQty > 0) {
-                                const closingQty = Math.min(freshTrade.quantity, prevNetQty);
-                                realisedPnl = (freshTrade.price - avgBuyPrice) * closingQty;
-                            } else if (freshTrade.transaction_type === 'BUY' && prevNetQty < 0) {
-                                const closingQty = Math.min(freshTrade.quantity, Math.abs(prevNetQty));
-                                realisedPnl = (avgSellPrice - freshTrade.price) * closingQty;
-                            }
-                        }
 
                         // ── Free margin check for opening LIMIT orders ──
                         const prevNetQtyCheck = existingAgg.length > 0 ? existingAgg[0].total_buy_qty - existingAgg[0].total_sell_qty : 0;
