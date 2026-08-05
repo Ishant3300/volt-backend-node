@@ -69,8 +69,10 @@ const getScriptQtyDetails = async (req, res) => {
         }
       }
 
-      // Also fetch ScriptQuantity for this exchange (global script-level limits)
+      // Also fetch ScriptQuantity for this exchange — scoped to the target user's own copies
       const scripts = await ScriptQuantity.find({
+        owner_id: targetUserId,
+        owner_type: 'User',
         exchange_name: ex.exchange_name,
         deleted_at: null
       }).lean();

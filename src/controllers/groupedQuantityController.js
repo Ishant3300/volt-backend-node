@@ -448,9 +448,12 @@ const bulkCreateScriptQuantity = async (req, res) => {
       return res.status(404).json({ success: false, message: `No instruments found for ${normalizedExchange}`, data: null });
     }
 
-    // If owner_id is provided, create/update for that specific owner
-    const baseFilter = { exchange_name: normalizedExchange, deleted_at: null };
-    if (owner_id) baseFilter.owner_id = owner_id;
+    // Determine effective owner: use provided owner_id/owner_type, or fall back to the
+    // calling admin so records always have a valid owner.
+    const effectiveOwnerId = owner_id || (req.admin ? req.admin.id : req.master?.id);
+    const effectiveOwnerType = owner_id ? (owner_type || 'Master') : (req.admin ? 'Admin' : 'Master');
+
+    const baseFilter = { exchange_name: normalizedExchange, owner_id: effectiveOwnerId, owner_type: effectiveOwnerType, deleted_at: null };
 
     const bulkOps = results.map(r => ({
       updateOne: {
@@ -462,7 +465,8 @@ const bulkCreateScriptQuantity = async (req, res) => {
             lot_size: r.lot_size || 1,
             max_qty: default_max_qty,
             brk_qty: default_brk_qty,
-            ...(owner_id ? { owner_id, owner_type: owner_type || 'Master' } : {}),
+            owner_id: effectiveOwnerId,
+            owner_type: effectiveOwnerType,
             created_at: new Date(),
           },
           $set: { updated_at: new Date(), deleted_at: null }
@@ -473,14 +477,26 @@ const bulkCreateScriptQuantity = async (req, res) => {
     const bulkResult = await ScriptQuantity.bulkWrite(bulkOps);
 
     // If updating a master's data, cascade to direct users
-    if (owner_id && owner_type === 'Master') {
+    if (effectiveOwnerType === 'Master') {
       const { cascadeToDirectUsers } = require('../services/scriptQuantityCopyService');
       for (const r of results) {
-        await cascadeToDirectUsers(owner_id, normalizedExchange, r._id, {
+        await cascadeToDirectUsers(effectiveOwnerId, normalizedExchange, r._id, {
           max_qty: default_max_qty,
           brk_qty: default_brk_qty,
           lot_size: r.lot_size || 1,
         });
+      }
+    }
+
+    // If Admin global bulk-create, cascade each script to all Masters and their users
+    if (effectiveOwnerType === 'Admin') {
+      const { cascadeNewScriptGlobally } = require('../services/scriptQuantityCopyService');
+      for (const r of results) {
+        await cascadeNewScriptGlobally(normalizedExchange, r._id, {
+          lot_size: r.lot_size || 1,
+          max_qty: default_max_qty,
+          brk_qty: default_brk_qty,
+        }, effectiveOwnerId);
       }
     }
 
@@ -515,13 +531,53 @@ const getScriptQuantityByExchange = async (req, res) => {
     // If owner_id is provided, filter to that specific master/user's ScriptQuantity
     if (owner_id) {
       filter.owner_id = owner_id;
+      const items = await ScriptQuantity.find(filter)
+        .limit(parseInt(limit)).skip((parseInt(page) - 1) * parseInt(limit)).sort({ script_name: 1 });
+      const count = await ScriptQuantity.countDocuments(filter);
+      return res.status(200).json({
+        success: true, data: { items: items.map(i => i.toJSON()), total: count, page: parseInt(page), pages: Math.ceil(count / parseInt(limit)) }
+      });
     }
 
-    const items = await ScriptQuantity.find(filter)
-      .limit(parseInt(limit)).skip((parseInt(page) - 1) * parseInt(limit)).sort({ script_name: 1 });
-    const count = await ScriptQuantity.countDocuments(filter);
+    // Admin/Master viewing global list: deduplicate by script_name, prefer Admin-owned records
+    // This avoids showing one entry per master/user for the same script
+    const allItems = await ScriptQuantity.find(filter).sort({ owner_type: 1, script_name: 1 }).lean();
+
+    // Deduplicate: keep one per script_name (prefer Admin > Master > User)
+    const seen = new Map();
+    for (const item of allItems) {
+      const key = item.script_name;
+      if (!seen.has(key)) {
+        seen.set(key, item);
+      } else {
+        // Prefer Admin-owned, then Master, then User
+        const existing = seen.get(key);
+        const priority = { 'Admin': 0, 'Master': 1, 'User': 2 };
+        if ((priority[item.owner_type] || 2) < (priority[existing.owner_type] || 2)) {
+          seen.set(key, item);
+        }
+      }
+    }
+
+    const uniqueItems = Array.from(seen.values())
+      .sort((a, b) => a.script_name.localeCompare(b.script_name));
+    
+    // Paginate
+    const total = uniqueItems.length;
+    const start = (parseInt(page) - 1) * parseInt(limit);
+    const paginatedItems = uniqueItems.slice(start, start + parseInt(limit));
+
+    // Transform to match toJSON format
+    const items = paginatedItems.map(item => {
+      const ret = { ...item };
+      ret.id = ret._id;
+      delete ret._id;
+      delete ret.__v;
+      return ret;
+    });
+
     res.status(200).json({
-      success: true, data: { items: items.map(i => i.toJSON()), total: count, page: parseInt(page), pages: Math.ceil(count / parseInt(limit)) }
+      success: true, data: { items, total, page: parseInt(page), pages: Math.ceil(total / parseInt(limit)) }
     });
   } catch (error) {
     res.status(500).json({ success: false, message: error.message, data: null });

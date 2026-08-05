@@ -189,9 +189,269 @@ async function cascadeToDirectUsers(masterId, exchangeName, scriptName, newValue
   }
 }
 
+/**
+ * Cascade a NEW script entry to all direct users of a master.
+ * Called when admin/master creates a new ScriptQuantity for a master.
+ * Upserts the record for each user so existing ones are updated, new ones are created.
+ * @param {string} masterId
+ * @param {string} exchangeName
+ * @param {string} scriptName
+ * @param {object} values - { lot_size, max_qty, brk_qty }
+ */
+async function cascadeNewScriptToUsers(masterId, exchangeName, scriptName, values) {
+  try {
+    const directUsers = await User.find({
+      master_id: masterId,
+      deleted_at: null,
+    }).select('_id').lean();
+
+    if (directUsers.length === 0) return;
+
+    const normalizedExchange = exchangeName.toUpperCase();
+    const now = new Date();
+
+    const bulkOps = directUsers.map(u => ({
+      updateOne: {
+        filter: {
+          owner_id: u._id,
+          owner_type: 'User',
+          exchange_name: normalizedExchange,
+          script_name: scriptName,
+          deleted_at: null,
+        },
+        update: {
+          $set: {
+            lot_size: values.lot_size,
+            max_qty: values.max_qty,
+            brk_qty: values.brk_qty,
+            updated_at: now,
+            deleted_at: null,
+          },
+          $setOnInsert: {
+            owner_id: u._id,
+            owner_type: 'User',
+            exchange_name: normalizedExchange,
+            script_name: scriptName,
+            created_at: now,
+          },
+        },
+        upsert: true,
+      },
+    }));
+
+    const result = await ScriptQuantity.bulkWrite(bulkOps);
+    console.log(`📋 [ScriptQtyCopy] Cascaded new script ${scriptName}/${normalizedExchange} to ${directUsers.length} users of Master ${masterId} (upserted: ${result.upsertedCount}, modified: ${result.modifiedCount})`);
+  } catch (e) {
+    console.error(`❌ [ScriptQtyCopy] Error cascading new script to users:`, e.message);
+  }
+}
+
+/**
+ * Cascade a soft-delete to all direct users of a master for a specific script.
+ * Called when admin/master deletes a ScriptQuantity on a master.
+ * @param {string} masterId
+ * @param {string} exchangeName
+ * @param {string} scriptName
+ */
+async function cascadeDeleteScriptToUsers(masterId, exchangeName, scriptName) {
+  try {
+    const directUsers = await User.find({
+      master_id: masterId,
+      deleted_at: null,
+    }).select('_id').lean();
+
+    if (directUsers.length === 0) return;
+
+    const userIds = directUsers.map(u => u._id);
+    const normalizedExchange = exchangeName.toUpperCase();
+
+    const result = await ScriptQuantity.updateMany(
+      {
+        owner_id: { $in: userIds },
+        owner_type: 'User',
+        exchange_name: normalizedExchange,
+        script_name: scriptName,
+        deleted_at: null,
+      },
+      { $set: { deleted_at: new Date() } }
+    );
+
+    console.log(`📋 [ScriptQtyCopy] Cascade-deleted ${scriptName}/${normalizedExchange} for ${result.modifiedCount}/${directUsers.length} users of Master ${masterId}`);
+  } catch (e) {
+    console.error(`❌ [ScriptQtyCopy] Error cascading delete to users:`, e.message);
+  }
+}
+
+/**
+ * Cascade a NEW script from Admin (global) to all Masters and their direct users.
+ * Called when admin creates a ScriptQuantity at the global level.
+ * @param {string} exchangeName
+ * @param {string} scriptName
+ * @param {object} values - { lot_size, max_qty, brk_qty }
+ */
+/**
+ * Cascade a NEW script from Admin to their own Masters and those Masters' users.
+ * Called when admin creates/updates a ScriptQuantity at their level.
+ * @param {string} exchangeName
+ * @param {string} scriptName
+ * @param {object} values - { lot_size, max_qty, brk_qty }
+ * @param {string} [adminId] - The admin's ID to scope cascade to their hierarchy only
+ */
+async function cascadeNewScriptGlobally(exchangeName, scriptName, values, adminId) {
+  try {
+    const Master = require('../models/Master');
+    
+    // If adminId is provided, only cascade to that admin's masters
+    const masterFilter = { deleted_at: null };
+    if (adminId) {
+      masterFilter.admin_id = adminId;
+    }
+    const allMasters = await Master.find(masterFilter).select('_id').lean();
+
+    if (allMasters.length === 0) return;
+
+    const normalizedExchange = exchangeName.toUpperCase();
+    const now = new Date();
+
+    const masterIds = allMasters.map(m => m._id);
+
+    // First: updateMany to update ALL existing master records (handles duplicates)
+    await ScriptQuantity.updateMany(
+      {
+        owner_id: { $in: masterIds },
+        owner_type: 'Master',
+        exchange_name: normalizedExchange,
+        script_name: scriptName,
+        deleted_at: null,
+      },
+      { $set: { lot_size: values.lot_size, max_qty: values.max_qty, brk_qty: values.brk_qty, updated_at: now } }
+    );
+
+    // Then: upsert for masters who don't have a record yet
+    const masterBulkOps = allMasters.map(m => ({
+      updateOne: {
+        filter: {
+          owner_id: m._id,
+          owner_type: 'Master',
+          exchange_name: normalizedExchange,
+          script_name: scriptName,
+          deleted_at: null,
+        },
+        update: {
+          $set: { lot_size: values.lot_size, max_qty: values.max_qty, brk_qty: values.brk_qty, updated_at: now, deleted_at: null },
+          $setOnInsert: { owner_id: m._id, owner_type: 'Master', exchange_name: normalizedExchange, script_name: scriptName, created_at: now },
+        },
+        upsert: true,
+      },
+    }));
+    await ScriptQuantity.bulkWrite(masterBulkOps);
+
+    // Same for users under these masters
+    const allUsers = await User.find({ master_id: { $in: masterIds }, deleted_at: null }).select('_id').lean();
+
+    if (allUsers.length > 0) {
+      const userIds = allUsers.map(u => u._id);
+
+      // Update ALL existing user records for this script (handles duplicates)
+      await ScriptQuantity.updateMany(
+        {
+          owner_id: { $in: userIds },
+          owner_type: 'User',
+          exchange_name: normalizedExchange,
+          script_name: scriptName,
+          deleted_at: null,
+        },
+        { $set: { lot_size: values.lot_size, max_qty: values.max_qty, brk_qty: values.brk_qty, updated_at: now } }
+      );
+
+      // Upsert for users who don't have a record yet
+      const userBulkOps = allUsers.map(u => ({
+        updateOne: {
+          filter: {
+            owner_id: u._id,
+            owner_type: 'User',
+            exchange_name: normalizedExchange,
+            script_name: scriptName,
+            deleted_at: null,
+          },
+          update: {
+            $set: { lot_size: values.lot_size, max_qty: values.max_qty, brk_qty: values.brk_qty, updated_at: now, deleted_at: null },
+            $setOnInsert: { owner_id: u._id, owner_type: 'User', exchange_name: normalizedExchange, script_name: scriptName, created_at: now },
+          },
+          upsert: true,
+        },
+      }));
+      await ScriptQuantity.bulkWrite(userBulkOps);
+    }
+
+    console.log(`📋 [ScriptQtyCopy] Globally cascaded new script ${scriptName}/${normalizedExchange} to ${allMasters.length} masters and ${allUsers.length} users`);
+  } catch (e) {
+    console.error(`❌ [ScriptQtyCopy] Error globally cascading new script:`, e.message);
+  }
+}
+
+/**
+ * Cascade a soft-delete to all Masters and their users for a specific script.
+ * Called when admin deletes a global-level ScriptQuantity.
+ * @param {string} exchangeName
+ * @param {string} scriptName
+ * @param {string} [adminId] - The admin's ID to scope cascade to their hierarchy only
+ */
+async function cascadeDeleteScriptGlobally(exchangeName, scriptName, adminId) {
+  try {
+    const Master = require('../models/Master');
+    const normalizedExchange = exchangeName.toUpperCase();
+    const now = new Date();
+
+    // Find only this admin's masters
+    const masterFilter = { deleted_at: null };
+    if (adminId) {
+      masterFilter.admin_id = adminId;
+    }
+    const masters = await Master.find(masterFilter).select('_id').lean();
+    const masterIds = masters.map(m => m._id);
+
+    // Delete for masters
+    await ScriptQuantity.updateMany(
+      {
+        owner_id: { $in: masterIds },
+        owner_type: 'Master',
+        exchange_name: normalizedExchange,
+        script_name: scriptName,
+        deleted_at: null,
+      },
+      { $set: { deleted_at: now } }
+    );
+
+    // Delete for users under those masters
+    const allUsers = await User.find({ master_id: { $in: masterIds }, deleted_at: null }).select('_id').lean();
+    if (allUsers.length > 0) {
+      const userIds = allUsers.map(u => u._id);
+      await ScriptQuantity.updateMany(
+        {
+          owner_id: { $in: userIds },
+          owner_type: 'User',
+          exchange_name: normalizedExchange,
+          script_name: scriptName,
+          deleted_at: null,
+        },
+        { $set: { deleted_at: now } }
+      );
+    }
+
+    console.log(`📋 [ScriptQtyCopy] Deleted script ${scriptName}/${normalizedExchange} for ${masterIds.length} masters and ${allUsers.length} users`);
+  } catch (e) {
+    console.error(`❌ [ScriptQtyCopy] Error cascading delete:`, e.message);
+  }
+}
+
 module.exports = {
   copyFromGroupedQuantityToMaster,
   copyFromMasterToSubMaster,
   copyFromMasterToUser,
   cascadeToDirectUsers,
+  cascadeNewScriptToUsers,
+  cascadeDeleteScriptToUsers,
+  cascadeNewScriptGlobally,
+  cascadeDeleteScriptGlobally,
 };
