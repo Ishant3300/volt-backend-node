@@ -400,4 +400,36 @@ const { startSettlement, getSettlementStatus } = require('../controllers/settlem
 router.post('/settlement/start', authenticateAdmin, startSettlement);
 router.get('/settlement/status', authenticateAdmin, getSettlementStatus);
 
+// ==================== ADMIN PROFILE ROUTE ====================
+router.get('/profile', authenticateAdmin, async (req, res) => {
+  try {
+    const Admin = require('../models/Admin');
+    const Server = require('../models/Server');
+    const admin = await Admin.findById(req.admin.id).lean();
+    if (!admin) {
+      return res.status(404).json({ success: false, message: 'Admin not found', data: null });
+    }
+
+    // Get server info if admin has one assigned
+    let serverName = null;
+    if (admin.server_id) {
+      const server = await Server.findById(admin.server_id).lean();
+      serverName = server?.name || admin.server_id.toString();
+    }
+
+    res.json({
+      success: true,
+      data: {
+        id: admin._id,
+        username: admin.username,
+        server_id: serverName || 'N/A',
+        last_login: admin.last_login || null,
+        created_at: admin.createdAt,
+      }
+    });
+  } catch (e) {
+    res.status(500).json({ success: false, message: e.message, data: null });
+  }
+});
+
 module.exports = router;
