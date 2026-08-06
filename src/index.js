@@ -15,6 +15,10 @@ const priceQueueService = require('./services/priceQueueService');
 const firebaseService = require('./services/firebaseService');
 
 const app = express();
+
+// Trust proxy so req.ip returns real client IP behind nginx/load balancer
+app.set('trust proxy', true);
+
 const server = http.createServer(app);
 
 // ── Security Middleware ──────────────────────────────────────────────────────
@@ -234,45 +238,55 @@ const startServer = async () => {
     throw error;
   }
 
+  const bgDisabled = process.env.DISABLE_BG_SERVICES === 'true';
+
   // Only now may retained BullMQ jobs mutate trades. A failed/blocked durable
   // run remains visible to beginTradeWrite() and causes jobs to retry safely.
-  if (redisService.isAvailable()) {
+  if (!bgDisabled && redisService.isAvailable()) {
     await priceQueueService.init();
     console.log('🚀 Redis Order Book + BullMQ Price Queue active');
   }
 
   // Initialize margin square-off monitoring and background jobs.
-  const marginSquareOffService = require('./services/marginSquareOffService');
-  await marginSquareOffService.init(livePriceService);
-  await cronService.init();
-
-  // Establish Kite authentication prerequisites before outbound live-price setup.
-  console.log('\n🔐 Checking Kite authentication...');
-  try {
-    const status = await kiteAuthService.checkTokenStatus();
-
-    if (status.valid) {
-      console.log(`✅ Kite already authenticated (valid for ${status.hoursLeft} hours)`);
-    } else {
-      console.log(`⚠️  Kite not authenticated: ${status.reason}`);
-      console.log('🤖 Attempting auto-login...\n');
-
-      const loginResult = await kiteAuthService.performAutomatedLogin();
-      console.log({ loginResult });
-      if (loginResult.success) {
-        console.log('✅ Kite auto-login successful!');
-      } else {
-        console.log('❌ Kite auto-login failed:', loginResult.error);
-        console.log('💡 You can manually login at: http://localhost:' + PORT + '/api/kite/login');
-      }
-    }
-  } catch (error) {
-    console.error('❌ Error during Kite authentication:', error.message);
-    console.log('💡 You can manually login at: http://localhost:' + PORT + '/api/kite/login');
+  if (!bgDisabled) {
+    const marginSquareOffService = require('./services/marginSquareOffService');
+    await marginSquareOffService.init(livePriceService);
+    await cronService.init();
+  } else {
+    console.log('⏭️  Background services DISABLED (DISABLE_BG_SERVICES=true)');
   }
 
-  await livePriceService._connectToKite();
-  await livePriceService._updateKiteSubscription();
+  // Establish Kite authentication prerequisites before outbound live-price setup.
+  if (!bgDisabled) {
+    console.log('\n🔐 Checking Kite authentication...');
+    try {
+      const status = await kiteAuthService.checkTokenStatus();
+
+      if (status.valid) {
+        console.log(`✅ Kite already authenticated (valid for ${status.hoursLeft} hours)`);
+      } else {
+        console.log(`⚠️  Kite not authenticated: ${status.reason}`);
+        console.log('🤖 Attempting auto-login...\n');
+
+        const loginResult = await kiteAuthService.performAutomatedLogin();
+        console.log({ loginResult });
+        if (loginResult.success) {
+          console.log('✅ Kite auto-login successful!');
+        } else {
+          console.log('❌ Kite auto-login failed:', loginResult.error);
+          console.log('💡 You can manually login at: http://localhost:' + PORT + '/api/kite/login');
+        }
+      }
+    } catch (error) {
+      console.error('❌ Error during Kite authentication:', error.message);
+      console.log('💡 You can manually login at: http://localhost:' + PORT + '/api/kite/login');
+    }
+
+    await livePriceService._connectToKite();
+    await livePriceService._updateKiteSubscription();
+  } else {
+    console.log('⏭️  Kite auth & live prices SKIPPED (local dev mode)');
+  }
 
   server.listen(PORT, () => {
     console.log(`Server is running on port ${PORT}`);

@@ -5,7 +5,18 @@ const Admin = require('../models/Admin');
 const Master = require('../models/Master');
 const LoginHistory = require('../models/LoginHistory');
 
-const _getClientIp = (req) => req.ip || req.connection?.remoteAddress || req.socket?.remoteAddress || req.connection?.socket?.remoteAddress || null;
+const _getClientIp = (req) => {
+  // X-Forwarded-For can be comma-separated list; first entry is the real client
+  const forwarded = req.headers['x-forwarded-for'];
+  let ip = forwarded
+    ? forwarded.split(',')[0].trim()
+    : req.ip || req.connection?.remoteAddress || req.socket?.remoteAddress || req.connection?.socket?.remoteAddress || null;
+  // Strip IPv4-mapped IPv6 prefix (::ffff:127.0.0.1 → 127.0.0.1)
+  if (ip && ip.startsWith('::ffff:')) {
+    ip = ip.slice(7);
+  }
+  return ip;
+};
 
 const _logLogin = async (req, userId, userModel, username, name) => {
   try {
@@ -83,7 +94,7 @@ const userLogin = async (req, res) => {
     // Update active_token, last_login, and IP address
     user.active_token = token;
     user.last_login = new Date();
-    user.ip_address = req.ip || req.connection.remoteAddress || req.socket.remoteAddress || (req.connection.socket ? req.connection.socket.remoteAddress : null);
+    user.ip_address = _getClientIp(req);
     await user.save();
 
     await _logLogin(req, user._id, 'User', user.username, user.name);
@@ -306,7 +317,7 @@ const masterLogin = async (req, res) => {
     // Update active_token, last_login, and IP address
     master.active_token = token;
     master.last_login = new Date();
-    master.ip_address = req.ip || req.connection.remoteAddress || req.socket.remoteAddress || (req.connection.socket ? req.connection.socket.remoteAddress : null);
+    master.ip_address = _getClientIp(req);
     await master.save();
 
     await _logLogin(req, master._id, 'Master', master.username, master.name);
@@ -476,7 +487,7 @@ const universalLogin = async (req, res) => {
     userAccount.active_token = token;
     if (roleType !== 'admin') {
       userAccount.last_login = new Date();
-      userAccount.ip_address = req.ip || req.connection.remoteAddress || req.socket.remoteAddress || (req.connection.socket ? req.connection.socket.remoteAddress : null);
+      userAccount.ip_address = _getClientIp(req);
     }
 
     await userAccount.save();
