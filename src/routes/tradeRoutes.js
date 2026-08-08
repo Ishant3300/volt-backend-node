@@ -30,9 +30,6 @@ router.post('/metrics', tradeController.saveClientMetrics);
 // Get positions for frontend metrics calculation
 router.get('/positions', tradeController.getPositions);
 
-// Get margin rules for frontend metrics calculation
-router.get('/margins', tradeController.getMargins);
-
 // Get brokerage rules for frontend brokerage calculation
 router.get('/brokerage-rules', tradeController.getBrokerageRules);
 

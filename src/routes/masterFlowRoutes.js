@@ -54,8 +54,32 @@ const { getPnlSummary } = require('../controllers/pnlSummaryController');
 const { getWeeklyAdminReport } = require('../controllers/weeklyAdminController');
 const { getSettlementReport } = require('../controllers/settlementController');
 
+// Category trade-wallet funding (Task 12 / Requirements 5.1–5.7)
+const {
+  assign: walletAssign,
+  withdraw: walletWithdraw,
+  getWallet,
+} = require('../controllers/walletController');
+
 // All routes require admin or master authentication
 router.use(authenticateAdminOrMaster);
+
+// ============================================
+// Wallet Funding Routes (master ↔ direct child)
+// ============================================
+// authenticateAdminOrMaster (applied above) sets req.master OR req.admin; the
+// walletController resolves the actor and enforces direct-child hierarchy for
+// masters (admin may act on anyone). walletService owns the Mongo transaction
+// + Transaction audit, so no session handling is needed here.
+
+// Assign (fund) a direct child's category wallet from the master's own pool
+router.post('/wallet/assign', walletAssign);
+
+// Withdraw from a direct child's category wallet back to the master's pool
+router.post('/wallet/withdraw', walletWithdraw);
+
+// Read per-category available balances (self or a direct child)
+router.get('/wallet', getWallet);
 
 // ============================================
 // Child Master Management Routes

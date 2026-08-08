@@ -9,6 +9,8 @@ const redisService = require('./redisService');
 const { snapshotWeeklySummary } = require('./weeklySummaryService');
 const livePriceService = require('./livePriceService');
 const { beginTradeWrite } = require('./tradeWriteFenceService');
+const walletService = require('./walletService');
+const { categoryForSegment } = require('../utils/walletCategory');
 
 class CronService {
     constructor() {
@@ -351,7 +353,7 @@ class CronService {
             const expiredInstruments = await KiteInstrument.find({
                 expiry: { $gte: today, $lt: tomorrow },
                 deleted_at: null,
-            }).select('instrument_token tradingsymbol exchange last_price').lean();
+            }).select('instrument_token tradingsymbol exchange last_price segment').lean();
 
             if (expiredInstruments.length === 0) {
                 console.log('   No instruments expiring today.');
@@ -363,7 +365,7 @@ class CronService {
             for (const instrument of expiredInstruments) {
                 const token = instrument.instrument_token.toString();
                 const ltp = metricsEngine._ltpMap?.get(token) || instrument.last_price;
-                priceMap[token] = { price: ltp, symbol: instrument.tradingsymbol, exchange: instrument.exchange };
+                priceMap[token] = { price: ltp, symbol: instrument.tradingsymbol, exchange: instrument.exchange, segment: instrument.segment };
             }
 
             const openPositions = await Trade.aggregate([
@@ -397,10 +399,26 @@ class CronService {
                             { $group: {
                                 _id: null,
                                 net_qty: { $sum: { $cond: [{ $eq: ['$transaction_type', 'BUY'] }, '$executed_quantity', { $multiply: ['$executed_quantity', -1] }] } },
+                                total_buy_qty: { $sum: { $cond: [{ $eq: ['$transaction_type', 'BUY'] }, '$executed_quantity', 0] } },
+                                total_sell_qty: { $sum: { $cond: [{ $eq: ['$transaction_type', 'SELL'] }, '$executed_quantity', 0] } },
+                                total_buy_value: { $sum: { $cond: [{ $eq: ['$transaction_type', 'BUY'] }, { $multiply: ['$executed_quantity', '$executed_price'] }, 0] } },
+                                total_sell_value: { $sum: { $cond: [{ $eq: ['$transaction_type', 'SELL'] }, { $multiply: ['$executed_quantity', '$executed_price'] }, 0] } },
                             }},
                         ]).session(session);
                         const netQty = Number(freshPosition[0]?.net_qty || 0);
                         if (netQty === 0) return;
+
+                        // Requirement 3.2 / 7.5: this path closes at LTP with pnl:0 and does
+                        // not carry an avg entry price, so derive it from the trade legs to
+                        // release the ENTRY notional (independent of the exit/LTP price).
+                        const buyQty = Number(freshPosition[0]?.total_buy_qty || 0);
+                        const sellQty = Number(freshPosition[0]?.total_sell_qty || 0);
+                        const buyVal = Number(freshPosition[0]?.total_buy_value || 0);
+                        const sellVal = Number(freshPosition[0]?.total_sell_value || 0);
+                        const avgBuy = buyQty > 0 ? buyVal / buyQty : 0;
+                        const avgSell = sellQty > 0 ? sellVal / sellQty : 0;
+                        const avgEntry = netQty > 0 ? avgBuy : avgSell;
+                        const releaseCategory = categoryForSegment(instData.segment || instData.exchange || '');
 
                         const user = await User.findById(userId).select('master_id admin_id').session(session).lean();
                         if (!user) throw new Error(`User ${userId} not found`);
@@ -426,6 +444,14 @@ class CronService {
                             pnl: 0,
                             remarks: `Auto square-off: instrument expired (${instData.symbol})`,
                         }], { session });
+
+                        // Requirement 3.2 / 7.5: release the closed position's ENTRY notional
+                        // back to its category wallet inside this same transaction, so the
+                        // release commits atomically with the close trade (keeps pnl:0).
+                        if (absQty > 0 && avgEntry > 0) {
+                            await walletService.release('User', userId, releaseCategory, absQty * avgEntry, session);
+                        }
+
                         if (options.faultInjector) {
                             await options.faultInjector({
                                 phase: 'before_final_lease_proof',

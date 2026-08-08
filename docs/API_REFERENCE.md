@@ -14,7 +14,6 @@
 2. [Admin — User Management](#2-admin--user-management)
 3. [Admin — Grouped Quantities](#3-admin--grouped-quantities)
 4. [Admin — Script Quantities](#4-admin--script-quantities)
-5. [Admin — Trade Margins](#5-admin--trade-margins)
 6. [Admin — Brokerage Settings](#6-admin--brokerage-settings)
 7. [Admin — Announcements](#7-admin--announcements)
 8. [Admin — Fresh Stoploss Limits](#8-admin--fresh-stoploss-limits)
@@ -184,6 +183,34 @@ Debit from a user's balance. Auth: Admin.
 { "amount": 5000, "note": "Penalty deduction" }
 ```
 
+### Trade Wallet — Funding (admin grant/remove)
+
+Per-category wallet pools (`NSE`, `MCX`, `GLOBAL`). Admin is the root of funds: assign grants (credit only, no debit source) and withdraw removes funds. Auth: Admin. `target_type` is `User` or `Master`.
+
+### POST `/api/admin/wallet/assign`
+Grant funds to any user/master's category wallet.
+
+```json
+// Request
+{ "target_id": "6a5d...", "target_type": "Master", "category": "MCX", "amount": 100000 }
+// Response
+{ "success": true, "message": "Assigned ₹100000 to MCX wallet", "data": { "owner_type": "Master", "owner_id": "6a5d...", "wallet": { "NSE": 0, "MCX": 100000, "GLOBAL": 0 } } }
+```
+
+### POST `/api/admin/wallet/withdraw`
+Remove funds from any user/master's category wallet. Rejected 400 if the target pool cannot cover it. Body shape identical to assign.
+
+### GET `/api/admin/wallet?owner_id=&owner_type=`
+Read per-category available balances for any owner.
+
+### GET `/api/admin/wallet/reconcile?owner_id=&owner_type=`
+Drift audit: recomputes blocked margin from the owner's open positions and reports per-category `{ available, blocked, total }` (`available + blocked` reconstructs the funded amount).
+
+```json
+// Response
+{ "success": true, "data": { "ownerModel": "User", "ownerId": "6a5d...", "categories": { "NSE": { "available": 75000, "blocked": 25000, "total": 100000 }, "MCX": { "available": 0, "blocked": 0, "total": 0 }, "GLOBAL": { "available": 0, "blocked": 0, "total": 0 } } } }
+```
+
 ---
 
 ## 3. Admin — Grouped Quantities
@@ -258,46 +285,6 @@ Update a script quantity rule.
 
 ### DELETE `/api/admin/script-quantities/:id`
 Delete a script quantity rule.
-
----
-
-## 5. Admin — Trade Margins
-
-Per-instrument margin requirements. Auth: Admin/Master.
-
-### POST `/api/admin/trade-margins`
-Create a trade margin rule.
-
-```json
-// Request
-{ "exchange_name": "NFO-FUT", "raw_name": "NIFTY", "trade_margin": 50000, "amount_type": "FIXED" }
-```
-
-### POST `/api/admin/trade-margins/bulk-create`
-Bulk create trade margin rules.
-
-### GET `/api/admin/trade-margins`
-List all trade margins.
-
-### GET `/api/admin/trade-margins/exchange/:exchange_name`
-Get trade margins for a specific exchange.
-
-### GET `/api/admin/trade-margins/:id`
-Get single trade margin by ID.
-
-### PUT `/api/admin/trade-margins/bulk-update`
-Bulk update multiple trade margins at once.
-
-```json
-// Request
-{ "ids": ["id1", "id2"], "trade_margin": 75000, "amount_type": "FIXED" }
-```
-
-### PUT `/api/admin/trade-margins/:id`
-Update a single trade margin rule.
-
-### DELETE `/api/admin/trade-margins/:id`
-Delete a trade margin rule.
 
 ---
 
@@ -613,6 +600,31 @@ Send a message to a user.
 ### DELETE `/api/master/users/:id`
 Soft-delete a user.
 
+### Trade Wallet — Funding (master ↔ direct child)
+
+Per-category wallet pools (`NSE`, `MCX`, `GLOBAL`). A master funds/withdraws only a **direct child** it owns (403 otherwise); the master's own same-category pool is debited on assign and credited on withdraw (a transfer). Auth: Admin/Master.
+
+### POST `/api/master/wallet/assign`
+Assign (fund) a direct child's category wallet from the master's own pool. Rejected 400 if the master's pool cannot cover it.
+
+```json
+// Request
+{ "target_id": "6a5d...", "target_type": "User", "category": "NSE", "amount": 25000 }
+// Response
+{ "success": true, "message": "Assigned ₹25000 to NSE wallet", "data": { "owner_type": "User", "owner_id": "6a5d...", "wallet": { "NSE": 25000, "MCX": 0, "GLOBAL": 0 } } }
+```
+
+### POST `/api/master/wallet/withdraw`
+Withdraw from a direct child's category wallet back to the master's pool. Rejected 400 if the child's pool cannot cover it. Body shape identical to assign.
+
+### GET `/api/master/wallet?owner_id=&owner_type=`
+Read per-category available balances. A master may read its own wallet or a direct child's (403 otherwise).
+
+```json
+// Response
+{ "success": true, "data": { "owner_type": "User", "owner_id": "6a5d...", "wallet": { "NSE": 25000, "MCX": 0, "GLOBAL": 0 } } }
+```
+
 ---
 
 ## 14. Master Flow — Trades & Positions
@@ -775,9 +787,6 @@ Save client-computed metrics to DB (called by Flutter periodically).
 
 ### GET `/api/trade/positions`
 Get all positions for the authenticated user (includes carry_forward trades for position calculation).
-
-### GET `/api/trade/margins`
-Get margin rules applicable to the user.
 
 ### GET `/api/trade/brokerage-rules`
 Get brokerage rules applicable to the user.
@@ -1097,7 +1106,6 @@ Bidirectional WebSocket connection for Flutter clients.
 | Admin — Users | 7 |
 | Admin — Grouped Quantities | 9 |
 | Admin — Script Quantities | 7 |
-| Admin — Trade Margins | 8 |
 | Admin — Brokerage Settings | 8 |
 | Admin — Announcements | 3 |
 | Admin — Fresh Stoploss | 5 |
@@ -1109,7 +1117,7 @@ Bidirectional WebSocket connection for Flutter clients.
 | Master Flow — Trades/Positions | 12 |
 | Master Flow — Reports | 3 |
 | Masters (CRUD) | 15 |
-| Trading | 16 |
+| Trading | 15 |
 | Kite Connect | 18 |
 | Watchlist | 3 |
 | User Routes | 2 |

@@ -20,12 +20,6 @@ const {
   getScriptQuantityById,
   updateScriptQuantity,
   deleteScriptQuantity,
-  // Trade Margin
-  createTradeMargin,
-  getAllTradeMargins,
-  getTradeMarginById,
-  updateTradeMargin,
-  deleteTradeMargin,
   // Brokerage Settings
   createBrokerageSettings,
   getAllBrokerageSettings,
@@ -33,8 +27,16 @@ const {
   updateBrokerageSettings,
   deleteBrokerageSettings
 } = require('../controllers/adminController');
-const { getLotNamesByExchange, getUniqueRawNamesBySegment, bulkCreateGroup, getGroupInstruments, bulkCreateBrokerage, getBrokerageByExchange, bulkCreateTradeMargin, getTradeMarginByExchange, bulkCreateScriptQuantity, getScriptQuantityByExchange } = require('../controllers/groupedQuantityController');
+const { getLotNamesByExchange, getUniqueRawNamesBySegment, bulkCreateGroup, getGroupInstruments, bulkCreateBrokerage, getBrokerageByExchange, bulkCreateScriptQuantity, getScriptQuantityByExchange } = require('../controllers/groupedQuantityController');
 const { authenticateAdmin, authenticateAdminOrMaster, authenticateMaster, authenticateAny } = require('../middlewares/auth');
+
+// Category trade-wallet funding (Task 12 / Requirements 5.1–5.7)
+const {
+  assign: walletAssign,
+  withdraw: walletWithdraw,
+  getWallet: walletGet,
+  reconcile: walletReconcile,
+} = require('../controllers/walletController');
 
 // All routes require admin authentication
 
@@ -47,6 +49,16 @@ router.put('/users/:id', authenticateAdminOrMaster, updateUser);
 router.delete('/users/:id', authenticateMaster, deleteUser);
 router.post('/users/:id/credit', authenticateAdmin, creditUserByAdmin);
 router.post('/users/:id/debit', authenticateAdmin, debitUserByAdmin);
+
+// ==================== WALLET FUNDING ROUTES (admin grant/remove) ====================
+// Admin is the root of funds: assign is a grant (credit only, no debit source),
+// withdraw removes funds from the target. The walletController resolves req.admin
+// as the actor; walletService owns the Mongo transaction + Transaction audit.
+router.post('/wallet/assign', authenticateAdmin, walletAssign);
+router.post('/wallet/withdraw', authenticateAdmin, walletWithdraw);
+router.get('/wallet', authenticateAdmin, walletGet);
+// Drift audit: per-category { available, blocked, total } from open positions
+router.get('/wallet/reconcile', authenticateAdmin, walletReconcile);
 
 // Grouped Quantity CRUD operations
 router.post('/grouped-quantities', authenticateAdmin, createGroupedQuantity);
@@ -67,35 +79,6 @@ router.get('/script-quantities', authenticateAdminOrMaster, getAllScriptQuantiti
 router.get('/script-quantities/:id', authenticateAdminOrMaster, getScriptQuantityById);
 router.put('/script-quantities/:id', authenticateAdminOrMaster, updateScriptQuantity);
 router.delete('/script-quantities/:id', authenticateAdminOrMaster, deleteScriptQuantity);
-
-// Trade Margin CRUD operations
-router.post('/trade-margins/bulk-create', authenticateAdminOrMaster, bulkCreateTradeMargin);
-router.get('/trade-margins/exchange/:exchange_name', authenticateAdminOrMaster, getTradeMarginByExchange);
-router.post('/trade-margins', authenticateAdminOrMaster, createTradeMargin);
-router.get('/trade-margins', authenticateAdminOrMaster, getAllTradeMargins);
-router.get('/trade-margins/:id', authenticateAdminOrMaster, getTradeMarginById);
-// Bulk update trade margins (update multiple IDs with same value)
-router.put('/trade-margins/bulk-update', authenticateAdminOrMaster, async (req, res) => {
-  try {
-    const { ids, trade_margin, amount_type } = req.body;
-    if (!ids || !Array.isArray(ids) || ids.length === 0 || trade_margin === undefined) {
-      return res.status(400).json({ success: false, message: 'ids array and trade_margin are required', data: null });
-    }
-    const TradeMargin = require('../models/TradeMargin');
-    const updateFields = { trade_margin };
-    if (amount_type) updateFields.amount_type = amount_type;
-    const result = await TradeMargin.updateMany({ _id: { $in: ids }, deleted_at: null }, { $set: updateFields });
-
-    // Reload metricsEngine rules so margin calculations use the new values immediately
-    try { const me = require('../services/metricsEngine'); me.reloadRules(); } catch (_) {}
-
-    res.json({ success: true, message: `Updated ${result.modifiedCount} trade margin(s)`, data: { modified: result.modifiedCount } });
-  } catch (e) {
-    res.status(500).json({ success: false, message: e.message, data: null });
-  }
-});
-router.put('/trade-margins/:id', authenticateAdminOrMaster, updateTradeMargin);
-router.delete('/trade-margins/:id', authenticateAdminOrMaster, deleteTradeMargin);
 
 // Brokerage Settings CRUD operations
 router.post('/brokerage-settings/bulk-create', authenticateAdminOrMaster, bulkCreateBrokerage);

@@ -19,7 +19,7 @@ const transactionSchema = new mongoose.Schema({
     type: {
         type: String,
         required: true,
-        enum: ['CREDIT', 'DEBIT', 'BUY_TRADE', 'SELL_TRADE', 'BUY', 'SELL', 'REFUND', 'FEE', 'DEPOSIT', 'WITHDRAWAL', 'TRANSFER', 'CHARGE', 'DIVIDEND', 'INTEREST', 'BONUS', 'ADJUSTMENT']
+        enum: ['CREDIT', 'DEBIT', 'BUY_TRADE', 'SELL_TRADE', 'BUY', 'SELL', 'REFUND', 'FEE', 'DEPOSIT', 'WITHDRAWAL', 'TRANSFER', 'CHARGE', 'DIVIDEND', 'INTEREST', 'BONUS', 'ADJUSTMENT', 'WALLET_ASSIGN', 'WALLET_WITHDRAW']
     },
     status: {
         type: String,

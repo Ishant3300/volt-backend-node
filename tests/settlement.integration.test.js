@@ -37,7 +37,6 @@ function resetProcessCaches() {
   metricsEngine._bidMap.clear();
   metricsEngine._askMap.clear();
   metricsEngine._brokerageRules = [];
-  metricsEngine._marginRules = [];
   metricsEngine._kiteMap = {};
   metricsEngine._masterParentMap = {};
   metricsEngine._masterChildrenMap = {};
@@ -88,6 +87,21 @@ async function seedScenario(options = {}) {
     exchanges_allowed: ['NFO-FUT', 'MCX-FUT'],
   });
 
+  // --- Wallet re-base fixtures (design §6.5) --------------------------------
+  // Seed each user's wallet to the AVAILABLE balance *after* opening its
+  // position: `WALLET_FUNDING − |qty|×entryPrice` for the traded category (the
+  // entry notional blocked on open). Settlement re-bases that block from the
+  // entry price to the official settlement price, so assertions afterwards can
+  // check `WALLET_FUNDING − |qty|×settlementPrice`.
+  const WALLET_FUNDING = 100_000;
+  const NFO_ENTRY_BLOCK = 6 * 100;    // user 1: net 6 long @ 100 (NSE)
+  const MCX_ENTRY_BLOCK = 20 * 200;   // user 2: net 20 short @ 200 (MCX)
+  const walletForUser = index => {
+    if (index === 1) return { NSE: WALLET_FUNDING - NFO_ENTRY_BLOCK, MCX: WALLET_FUNDING, GLOBAL: 0 };
+    if (index === 2) return { NSE: WALLET_FUNDING, MCX: WALLET_FUNDING - MCX_ENTRY_BLOCK, GLOBAL: 0 };
+    return { NSE: WALLET_FUNDING, MCX: WALLET_FUNDING, GLOBAL: 0 }; // user 3 is flat
+  };
+
   const userPayload = index => ({
     name: `Integration User ${index}`,
     username: `it_user_${prefix}_${index}`,
@@ -97,6 +111,7 @@ async function seedScenario(options = {}) {
     settled_pnl: 0,
     server_id: serverId,
     master_id: master._id,
+    wallet: walletForUser(index),
     exchanges_allowed: [
       { exchange_name: 'NFO-FUT', turnover: true, lot: false, group_name: 'IT' },
       { exchange_name: 'MCX-FUT', turnover: true, lot: false, group_name: 'IT' },
@@ -293,6 +308,7 @@ async function seedScenario(options = {}) {
     prefix,
     tradingDate,
     users,
+    walletFunding: WALLET_FUNDING,
   };
 }
 
@@ -643,8 +659,63 @@ describeIntegration('isolated replica-set weekend settlement', () => {
     expect((await Trade.findById(scenario.pending._id).lean()).status).toBe('pending');
     expect((await User.findById(scenario.users[0]._id).lean()).settled_pnl).toBe(0);
     expect((await User.findById(scenario.users[1]._id).lean()).settled_pnl).toBe(0);
+    // The wallet carry-forward re-base is part of the same transaction, so an
+    // aborted settlement leaves the seeded available balances untouched
+    // (atomicity — Requirement 3.5 / cross-cutting 3).
+    const rolledBackNfoUser = await User.findById(scenario.users[0]._id).select('wallet').lean();
+    const rolledBackMcxUser = await User.findById(scenario.users[1]._id).select('wallet').lean();
+    expect(rolledBackNfoUser.wallet.NSE).toBeCloseTo(scenario.walletFunding - (6 * 100), 2);
+    expect(rolledBackMcxUser.wallet.MCX).toBeCloseTo(scenario.walletFunding - (20 * 200), 2);
     expect((await KiteInstrument.findOne({ instrument_token: scenario.nfoToken }).lean()).last_price).toBe(111);
     expect((await SettlementRun.findById(run._id).lean()).status).toBe('running');
+  });
+
+  test('settlement re-bases carried-forward wallet margin to the official settlement price', async () => {
+    const scenario = await seedScenario({ includeFlat: true, includePending: false, prefix: 'walletrebase' });
+    const owner = 'integration:wallet-rebase';
+    const run = await createOwnedRun(scenario, owner, '2026-07-31');
+
+    const commit = await settlementService._private.commitSettlementTransaction({
+      run,
+      lockOwner: owner,
+      tradingDate: scenario.tradingDate,
+    });
+    // Two carried-forward positions in two categories → two per-user wallet ops.
+    expect(commit.stats.open_positions_rebased).toBe(2);
+    expect(commit.stats.wallet_rebase_ops).toBe(2);
+
+    const funding = scenario.walletFunding;
+    const nfoSettlement = scenario.instruments[0].settlement_price; // 130 (> entry 100)
+    const mcxSettlement = scenario.instruments[1].settlement_price; // 180 (< entry 200)
+
+    const [nfoUser, mcxUser, flatUser] = await Promise.all([
+      User.findById(scenario.users[0]._id).select('wallet').lean(),
+      User.findById(scenario.users[1]._id).select('wallet').lean(),
+      User.findById(scenario.users[2]._id).select('wallet').lean(),
+    ]);
+
+    // NFO long 6 @ entry 100, settled at 130 (ABOVE entry): more margin blocked,
+    // so the NSE available balance DECREASES to funding − 6×130.
+    expect(nfoUser.wallet.NSE).toBeCloseTo(funding - (6 * nfoSettlement), 2);
+    // The user holds no MCX position, so that pool is left untouched.
+    expect(nfoUser.wallet.MCX).toBeCloseTo(funding, 2);
+
+    // MCX short 20 @ entry 200, settled at 180: less margin blocked, so the MCX
+    // available balance INCREASES to funding − 20×180.
+    expect(mcxUser.wallet.MCX).toBeCloseTo(funding - (20 * mcxSettlement), 2);
+    expect(mcxUser.wallet.NSE).toBeCloseTo(funding, 2);
+
+    // The flat user (net 0) is fully closed — no carry-forward, no wallet re-base.
+    expect(flatUser.wallet.NSE).toBeCloseTo(funding, 2);
+    expect(flatUser.wallet.MCX).toBeCloseTo(funding, 2);
+
+    // The wallet re-base is independent of P&L: settled_pnl is credited exactly
+    // as before (Requirement 3.4 — P&L never touches the wallet).
+    const settled = await User.find({ _id: { $in: scenario.users.map(user => user._id) } })
+      .sort({ username: 1 })
+      .select('settled_pnl')
+      .lean();
+    expect(settled.map(user => user.settled_pnl)).toEqual([260, 400, 25]);
   });
 
   test('post-commit crash recovery finalizes from immutable history without replaying finance', async () => {

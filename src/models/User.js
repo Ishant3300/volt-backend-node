@@ -1,5 +1,14 @@
 const mongoose = require('mongoose');
 
+// Category trade wallet — the available (spendable) balance per category pool
+// (NSE, MCX, GLOBAL). `min: 0` is a schema-level guard; the atomic `$gte` guard
+// in walletService is the real never-negative enforcement (see design §D1).
+const walletSchema = new mongoose.Schema({
+  NSE:    { type: Number, default: 0, min: 0 },
+  MCX:    { type: Number, default: 0, min: 0 },
+  GLOBAL: { type: Number, default: 0, min: 0 }
+}, { _id: false });
+
 const userSchema = new mongoose.Schema({
   name: {
     type: String,
@@ -101,6 +110,12 @@ const userSchema = new mongoose.Schema({
     default: 0,
     min: 0,
     max: 100
+  },
+  // Per-category trade wallet (available balances). Funded via the assignment
+  // flow; blocked on open / released on close by walletService.
+  wallet: {
+    type: walletSchema,
+    default: () => ({ NSE: 0, MCX: 0, GLOBAL: 0 })
   },
   close_only: {
     type: Boolean,

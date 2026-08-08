@@ -4,10 +4,10 @@ const Master = require('../models/Master');
 const Server = require('../models/Server');
 const GroupedQuantity = require('../models/GroupedQuantity');
 const ScriptQuantity = require('../models/ScriptQuantity');
-const TradeMargin = require('../models/TradeMargin');
 const BrokerageSettings = require('../models/BrokerageSettings');
 const mongoose = require('mongoose');
 const Transaction = require('../models/Transaction');
+const { applyWalletFunding } = require('./walletController');
 
 // Create User
 const createUser = async (req, res) => {
@@ -191,14 +191,23 @@ const updateUser = async (req, res) => {
   try {
     const { id } = req.params;
     const {
+      name,
       username,
       password,
       server_id,
       master_id,
       credit,
+      credits,
       current_credit,
       balance,
       exchanges_support,
+      note,
+      pnl_sharing,
+      brokerage_sharing,
+      exchanges_allowed,
+      trade_limit,
+      margin_square_off,
+      change_pass_on_first_login,
       status
     } = req.body;
 
@@ -253,13 +262,52 @@ const updateUser = async (req, res) => {
       user.master_id = master_id;
     }
 
-    if (credit !== undefined) user.credits = credit;
-    if (current_credit !== undefined) user.current_credit = current_credit;
-    if (balance !== undefined) user.equity = balance;
-    if (exchanges_support) user.exchanges_support = exchanges_support;
+    if (name) user.name = name;
+    if (credits !== undefined) user.credits = credits;
+    if (note !== undefined) user.note = note;
+    if (margin_square_off !== undefined) user.margin_square_off = margin_square_off;
+    if (change_pass_on_first_login !== undefined) user.change_pass_on_first_login = change_pass_on_first_login;
     if (status) user.status = status;
 
+    if (pnl_sharing !== undefined) {
+      if (pnl_sharing < 0 || pnl_sharing > 100) return res.status(400).json({ success: false, message: 'P&L sharing must be between 0 and 100', data: null });
+      user.pnl_sharing = pnl_sharing;
+    }
+
+    if (brokerage_sharing !== undefined) {
+      if (brokerage_sharing < 0 || brokerage_sharing > 100) return res.status(400).json({ success: false, message: 'Brokerage sharing must be between 0 and 100', data: null });
+      user.brokerage_sharing = brokerage_sharing;
+    }
+
+    if (exchanges_allowed) {
+      if (!Array.isArray(exchanges_allowed)) return res.status(400).json({ success: false, message: 'exchanges_allowed must be an array', data: null });
+      for (const exchange of exchanges_allowed) {
+        if (!exchange.exchange_name || exchange.turnover === undefined || exchange.lot === undefined) return res.status(400).json({ success: false, message: 'Each exchange must have exchange_name, turnover, and lot', data: null });
+      }
+      user.exchanges_allowed = exchanges_allowed.map(ex => {
+        let name = ex.exchange_name.toUpperCase();
+        if (name === 'GLOBAL') name = 'INDICES';
+        return { ...ex, exchange_name: name };
+      });
+    }
+
+    if (trade_limit) {
+      user.trade_limit = trade_limit.map(ex => {
+        let name = ex.toUpperCase();
+        if (name === 'GLOBAL') name = 'INDICES';
+        return name;
+      });
+    }
+
     await user.save();
+
+    if (req.body.wallet) {
+      await applyWalletFunding({ req, targetType: 'User', targetId: user._id, walletMap: req.body.wallet });
+      try {
+        const metricsEngine = require('../services/metricsEngine');
+        await metricsEngine.onTradeExecuted(user._id.toString());
+      } catch (err) {}
+    }
 
     res.status(200).json({
       success: true,
@@ -833,180 +881,6 @@ const deleteScriptQuantity = async (req, res) => {
   }
 };
 
-// ============================================
-// Trade Margin CRUD Operations
-// ============================================
-
-// Create Trade Margin
-const createTradeMargin = async (req, res) => {
-  try {
-    const { exchange_name, script_name, amount_type, trade_margin } = req.body;
-
-    if (!exchange_name || !script_name || !amount_type || trade_margin === undefined) {
-      return res.status(400).json({
-        success: false,
-        message: 'exchange_name, script_name, amount_type, and trade_margin are required',
-        data: null
-      });
-    }
-
-    const tradeMarginDoc = await TradeMargin.findOneAndUpdate(
-      { exchange_name, script_name, amount_type, deleted_at: null },
-      { exchange_name, script_name, amount_type, trade_margin, deleted_at: null },
-      { upsert: true, new: true, setDefaultsOnInsert: true }
-    );
-
-    res.status(201).json({
-      success: true,
-      message: 'Trade margin saved successfully',
-      data: tradeMarginDoc.toJSON()
-    });
-  } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: error.message,
-      data: null
-    });
-  }
-};
-
-// Get All Trade Margins
-const getAllTradeMargins = async (req, res) => {
-  try {
-    const { page = 1, limit = 20 } = req.query;
-
-    const filter = { deleted_at: null };
-
-    const tradeMargins = await TradeMargin.find(filter)
-      .limit(limit * 1)
-      .skip((page - 1) * limit)
-      .sort({ created_at: -1 });
-
-    const count = await TradeMargin.countDocuments(filter);
-
-    res.status(200).json({
-      success: true,
-      message: 'Trade margins retrieved successfully',
-      data: {
-        trade_margins: tradeMargins.map(tm => tm.toJSON()),
-        total: count,
-        page: parseInt(page),
-        pages: Math.ceil(count / limit)
-      }
-    });
-  } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: error.message,
-      data: null
-    });
-  }
-};
-
-// Get Trade Margin by ID
-const getTradeMarginById = async (req, res) => {
-  try {
-    const { id } = req.params;
-
-    const tradeMargin = await TradeMargin.findById(id);
-
-    if (!tradeMargin || tradeMargin.deleted_at) {
-      return res.status(404).json({
-        success: false,
-        message: 'Trade margin not found',
-        data: null
-      });
-    }
-
-    res.status(200).json({
-      success: true,
-      message: 'Trade margin retrieved successfully',
-      data: tradeMargin.toJSON()
-    });
-  } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: error.message,
-      data: null
-    });
-  }
-};
-
-// Update Trade Margin
-const updateTradeMargin = async (req, res) => {
-  try {
-    const { id } = req.params;
-    const { exchange_name, script_name, amount_type, trade_margin } = req.body;
-
-    const tradeMargin = await TradeMargin.findById(id);
-
-    if (!tradeMargin || tradeMargin.deleted_at) {
-      return res.status(404).json({
-        success: false,
-        message: 'Trade margin not found',
-        data: null
-      });
-    }
-
-    if (exchange_name) tradeMargin.exchange_name = exchange_name;
-    if (script_name) tradeMargin.script_name = script_name;
-    if (amount_type) tradeMargin.amount_type = amount_type;
-    if (trade_margin !== undefined) tradeMargin.trade_margin = trade_margin;
-
-    await tradeMargin.save();
-
-    // Reload metricsEngine rules so margin calculations use the new values immediately
-    try { const me = require('../services/metricsEngine'); me.reloadRules(); } catch (_) {}
-
-    res.status(200).json({
-      success: true,
-      message: 'Trade margin updated successfully',
-      data: tradeMargin.toJSON()
-    });
-  } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: error.message,
-      data: null
-    });
-  }
-};
-
-// Delete Trade Margin (Soft Delete)
-const deleteTradeMargin = async (req, res) => {
-  try {
-    const { id } = req.params;
-
-    const tradeMargin = await TradeMargin.findById(id);
-
-    if (!tradeMargin || tradeMargin.deleted_at) {
-      return res.status(404).json({
-        success: false,
-        message: 'Trade margin not found',
-        data: null
-      });
-    }
-
-    tradeMargin.deleted_at = new Date();
-    await tradeMargin.save();
-
-    // Reload metricsEngine rules
-    try { const me = require('../services/metricsEngine'); me.reloadRules(); } catch (_) {}
-
-    res.status(200).json({
-      success: true,
-      message: 'Trade margin deleted successfully',
-      data: null
-    });
-  } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: error.message,
-      data: null
-    });
-  }
-};
-
 // ==================== BROKERAGE SETTINGS ====================
 
 // Create Brokerage Settings
@@ -1204,12 +1078,6 @@ module.exports = {
   getScriptQuantityById,
   updateScriptQuantity,
   deleteScriptQuantity,
-  // Trade Margin
-  createTradeMargin,
-  getAllTradeMargins,
-  getTradeMarginById,
-  updateTradeMargin,
-  deleteTradeMargin,
   // Brokerage Settings
   createBrokerageSettings,
   getAllBrokerageSettings,

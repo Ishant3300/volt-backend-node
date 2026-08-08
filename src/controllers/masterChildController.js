@@ -6,6 +6,7 @@ const Trade = require('../models/Trade');
 const CreditTransaction = require('../models/CreditTransaction');
 const mongoose = require('mongoose');
 const Transaction = require('../models/Transaction');
+const { applyWalletFunding } = require('./walletController');
 
 // Create Child Master
 const createChildMaster = async (req, res) => {
@@ -194,6 +195,16 @@ const createChildMaster = async (req, res) => {
         await copyFromGroupedQuantityToMaster(childMaster._id, session);
       }
 
+      // Task 13 / design §13.3: apply any inline initial wallet funding for the new
+      // child master. A MASTER creating the child → TRANSFER (debits the master's
+      // own category pool); an ADMIN creating it → GRANT (no debit). It runs inside
+      // this transaction (session passed through) so a master over-funding throws
+      // INSUFFICIENT_WALLET and aborts the ENTIRE creation (Requirement 5.3). This
+      // pool is independent of the credits/equity debit above. No-op when absent.
+      if (req.body.wallet) {
+        await applyWalletFunding({ req, targetType: 'Master', targetId: childMaster._id, walletMap: req.body.wallet, session });
+      }
+
       resultData = { child_master: childMaster.toJSON() };
       if (parentMaster) {
         resultData.parent_master_remaining_balance = parentMaster.equity;
@@ -217,6 +228,12 @@ const createChildMaster = async (req, res) => {
     if (error.message.includes('not found')) statusCode = 404;
     else if (error.message === 'Unauthorized' || error.message.includes('No permission')) statusCode = 403;
     else if (error.message.includes('Insufficient') || error.message.includes('exists') || error.message.includes('between 0 and 100') || error.message.includes('grant permission') || error.message.includes('Account limit reached')) statusCode = 400;
+    // Task 13: an inline wallet transfer the master's pool can't cover aborts the
+    // create — surface it as a clear 400 naming the category.
+    else if (error.code === 'INSUFFICIENT_WALLET') {
+      statusCode = 400;
+      error.message = `Insufficient ${error.category} wallet balance to fund the new account.`;
+    }
 
     res.status(statusCode).json({
       success: false,
@@ -425,6 +442,15 @@ const updateChildMasterDetails = async (req, res) => {
 
     await childMaster.save();
 
+    // Task 13 / design §13.3: inline wallet on EDIT is an ADDITIVE top-up applied
+    // via walletService.assign (master transfer / admin grant). REDUCTIONS use the
+    // dedicated wallet withdraw endpoint (Task 12), never this path. No transaction
+    // here (the save already committed), so walletService opens its own transaction
+    // per category; a funding failure surfaces as a 400 below.
+    if (req.body.wallet) {
+      await applyWalletFunding({ req, targetType: 'Master', targetId: childMaster._id, walletMap: req.body.wallet });
+    }
+
     res.status(200).json({
       success: true,
       message: 'Child master details updated successfully',
@@ -440,6 +466,15 @@ const updateChildMasterDetails = async (req, res) => {
       }
     });
   } catch (error) {
+    // Task 13: an inline wallet top-up the master's pool can't cover → 400 with a
+    // clear message. The profile fields were already saved; only funding failed.
+    if (error.code === 'INSUFFICIENT_WALLET') {
+      return res.status(400).json({
+        success: false,
+        message: `Insufficient ${error.category} wallet balance to fund the account.`,
+        data: null
+      });
+    }
     res.status(500).json({
       success: false,
       message: error.message,

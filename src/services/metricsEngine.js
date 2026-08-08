@@ -14,9 +14,9 @@ const Master = require('../models/Master');
 const BrokerageSettings = require('../models/BrokerageSettings');
 const KiteInstrument = require('../models/KiteInstrument');
 const SettlementHistory = require('../models/SettlementHistory');
-const TradeMargin = require('../models/TradeMargin');
 const SettlementRun = require('../models/SettlementRun');
 const { dateRange, isWeekendInIndia } = require('../utils/settlementDates');
+const { allowedCategories } = require('../utils/walletCategory');
 
 class MetricsEngine {
   constructor() {
@@ -24,7 +24,6 @@ class MetricsEngine {
 
     // In-memory caches (rebuilt on init + periodically)
     this._brokerageRules = [];
-    this._marginRules = [];
     this._kiteMap = {};           // instrument_token → { lot_size, segment, raw_name }
 
     // Per-user trade aggregation cache: userId → { credit, positions[], fifoPnl, brokerage }
@@ -124,12 +123,11 @@ class MetricsEngine {
   }
 
   /**
-   * Load brokerage rules, margin rules, and kite instrument info into memory.
+   * Load brokerage rules and kite instrument info into memory.
    */
   async _loadRules() {
     try {
       this._brokerageRules = await BrokerageSettings.find({ deleted_at: null }).lean();
-      this._marginRules = await TradeMargin.find({ deleted_at: null }).lean();
 
       const instruments = await KiteInstrument.find({}, 'instrument_token lot_size segment raw_name').lean();
       this._kiteMap = {};
@@ -140,7 +138,7 @@ class MetricsEngine {
           raw_name: ki.raw_name || ''
         };
       });
-      console.log(`📊 [MetricsEngine] Loaded ${this._brokerageRules.length} brokerage rules, ${this._marginRules.length} margin rules, ${instruments.length} instruments`);
+      console.log(`📊 [MetricsEngine] Loaded ${this._brokerageRules.length} brokerage rules, ${instruments.length} instruments`);
     } catch (e) {
       console.error('📊 [MetricsEngine] Error loading rules:', e.message);
     }
@@ -154,12 +152,18 @@ class MetricsEngine {
       const activeUserIds = await Trade.distinct('user_id', { status: 'completed', deleted_at: null });
       const requestedUserIds = options.includeUserIds || [];
       const userIds = [...new Set([...activeUserIds, ...requestedUserIds].map(id => id.toString()))];
-      const users = await User.find({ _id: { $in: userIds }, deleted_at: null }).select('_id credits settled_pnl master_id').lean();
+      const users = await User.find({ _id: { $in: userIds }, deleted_at: null }).select('_id credits settled_pnl master_id wallet exchanges_allowed').lean();
 
-      // Build master hierarchy maps for broadcast aggregation
-      const allMasters = await Master.find({ deleted_at: null }).select('_id master_id').lean();
+      // Build master hierarchy maps for broadcast aggregation. Also cache each
+      // master's square-off config here (Task 11) so the master-aggregate path can
+      // evaluate the cascade threshold without a per-tick DB read (non-functional
+      // Req 4: keep the hot tick path free of extra blocking reads).
+      const allMasters = await Master.find({ deleted_at: null })
+        .select('_id master_id margin_square_off margin_square_off_percentage credits username active_status')
+        .lean();
       this._masterParentMap = {};
       this._masterChildrenMap = {};
+      this._masterConfigMap = {};
       for (const master of allMasters) {
         const masterId = master._id.toString();
         const parentId = master.master_id?.toString() || null;
@@ -168,6 +172,14 @@ class MetricsEngine {
           if (!this._masterChildrenMap[parentId]) this._masterChildrenMap[parentId] = [];
           this._masterChildrenMap[parentId].push(masterId);
         }
+        this._masterConfigMap[masterId] = {
+          credits: master.credits || 0,
+          margin_square_off: master.margin_square_off,
+          margin_square_off_percentage: master.margin_square_off_percentage,
+          username: master.username,
+          active_status: master.active_status,
+          deleted_at: null,
+        };
       }
 
       this._userCache.clear();
@@ -175,7 +187,7 @@ class MetricsEngine {
       this._metricsCache.clear();
 
       for (const user of users) {
-        await this._rebuildUserCache(user._id.toString(), user.credits || 0, user.settled_pnl || 0, user.master_id?.toString());
+        await this._rebuildUserCache(user._id.toString(), user.credits || 0, user.settled_pnl || 0, user.master_id?.toString(), user.wallet, user.exchanges_allowed);
       }
 
       for (const userId of this._userCache.keys()) {
@@ -191,8 +203,17 @@ class MetricsEngine {
   /**
    * Rebuild cache for a single user.
    */
-  async _rebuildUserCache(userId, credit, settledPnl, masterId) {
+  async _rebuildUserCache(userId, credit, settledPnl, masterId, wallet, exchangesAllowed) {
     try {
+      // Normalize the wallet + allowed categories once so both cache branches
+      // (flat/no-trades and the main aggregation) store identical shapes.
+      const walletBalances = {
+        NSE: Number(wallet?.NSE) || 0,
+        MCX: Number(wallet?.MCX) || 0,
+        GLOBAL: Number(wallet?.GLOBAL) || 0,
+      };
+      const allowedCats = allowedCategories(exchangesAllowed || []);
+
       const trades = await Trade.find({
         user_id: userId, status: 'completed', deleted_at: null
       }).sort({ createdAt: 1 }).lean();
@@ -208,6 +229,8 @@ class MetricsEngine {
           fifoPnl: 0,
           brokerage: 0,
           openPositions: [],
+          wallet: walletBalances,
+          allowedCategories: allowedCats,
         });
         return;
       }
@@ -320,7 +343,9 @@ class MetricsEngine {
         masterId,
         fifoPnl: totalFifoPnl,
         brokerage: totalBrokerage,
-        openPositions
+        openPositions,
+        wallet: walletBalances,
+        allowedCategories: allowedCats,
       });
     } catch (e) {
       console.error(`📊 [MetricsEngine] Error rebuilding cache for user ${userId}:`, e.message);
@@ -414,7 +439,9 @@ class MetricsEngine {
     const cache = this._userCache.get(userId);
     if (!cache) return null;
 
-    const { credit, settledPnl, openPositions, fifoPnl, brokerage } = cache;
+    const { credit, settledPnl, openPositions, fifoPnl, brokerage, wallet, allowedCategories: allowedCats } = cache;
+    const walletBalances = wallet || { NSE: 0, MCX: 0, GLOBAL: 0 };
+    const allowed = allowedCats || [];
 
     let totalFloating = 0;
     let totalMargin = 0;
@@ -442,29 +469,10 @@ class MetricsEngine {
       }
       totalFloating += floating;
 
-      // Margin calculation (same 4-level fallback as Flutter)
-      let positionMargin = 0;
-      const seg = pos.segment.toUpperCase();
-      const rawName = pos.rawName;
-
-      let rule = null;
-      if (rawName) rule = this._marginRules.find(m => m.script_name?.toUpperCase() === rawName.toUpperCase() && m.exchange_name === seg);
-      if (!rule && rawName) rule = this._marginRules.find(m => m.script_name?.toUpperCase() === rawName.toUpperCase());
-      if (!rule) rule = this._marginRules.find(m => m.exchange_name === seg && !m.script_name);
-      if (!rule) rule = this._marginRules.find(m => m.exchange_name === pos.exchange.toUpperCase() && !m.script_name);
-
-      if (rule) {
-        const isLotBased = seg === 'MCX-FUT' || seg === 'MCX-OPT' || seg === 'NFO-OPT';
-        if (isLotBased && rule.amount_type === 'amount') {
-          const lots = pos.lotSize > 0 ? Math.ceil(Math.abs(pos.netQty) / pos.lotSize) : Math.abs(pos.netQty);
-          positionMargin = rule.trade_margin * lots;
-        } else if (rule.amount_type === 'percentage') {
-          const atp = pos.netQty > 0 ? pos.avgBuy : pos.avgSell;
-          positionMargin = Math.abs(pos.netQty) * atp * (rule.trade_margin / 100);
-        } else {
-          positionMargin = Math.abs(pos.netQty) * rule.trade_margin;
-        }
-      }
+      // Margin = entry notional: |net_qty| × avg entry price (design D3).
+      // avgEntry uses avgBuy for long positions, avgSell for short.
+      const avgEntry = pos.netQty > 0 ? pos.avgBuy : pos.avgSell;
+      const positionMargin = Math.abs(pos.netQty) * avgEntry;
       totalMargin += positionMargin;
 
       positionDetails.push({
@@ -489,8 +497,22 @@ class MetricsEngine {
     const positionPnl = Math.round(totalFloating * 100) / 100;
     const m2mPnl = Math.round((realisedPnl + positionPnl) * 100) / 100;
     const marginUsed = Math.round(totalMargin * 100) / 100;
-    const equity = Math.round((credit + (settledPnl || 0) + m2mPnl) * 100) / 100;
-    const freeMargin = Math.round((equity - marginUsed) * 100) / 100;
+
+    // equity = Σ available wallet balances across ALLOWED categories only (design D2).
+    // Non-allowed categories are excluded (Requirement 6.3). margin_used stays for
+    // display only; free_margin equals equity because the available balance already
+    // excludes margin blocked by open positions (so we stop the equity − margin_used
+    // subtraction to avoid double counting).
+    const walletSum = allowed.reduce((sum, cat) => sum + (Number(walletBalances[cat]) || 0), 0);
+    const equity = Math.round(walletSum * 100) / 100;
+    const freeMargin = equity;
+
+    // Per-category available breakdown for the orders-page "i" control, filtered to
+    // allowed categories only (Requirement 6.2/6.3).
+    const walletBreakdown = {};
+    for (const cat of allowed) {
+      walletBreakdown[cat] = Math.round((Number(walletBalances[cat]) || 0) * 100) / 100;
+    }
 
     return {
       user_id: userId,
@@ -501,6 +523,7 @@ class MetricsEngine {
       margin_used: marginUsed,
       equity,
       free_margin: freeMargin,
+      wallet: walletBreakdown,
       positions: positionDetails
     };
   }
@@ -612,6 +635,24 @@ class MetricsEngine {
           }
         });
       }
+
+      // Master cascade square-off (Task 11, design §13.1 / Requirements 7.4, 8.4):
+      // `totalPnl` here is the master's AGGREGATE live M2M (Σ realised+position P&L
+      // over the whole subtree). When the master's own threshold is breached, all
+      // users under the master are squared off. Fire-and-forget (do NOT await inside
+      // the broadcast loop; mirrors how _processPendingTicks calls checkUser). The
+      // lazy require avoids circular-import init (marginSquareOffService lazily
+      // requires metricsEngine too).
+      if (allUsers.length > 0) {
+        try {
+          const marginSquareOffService = require('./marginSquareOffService');
+          const masterConfig = this._masterConfigMap?.[masterId];
+          if (masterConfig && (masterConfig.margin_square_off || masterConfig.margin_square_off_percentage > 0)) {
+            const subtreeUserIds = allUsers.map(u => u.user_id);
+            marginSquareOffService.checkMaster(masterId, { m2m_pnl: Math.round(totalPnl * 100) / 100 }, masterConfig, subtreeUserIds);
+          }
+        } catch (_) {}
+      }
     }
 
     // Broadcast admin-level summary
@@ -681,7 +722,7 @@ class MetricsEngine {
   async onTradeExecuted(userId) {
     if (!this._initialized) return;
     try {
-      const user = await User.findById(userId).select('credits settled_pnl master_id').lean();
+      const user = await User.findById(userId).select('credits settled_pnl master_id wallet exchanges_allowed').lean();
       if (!user) return;
 
       // Clear old token→user mappings for this user
@@ -690,7 +731,7 @@ class MetricsEngine {
         if (users.size === 0) this._tokenToUsers.delete(token);
       }
 
-      await this._rebuildUserCache(userId, user.credits || 0, user.settled_pnl || 0, user.master_id?.toString());
+      await this._rebuildUserCache(userId, user.credits || 0, user.settled_pnl || 0, user.master_id?.toString(), user.wallet, user.exchanges_allowed);
 
       const metrics = this._computeUserMetrics(userId);
       if (metrics) {
@@ -858,7 +899,7 @@ class MetricsEngine {
 
     // No cache — rebuild this user's data and compute
     try {
-      const user = await User.findById(userId).select('credits settled_pnl master_id').lean();
+      const user = await User.findById(userId).select('credits settled_pnl master_id wallet exchanges_allowed').lean();
       if (!user) return null;
 
       // Clear old token→user mappings for this user
@@ -867,7 +908,7 @@ class MetricsEngine {
         if (users.size === 0) this._tokenToUsers.delete(token);
       }
 
-      await this._rebuildUserCache(userId, user.credits || 0, user.settled_pnl || 0, user.master_id?.toString());
+      await this._rebuildUserCache(userId, user.credits || 0, user.settled_pnl || 0, user.master_id?.toString(), user.wallet, user.exchanges_allowed);
 
       const metrics = this._computeUserMetrics(userId);
       if (metrics) {

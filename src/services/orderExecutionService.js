@@ -1,11 +1,15 @@
 const Trade = require('../models/Trade');
 const Transaction = require('../models/Transaction');
 const User = require('../models/User');
+const KiteInstrument = require('../models/KiteInstrument');
 const mongoose = require('mongoose');
 const kiteService = require('./kiteService');
 const orderBookService = require('./orderBookService');
 const redisService = require('./redisService');
 const { calculateMargin } = require('./marginService');
+const walletService = require('./walletService');
+const { categoryForSegment } = require('../utils/walletCategory');
+const { computeWalletSplit } = require('../utils/walletSplit');
 const firebaseService = require('./firebaseService');
 const { beginTradeWrite } = require('./tradeWriteFenceService');
 
@@ -181,45 +185,93 @@ const processPendingOrders = async () => {
                                     },
                                     total_sell_qty: {
                                         $sum: { $cond: [{ $eq: ['$transaction_type', 'SELL'] }, '$executed_quantity', 0] }
+                                    },
+                                    // Buy/sell VALUE added for Task 6: needed to derive the
+                                    // average entry price for the wallet release basis.
+                                    total_buy_value: {
+                                        $sum: { $cond: [{ $eq: ['$transaction_type', 'BUY'] }, { $multiply: ['$executed_quantity', '$executed_price'] }, 0] }
+                                    },
+                                    total_sell_value: {
+                                        $sum: { $cond: [{ $eq: ['$transaction_type', 'SELL'] }, { $multiply: ['$executed_quantity', '$executed_price'] }, 0] }
                                     }
                                 }
                             }
                         ]).session(session);
 
-                        // ── Free margin check for opening LIMIT orders ──
                         const prevNetQtyCheck = existingAgg.length > 0 ? existingAgg[0].total_buy_qty - existingAgg[0].total_sell_qty : 0;
-                        const afterNetQtyCheck = freshTrade.transaction_type === 'BUY' ? prevNetQtyCheck + freshTrade.quantity : prevNetQtyCheck - freshTrade.quantity;
-                        const isOpeningLimitTrade = Math.abs(afterNetQtyCheck) > Math.abs(prevNetQtyCheck);
 
-                        if (isOpeningLimitTrade) {
-                            const metricsEngine = require('./metricsEngine');
-                            const freshMetrics = await metricsEngine.getFreshMetrics(freshTrade.user_id.toString());
-                            if (freshMetrics && freshMetrics.free_margin < 0) {
-                                freshTrade.status = 'cancelled';
-                                freshTrade.remarks = 'Insufficient free margin when limit order triggered';
-                                await freshTrade.save({ session });
+                        // ── Category trade-wallet gate at FILL time (Task 6 / Requirements
+                        //    3.1, 4.1; design §6.2 / §13.2). Mirrors priceQueueService (the
+                        //    primary Redis path); this DB fallback runs only when Redis is
+                        //    down. Placing the pending order did NOT touch the wallet — the
+                        //    block/release happens here at fill. REPLACES the old free-margin
+                        //    + equity gates.
+                        //
+                        //    Category MUST come from the instrument SEGMENT, not
+                        //    `freshTrade.exchange` (which carries no segment), so 'NFO-FUT'
+                        //    maps to NSE and 'MCX-FUT' to MCX rather than GLOBAL.
+                        const walletInstrument = await KiteInstrument.findOne({ instrument_token: freshTrade.instrument_token })
+                            .select('segment').session(session).lean();
+                        const walletCategory = categoryForSegment(walletInstrument?.segment || freshTrade.exchange || '');
 
-                                // Save rejection log
-                                try {
-                                    await Trade.create([{
-                                        user_id: freshTrade.user_id,
-                                        master_id: freshTrade.master_id,
-                                        admin_id: freshTrade.admin_id || null,
-                                        instrument_token: freshTrade.instrument_token,
-                                        tradingsymbol: freshTrade.tradingsymbol,
-                                        exchange: freshTrade.exchange,
-                                        transaction_type: freshTrade.transaction_type,
-                                        quantity: freshTrade.quantity,
-                                        price: freshTrade.price,
-                                        order_type: freshTrade.order_type,
-                                        status: 'rejected',
-                                        remarks: `Insufficient free margin (₹${freshMetrics.free_margin.toFixed(2)}). Limit order cancelled.`,
-                                    }], { session });
-                                } catch (_) {}
+                        const { closingQty: walletClosingQty, openingQty: walletOpeningQty } =
+                            computeWalletSplit(prevNetQtyCheck, freshTrade.transaction_type, freshTrade.quantity);
+                        const walletAgg = existingAgg.length > 0 ? existingAgg[0] : null;
+                        const walletAvgBuy = walletAgg && walletAgg.total_buy_qty > 0
+                            ? walletAgg.total_buy_value / walletAgg.total_buy_qty : 0;
+                        const walletAvgSell = walletAgg && walletAgg.total_sell_qty > 0
+                            ? walletAgg.total_sell_value / walletAgg.total_sell_qty : 0;
+                        // Closed long lots release at avgBuy; closed short lots at avgSell.
+                        const walletReleaseBasis = prevNetQtyCheck > 0 ? walletAvgBuy : walletAvgSell;
+                        const walletReleaseAmount = walletClosingQty * walletReleaseBasis;
+                        // LIMIT/SL fills at the limit price: executed_price = freshTrade.price.
+                        const walletOpeningNotional = walletOpeningQty * freshTrade.price;
 
-                                console.log(`⚠️ [OrderExecution] Cancelled ${freshTrade.tradingsymbol} LIMIT — insufficient free margin (₹${freshMetrics.free_margin.toFixed(2)})`);
-                                return;
-                            }
+                        // Affordability pre-check. A reversal's release funds the new opening.
+                        const walletAvailable = (await walletService.getAvailable('User', freshTrade.user_id, session))[walletCategory];
+                        const walletEffectiveAvailable = walletAvailable + walletReleaseAmount;
+                        if (walletOpeningQty > 0 && walletOpeningNotional > walletEffectiveAvailable) {
+                            const walletShortfall = walletOpeningNotional - walletEffectiveAvailable;
+                            const walletRejectRemark = `Insufficient ${walletCategory} wallet balance at fill. Required ₹${walletOpeningNotional.toFixed(2)}, available ₹${walletEffectiveAvailable.toFixed(2)} (short ₹${walletShortfall.toFixed(2)}).`;
+                            freshTrade.status = 'rejected';
+                            freshTrade.pnl = 0;
+                            freshTrade.net_amount = 0;
+                            freshTrade.remarks = walletRejectRemark;
+                            await freshTrade.save({ session });
+
+                            // Save rejection log (same shape as the previous rejection path).
+                            try {
+                                await Trade.create([{
+                                    user_id: freshTrade.user_id,
+                                    master_id: freshTrade.master_id,
+                                    admin_id: freshTrade.admin_id || null,
+                                    instrument_token: freshTrade.instrument_token,
+                                    tradingsymbol: freshTrade.tradingsymbol,
+                                    exchange: freshTrade.exchange,
+                                    transaction_type: freshTrade.transaction_type,
+                                    quantity: freshTrade.quantity,
+                                    price: freshTrade.price,
+                                    order_type: freshTrade.order_type,
+                                    status: 'rejected',
+                                    remarks: walletRejectRemark,
+                                }], { session });
+                            } catch (_) {}
+
+                            console.log(`⚠️ [OrderExecution] Rejected ${freshTrade.tradingsymbol} — ${walletRejectRemark}`);
+                            return;
+                        }
+
+                        // Gate passed — apply wallet mutations inside this transaction:
+                        // release the closed portion's entry notional first, then block the
+                        // opened portion. block() is the atomic never-negative backstop; if a
+                        // concurrent race makes it throw INSUFFICIENT_WALLET we let it
+                        // propagate so the transaction aborts and the order stays pending to
+                        // retry on the next cycle (never silently completed).
+                        if (walletClosingQty > 0 && walletReleaseBasis > 0) {
+                            await walletService.release('User', freshTrade.user_id, walletCategory, walletReleaseAmount, session);
+                        }
+                        if (walletOpeningQty > 0) {
+                            await walletService.block('User', freshTrade.user_id, walletCategory, walletOpeningNotional, session);
                         }
 
                         // Execute the trade
@@ -241,22 +293,16 @@ const processPendingOrders = async () => {
                         const marginPerUnit = await calculateMargin(freshTrade.exchange, 1, freshTrade.price);
                         const prevMargin = Math.abs(prevNetQtyForMargin) * marginPerUnit;
                         const newMargin = Math.abs(newNetQty) * marginPerUnit;
+                        // NOTE: marginDelta is now notional — persisted equity interaction
+                        // pending review (see Task 5 flag). calculateMargin returns |qty|×price
+                        // after Task 3, so this still subtracts a notional-sized amount from the
+                        // PERSISTED user.equity running balance. Kept byte-for-byte for parity
+                        // with placeTrade / priceQueueService; flagged for user review.
                         const marginDelta = newMargin - prevMargin;
                         const balanceChange = realisedPnl - marginDelta;
 
                         const user = await User.findById(freshTrade.user_id).session(session);
                         if (user) {
-                            // Skip trade if insufficient balance for opening positions
-                            if (marginDelta > 0 && (user.equity + balanceChange) < 0) {
-                                // Revert trade status
-                                freshTrade.status = 'rejected';
-                                freshTrade.pnl = 0;
-                                freshTrade.net_amount = 0;
-                                await freshTrade.save({ session });
-                                console.log(`⚠️ [OrderExecution] Rejected ${freshTrade.tradingsymbol} - insufficient balance (need ₹${marginDelta.toFixed(2)}, have ₹${user.equity.toFixed(2)})`);
-                                return;
-                            }
-
                             const balanceBefore = user.equity;
                             user.equity += balanceChange;
                             await user.save({ session });

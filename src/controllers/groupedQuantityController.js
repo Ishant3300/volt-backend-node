@@ -356,73 +356,6 @@ const getBrokerageByExchange = async (req, res) => {
 };
 
 // ============================================
-// Trade Margin — Bulk Create & Get by Exchange
-// ============================================
-const TradeMargin = require('../models/TradeMargin');
-
-/**
- * POST /api/admin/trade-margins/bulk-create
- * Body: { exchange_name, amount_type, default_trade_margin }
- */
-const bulkCreateTradeMargin = async (req, res) => {
-  try {
-    const { exchange_name, amount_type, default_trade_margin } = req.body;
-    if (!exchange_name || !amount_type || default_trade_margin === undefined) {
-      return res.status(400).json({ success: false, message: 'exchange_name, amount_type, and default_trade_margin are required', data: null });
-    }
-    const normalizedExchange = exchange_name.toUpperCase();
-    const filter = buildSegmentFilter(normalizedExchange);
-    const results = await KiteInstrument.aggregate([
-      { $match: filter },
-      { $group: { _id: '$raw_name' } },
-      { $sort: { _id: 1 } }
-    ]);
-    if (results.length === 0) {
-      return res.status(404).json({ success: false, message: `No instruments found for ${normalizedExchange}`, data: null });
-    }
-    const bulkOps = results.map(r => ({
-      updateOne: {
-        filter: { exchange_name: normalizedExchange, script_name: r._id, amount_type: amount_type.toLowerCase(), deleted_at: null },
-        update: {
-          $setOnInsert: { exchange_name: normalizedExchange, script_name: r._id, amount_type: amount_type.toLowerCase(), trade_margin: default_trade_margin, created_at: new Date() },
-          $set: { updated_at: new Date(), deleted_at: null }
-        },
-        upsert: true
-      }
-    }));
-    const bulkResult = await TradeMargin.bulkWrite(bulkOps);
-    res.status(201).json({
-      success: true,
-      message: `Trade margin created for ${results.length} instruments`,
-      data: { exchange_name: normalizedExchange, amount_type, total: results.length, inserted: bulkResult.upsertedCount, existing: results.length - bulkResult.upsertedCount }
-    });
-  } catch (error) {
-    res.status(500).json({ success: false, message: error.message, data: null });
-  }
-};
-
-/**
- * GET /api/admin/trade-margins/exchange/:exchange_name
- * Query: ?amount_type=amount&page=1&limit=500
- */
-const getTradeMarginByExchange = async (req, res) => {
-  try {
-    const { exchange_name } = req.params;
-    const { amount_type, page = 1, limit = 500 } = req.query;
-    const filter = { exchange_name: exchange_name.toUpperCase(), deleted_at: null };
-    if (amount_type) filter.amount_type = amount_type.toLowerCase();
-    const items = await TradeMargin.find(filter)
-      .limit(parseInt(limit)).skip((parseInt(page) - 1) * parseInt(limit)).sort({ script_name: 1 });
-    const count = await TradeMargin.countDocuments(filter);
-    res.status(200).json({
-      success: true, data: { items: items.map(i => i.toJSON()), total: count, page: parseInt(page), pages: Math.ceil(count / parseInt(limit)) }
-    });
-  } catch (error) {
-    res.status(500).json({ success: false, message: error.message, data: null });
-  }
-};
-
-// ============================================
 // Script Quantity — Bulk Create & Get by Exchange
 // ============================================
 const ScriptQuantity = require('../models/ScriptQuantity');
@@ -591,8 +524,6 @@ module.exports = {
   getGroupInstruments,
   bulkCreateBrokerage,
   getBrokerageByExchange,
-  bulkCreateTradeMargin,
-  getTradeMarginByExchange,
   bulkCreateScriptQuantity,
   getScriptQuantityByExchange
 };

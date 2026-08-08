@@ -14,6 +14,9 @@ const User = require('../models/User');
 const { LOG_PRICE_QUEUE } = require('../config/logFlags');
 const { beginTradeWrite } = require('./tradeWriteFenceService');
 const { calculateMargin } = require('./marginService');
+const walletService = require('./walletService');
+const { categoryForSegment } = require('../utils/walletCategory');
+const { computeWalletSplit } = require('../utils/walletSplit');
 const firebaseService = require('./firebaseService');
 const metricsEngine = require('./metricsEngine');
 const orderBookService = require('./orderBookService');
@@ -139,32 +142,60 @@ async function executeMatchedOrder(match, livePrice, options = {}) {
       const afterNetQty = trade.transaction_type === 'BUY'
         ? previousNetQty + trade.quantity
         : previousNetQty - trade.quantity;
-      const opening = Math.abs(afterNetQty) > Math.abs(previousNetQty);
 
-      if (opening) {
-        const freshMetrics = await metricsEngine.getFreshMetrics(trade.user_id.toString());
-        if (freshMetrics && freshMetrics.free_margin < 0) {
-          trade.status = 'cancelled';
-          trade.remarks = 'Insufficient free margin when limit order triggered';
-          await trade.save({ session });
-          await Trade.create([{
-            user_id: trade.user_id,
-            master_id: trade.master_id,
-            admin_id: trade.admin_id || null,
-            instrument_token: trade.instrument_token,
-            tradingsymbol: trade.tradingsymbol,
-            exchange: trade.exchange,
-            transaction_type: trade.transaction_type,
-            quantity: trade.quantity,
-            price: trade.price,
-            order_type: trade.order_type,
-            status: 'rejected',
-            remarks: `Insufficient free margin (₹${freshMetrics.free_margin.toFixed(2)}). Limit order cancelled.`,
-          }], { session });
-          await lease.assertActive({ session });
-          outcome = { kind: 'cancelled', trade: trade.toObject(), freeMargin: freshMetrics.free_margin };
-          return;
-        }
+      // ── Category trade-wallet gate at FILL time (Task 6 / Requirements 3.1,
+      //    4.1; design §6.2 / §13.2). Placing the pending order did NOT touch the
+      //    wallet — the block/release happens here, when it fills, mirroring
+      //    placeTrade. This REPLACES the old free-margin + equity gates.
+      //
+      //    Category MUST come from the instrument SEGMENT, not `trade.exchange`:
+      //    the Trade stores `exchange` (NSE/NFO/MCX/…), which does NOT carry the
+      //    segment, so categoryForSegment('NFO')→GLOBAL / ('MCX')→GLOBAL would be
+      //    wrong. Resolving from segment maps 'NFO-FUT'→NSE, 'MCX-FUT'→MCX, etc.
+      const walletInstrument = await KiteInstrument.findOne({ instrument_token: trade.instrument_token })
+        .select('segment').session(session).lean();
+      const walletCategory = categoryForSegment(walletInstrument?.segment || trade.exchange || '');
+
+      const { closingQty: walletClosingQty, openingQty: walletOpeningQty } =
+        computeWalletSplit(previousNetQty, trade.transaction_type, trade.quantity);
+      const walletAvgBuy = state.totalBuyQty > 0 ? state.totalBuyValue / state.totalBuyQty : 0;
+      const walletAvgSell = state.totalSellQty > 0 ? state.totalSellValue / state.totalSellQty : 0;
+      // Closed long lots release at avgBuy; closed short lots at avgSell (entry basis).
+      const walletReleaseBasis = previousNetQty > 0 ? walletAvgBuy : walletAvgSell;
+      const walletReleaseAmount = walletClosingQty * walletReleaseBasis;
+      // Limit/SL fills at the limit price: executed_price = trade.price (below).
+      const walletOpeningNotional = walletOpeningQty * trade.price;
+
+      // Affordability pre-check. A reversal's release funds the new opening, so
+      // add it to the available balance (mirrors release-then-block ordering).
+      const walletAvailable = (await walletService.getAvailable('User', trade.user_id, session))[walletCategory];
+      const walletEffectiveAvailable = walletAvailable + walletReleaseAmount;
+      if (walletOpeningQty > 0 && walletOpeningNotional > walletEffectiveAvailable) {
+        const walletShortfall = walletOpeningNotional - walletEffectiveAvailable;
+        const walletRejectRemark = `Insufficient ${walletCategory} wallet balance at fill. Required ₹${walletOpeningNotional.toFixed(2)}, available ₹${walletEffectiveAvailable.toFixed(2)} (short ₹${walletShortfall.toFixed(2)}).`;
+        trade.status = 'rejected';
+        trade.pnl = 0;
+        trade.net_amount = 0;
+        trade.remarks = walletRejectRemark;
+        await trade.save({ session });
+        // Rejection-log Trade (same shape as the previous rejection path).
+        await Trade.create([{
+          user_id: trade.user_id,
+          master_id: trade.master_id,
+          admin_id: trade.admin_id || null,
+          instrument_token: trade.instrument_token,
+          tradingsymbol: trade.tradingsymbol,
+          exchange: trade.exchange,
+          transaction_type: trade.transaction_type,
+          quantity: trade.quantity,
+          price: trade.price,
+          order_type: trade.order_type,
+          status: 'rejected',
+          remarks: walletRejectRemark,
+        }], { session });
+        await lease.assertActive({ session });
+        outcome = { kind: 'rejected', trade: trade.toObject(), category: walletCategory, shortfall: walletShortfall, message: walletRejectRemark };
+        return;
       }
 
       const realisedPnl = realisedPnlFor(trade, state);
@@ -172,21 +203,28 @@ async function executeMatchedOrder(match, livePrice, options = {}) {
       const marginPerUnit = await calculateMargin(trade.exchange, 1, trade.price);
       const previousMargin = Math.abs(previousNetQty) * marginPerUnit;
       const newMargin = Math.abs(afterNetQty) * marginPerUnit;
+      // NOTE: marginDelta is now notional — persisted equity interaction pending
+      // review (see Task 5 flag). calculateMargin returns |qty|×price after Task 3,
+      // so this still subtracts a notional-sized amount from the PERSISTED
+      // user.equity running balance. Kept byte-for-byte for parity with placeTrade;
+      // flagged for user review.
       const marginDelta = newMargin - previousMargin;
       const balanceChange = realisedPnl - marginDelta - brokerage;
       const user = await User.findById(trade.user_id).session(session);
       if (!user) throw new Error(`Pending-order user ${trade.user_id} not found`);
-
       const currentEquity = Number(user.equity || 0);
-      if (marginDelta > 0 && currentEquity + balanceChange < 0) {
-        trade.status = 'rejected';
-        trade.pnl = 0;
-        trade.net_amount = 0;
-        trade.remarks = 'Insufficient balance when limit order triggered';
-        await trade.save({ session });
-        await lease.assertActive({ session });
-        outcome = { kind: 'rejected', trade: trade.toObject(), marginDelta, equity: currentEquity };
-        return;
+
+      // Gate passed — apply the wallet mutations inside this transaction. Release
+      // the closed portion's entry notional first, then block the opened portion.
+      // block() is the atomic never-negative backstop; the pre-check above means
+      // it normally succeeds, but if a concurrent race makes it throw
+      // INSUFFICIENT_WALLET we let it propagate so the transaction aborts and the
+      // order stays pending to retry on the next tick (never silently completed).
+      if (walletClosingQty > 0 && walletReleaseBasis > 0) {
+        await walletService.release('User', trade.user_id, walletCategory, walletReleaseAmount, session);
+      }
+      if (walletOpeningQty > 0) {
+        await walletService.block('User', trade.user_id, walletCategory, walletOpeningNotional, session);
       }
 
       trade.status = 'completed';
@@ -262,19 +300,16 @@ async function notifyOutcome(outcome, livePrice) {
   if (!trade) return;
   const livePriceService = require('./livePriceService');
 
-  if (outcome.kind === 'cancelled') {
-    console.log(`⚠️ [PriceQueue] Cancelled ${trade.tradingsymbol} LIMIT — insufficient free margin (₹${outcome.freeMargin.toFixed(2)})`);
+  if (outcome.kind === 'rejected') {
+    const rejectMessage = outcome.message || 'Order rejected at fill.';
+    console.log(`⚠️ [PriceQueue] Rejected ${trade.tradingsymbol} — ${rejectMessage}`);
+    // Broadcast so the user's orders tab reflects the fill-time rejection.
     livePriceService.broadcastToUser(trade.user_id.toString(), {
       type: 'trade_rejected',
       trade_id: trade._id.toString(),
       tradingsymbol: trade.tradingsymbol,
-      message: 'Insufficient free margin. Limit order cancelled.',
+      message: rejectMessage,
     });
-    return;
-  }
-
-  if (outcome.kind === 'rejected') {
-    console.log(`⚠️ [PriceQueue] Rejected ${trade.tradingsymbol} - insufficient balance (need ₹${outcome.marginDelta.toFixed(2)}, have ₹${outcome.equity.toFixed(2)})`);
     return;
   }
 

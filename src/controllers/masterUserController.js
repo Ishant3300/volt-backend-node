@@ -9,6 +9,9 @@ const Trade = require('../models/Trade');
 const CreditTransaction = require('../models/CreditTransaction');
 const KiteInstrument = require('../models/KiteInstrument');
 const { beginTradeWrite } = require('../services/tradeWriteFenceService');
+const walletService = require('../services/walletService');
+const { categoryForSegment } = require('../utils/walletCategory');
+const { applyWalletFunding } = require('./walletController');
 
 /**
  * Square off all open positions for a user in the given segments.
@@ -35,6 +38,7 @@ async function _squareOffUserSegments(userId, segments, options = {}) {
 
     const segmentsUpper = segments.map(segment => segment.toUpperCase());
     const tradesToCreate = [];
+    const releasesToApply = [];
     for (const pos of metrics.positions) {
       if (pos.net_qty === 0) continue;
 
@@ -78,12 +82,29 @@ async function _squareOffUserSegments(userId, segments, options = {}) {
         pnl: Math.round(closingPnl * 100) / 100,
         remarks: `Intraday square-off: ${pos.segment} segment closed by admin`,
       });
+
+      // Requirement 3.2 / 7.5: collect the closed position's ENTRY notional to
+      // release back to its category wallet. Prefer the SEGMENT over the base
+      // exchange so 'NFO-FUT'→NSE / 'MCX-FUT'→MCX (exchange alone would be wrong).
+      const releaseAmount = absQty * avgEntry;
+      if (releaseAmount > 0) {
+        releasesToApply.push({
+          category: categoryForSegment(pos.segment || pos.exchange || ''),
+          amount: releaseAmount,
+        });
+      }
     }
 
     if (tradesToCreate.length === 0) return 0;
     await session.withTransaction(async () => {
       await lease.assertActive({ session });
       await Trade.insertMany(tradesToCreate, { session, ordered: true });
+      // Requirement 3.2 / 7.5: release each closed position's ENTRY notional
+      // back to its category wallet inside the same transaction as the close
+      // writes, so the releases commit atomically with the square-off trades.
+      for (const r of releasesToApply) {
+        await walletService.release('User', userId, r.category, r.amount, session);
+      }
       await lease.assertActive({ session });
     });
     squaredOff = tradesToCreate.length;
@@ -282,6 +303,17 @@ const createUser = async (req, res) => {
       const { copyFromMasterToUser } = require('../services/scriptQuantityCopyService');
       await copyFromMasterToUser(parentMaster._id.toString(), user._id.toString(), session);
 
+      // Task 13 / design §13.3: apply any inline initial wallet funding. Because
+      // createUser is a master route, this is a TRANSFER — the master's OWN
+      // category pool is debited and the new user credited via walletService.assign.
+      // It runs inside this same transaction (session passed through) so a master
+      // over-funding throws INSUFFICIENT_WALLET and aborts the ENTIRE user creation
+      // (Requirement 5.3 — "rejected"). This wallet pool is independent of the
+      // credits/equity debit above. No-op when req.body.wallet is absent.
+      if (req.body.wallet) {
+        await applyWalletFunding({ req, targetType: 'User', targetId: user._id, walletMap: req.body.wallet, session });
+      }
+
       resultData = {
         user: user.toJSON(),
         parent_master_remaining_balance: parentMaster.equity
@@ -301,6 +333,12 @@ const createUser = async (req, res) => {
     let statusCode = 500;
     if (error.message === 'Parent master not found' || error.message === 'Server not found') statusCode = 404;
     else if (error.message.includes('Insufficient balance') || error.message.includes('Username already exists') || error.message.includes('Account limit reached')) statusCode = 400;
+    // Task 13: an inline wallet transfer that the master's pool can't cover
+    // aborts the create — surface it as a clear 400 naming the category.
+    else if (error.code === 'INSUFFICIENT_WALLET') {
+      statusCode = 400;
+      error.message = `Insufficient ${error.category} wallet balance to fund the new account.`;
+    }
 
     res.status(statusCode).json({
       success: false,
@@ -516,6 +554,15 @@ const updateUserDetails = async (req, res) => {
 
     await user.save();
 
+    // Task 13 / design §13.3: inline wallet on EDIT is an ADDITIVE top-up applied
+    // via walletService.assign (master transfer / admin grant). REDUCTIONS use the
+    // dedicated wallet withdraw endpoint (Task 12), never this path. There is no
+    // transaction here (the profile save already committed), so walletService opens
+    // its own transaction per category; a funding failure surfaces as a 400 below.
+    if (req.body.wallet) {
+      await applyWalletFunding({ req, targetType: 'User', targetId: user._id, walletMap: req.body.wallet });
+    }
+
     // If margin_square_off was just toggled ON, immediately check if user needs square-off
     if (margin_square_off === true) {
       try {
@@ -538,6 +585,15 @@ const updateUserDetails = async (req, res) => {
       data: user.toJSON()
     });
   } catch (error) {
+    // Task 13: an inline wallet top-up the master's pool can't cover → 400 with a
+    // clear message. The profile fields were already saved; only funding failed.
+    if (error.code === 'INSUFFICIENT_WALLET') {
+      return res.status(400).json({
+        success: false,
+        message: `Insufficient ${error.category} wallet balance to fund the account.`,
+        data: null
+      });
+    }
     res.status(500).json({
       success: false,
       message: error.message,

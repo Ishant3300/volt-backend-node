@@ -4,13 +4,15 @@ const Master = require('../models/Master');
 const KiteInstrument = require('../models/KiteInstrument');
 const BrokerageSettings = require('../models/BrokerageSettings');
 const kiteService = require('../services/kiteService');
-const TradeMargin = require('../models/TradeMargin');
 const ScriptQuantity = require('../models/ScriptQuantity');
 const GroupedQuantity = require('../models/GroupedQuantity');
 const mongoose = require('mongoose');
 const Transaction = require('../models/Transaction');
 const orderBookService = require('../services/orderBookService');
 const { calculateMargin } = require('../services/marginService');
+const walletService = require('../services/walletService');
+const { categoryForSegment } = require('../utils/walletCategory');
+const { computeWalletSplit } = require('../utils/walletSplit');
 const firebaseService = require('../services/firebaseService');
 const { beginTradeWrite, withTradeWriteLease } = require('../services/tradeWriteFenceService');
 
@@ -70,6 +72,14 @@ const _computeUserFloatingPnl = async (userId, session) => {
         return 0; // Fallback: assume 0 floating if computation fails
     }
 };
+
+/**
+ * `computeWalletSplit` (the pure open/close split that drives the category-wallet
+ * release/block) now lives in `src/utils/walletSplit.js` so the pending-fill
+ * services can import it without depending on this controller. It is re-exported
+ * from here (see module.exports) for backwards compatibility with existing
+ * callers/tests that import it from the controller.
+ */
 
 /**
  * Place a new trade order
@@ -132,28 +142,10 @@ const placeTrade = async (req, res) => {
                 throw new Error('User not found');
             }
 
-            // Compute live equity and free margin for margin check.
-            // ALWAYS use metricsEngine (single source of truth — same as orders page UI).
-            // equity = credit + m2mPnl
-            // freeMargin = equity - marginUsed
-            let liveEquity;
-            let liveFreeMargin;
-            const metricsEngine = require('../services/metricsEngine');
-            const freshMetrics = await metricsEngine.getFreshMetrics(user._id.toString());
-            if (freshMetrics) {
-                liveEquity = freshMetrics.equity;
-                liveFreeMargin = freshMetrics.free_margin;
-            } else {
-                // User has no trades at all — equity = freeMargin = credits
-                liveEquity = user.credits || 0;
-                liveFreeMargin = user.credits || 0;
-            }
-
-            // ── Early free margin warning for LIMIT orders ──
-            // Inform user gracefully before any other validation
-            if (!req.admin && order_type === 'LIMIT' && liveFreeMargin < 0) {
-                throw new Error(`Your free margin is negative (₹${liveFreeMargin.toFixed(2)}). Please close existing positions or add funds before placing limit orders.`);
-            }
+            // NOTE: The old live free-margin gate (metricsEngine equity/free_margin) is
+            // replaced by the category-wallet gate applied at execution time below
+            // (walletService.block). LIMIT orders no longer warn on free margin at
+            // placement — they block at fill time (Task 6).
 
             // ── BET check: if bet is OFF, user cannot trade at all (BUY or SELL) ──
             // Admin placing on behalf of user bypasses this check
@@ -371,34 +363,10 @@ const placeTrade = async (req, res) => {
                             );
                         }
 
-                        // VALIDATION 3: balance / margin check (only for opening trades)
-                        if (absAfter > absCurrent) {
-                            const remainingQty = Math.max(0, limitValue - absCurrent);
-                            let priceForMargin = price;
-                            if (!priceForMargin || priceForMargin <= 0) {
-                                const ltpMapForMargin = await _getLivePricesFromKite([parseInt(instrument_token)]);
-                                priceForMargin = ltpMapForMargin.get(parseInt(instrument_token)) || ltpMapForMargin.get(instrument_token.toString());
-                            }
-                            if (!priceForMargin || priceForMargin <= 0) {
-                                throw new Error('Could not determine price for margin calculation');
-                            }
-
-                            const marginPerUnit = await calculateMargin(normalizedExchange, 1, priceForMargin, { rawName: instrumentRawName, instrumentToken: instrument_token, tradingsymbol });
-                            const availableBalance = liveFreeMargin;
-                            const maxAffordableQty = marginPerUnit > 0 ? Math.floor(availableBalance / marginPerUnit) : remainingQty;
-                            const effectiveMaxQty = Math.min(remainingQty, maxAffordableQty);
-
-                            if (quantity > effectiveMaxQty) {
-                                const requiredMargin = quantity * marginPerUnit;
-                                if (maxAffordableQty === 0) {
-                                    throw new Error(`Insufficient margin to place even 1 unit. Available: ₹${availableBalance.toFixed(2)}, Required per unit: ₹${marginPerUnit.toFixed(2)}.`);
-                                } else {
-                                    throw new Error(
-                                        `Insufficient balance for ${quantity} qty. Available: ₹${availableBalance.toFixed(2)}, Required: ₹${requiredMargin.toFixed(2)}. Max affordable: ${maxAffordableQty} qty.`
-                                    );
-                                }
-                            }
-                        }
+                        // VALIDATION 3 (old free-margin affordability check) removed for
+                        // Task 5 — the category-wallet gate (walletService.block at execution)
+                        // now enforces affordability per Requirement 4. Script-quantity limits
+                        // (VALIDATION 1/2 above) still apply.
                     }
 
                 } else if (isLotMode) {
@@ -451,34 +419,10 @@ const placeTrade = async (req, res) => {
                             );
                         }
 
-                        // VALIDATION 3: balance / margin check (only for opening trades)
-                        if (Math.abs(afterNetQty) > Math.abs(currentNetQty)) {
-                            const remainingLots = Math.max(0, limitValue - currentLots);
-                            let priceForMargin = price;
-                            if (!priceForMargin || priceForMargin <= 0) {
-                                const ltpMapForMargin = await _getLivePricesFromKite([parseInt(instrument_token)]);
-                                priceForMargin = ltpMapForMargin.get(parseInt(instrument_token)) || ltpMapForMargin.get(instrument_token.toString());
-                            }
-                            if (!priceForMargin || priceForMargin <= 0) {
-                                throw new Error('Could not determine price for margin calculation');
-                            }
-
-                            const marginPerLot = await calculateMargin(normalizedExchange, lotSize, priceForMargin, { rawName: instrumentRawName, instrumentToken: instrument_token, tradingsymbol });
-                            const availableBalance = liveFreeMargin;
-                            const maxAffordableLots = marginPerLot > 0 ? Math.floor(availableBalance / marginPerLot) : remainingLots;
-                            const effectiveMaxLots = Math.min(remainingLots, maxAffordableLots);
-
-                            if (requestedLots > effectiveMaxLots) {
-                                const requiredMargin = requestedLots * marginPerLot;
-                                if (maxAffordableLots === 0) {
-                                    throw new Error(`Insufficient margin to place even 1 lot. Available: ₹${availableBalance.toFixed(2)}, Required per lot: ₹${marginPerLot.toFixed(2)}.`);
-                                } else {
-                                    throw new Error(
-                                        `Insufficient balance for ${requestedLots} lot(s). Available: ₹${availableBalance.toFixed(2)}, Required: ₹${requiredMargin.toFixed(2)}. Max affordable: ${maxAffordableLots} lot(s).`
-                                    );
-                                }
-                            }
-                        }
+                        // VALIDATION 3 (old free-margin affordability check) removed for
+                        // Task 5 — the category-wallet gate (walletService.block at execution)
+                        // now enforces affordability per Requirement 4. Script-quantity limits
+                        // (VALIDATION 1/2 above) still apply.
                     }
                 }
             }
@@ -920,58 +864,10 @@ const placeTrade = async (req, res) => {
                 tradeRealisedPnl = Math.round(tradeRealisedPnl * 100) / 100;
             }
 
-            // ── Free Margin & Trade Margin validation (opening trades only) ──
-            // Checks for MARKET and SL orders (execute immediately).
-            // LIMIT orders skip this — margin is checked when the pending order triggers.
-            if (shouldExecuteNow && !req.admin) {
-                // Determine if this is an opening trade
-                const aggDataFM = existingAgg.length > 0 ? existingAgg[0] : null;
-                const currentNetQtyFM = aggDataFM ? aggDataFM.total_buy_qty - aggDataFM.total_sell_qty : 0;
-                const afterNetQtyFM = transaction_type === 'BUY' ? currentNetQtyFM + quantity : currentNetQtyFM - quantity;
-                const isOpeningFM = Math.abs(afterNetQtyFM) > Math.abs(currentNetQtyFM);
-
-                if (isOpeningFM) {
-                    // Check 1: Free margin must not be negative (use fresh metrics, not cached)
-                    const metricsEngine = require('../services/metricsEngine');
-                    const freshMetricsFM = await metricsEngine.getFreshMetrics(user._id.toString());
-                    if (freshMetricsFM && freshMetricsFM.free_margin < 0) {
-                        throw new Error('Insufficient free margin. Your free margin is negative. Please close existing positions or add funds.');
-                    }
-
-                    // Check 2: Verify trade margin is configured for this instrument
-                    const TradeMargin = require('../models/TradeMargin');
-                    const rawSeg = (segment || exchange || '').toUpperCase();
-                    // GLOBAL and INDICES are the same segment — normalize to check both
-                    const normalizedSegment = (rawSeg === 'GLOBAL' || rawSeg === 'INDICES') ? 'GLOBAL' : rawSeg;
-                    
-                    let marginRule = null;
-                    if (instrumentRawName) {
-                        marginRule = await TradeMargin.findOne({ script_name: { $regex: new RegExp('^' + instrumentRawName + '$', 'i') }, exchange_name: normalizedSegment, deleted_at: null }).session(session);
-                    }
-                    if (!marginRule && instrumentRawName) {
-                        // Try the alternate name (GLOBAL↔INDICES)
-                        const altSegment = normalizedSegment === 'GLOBAL' ? 'INDICES' : (normalizedSegment === 'INDICES' ? 'GLOBAL' : null);
-                        if (altSegment) {
-                            marginRule = await TradeMargin.findOne({ script_name: { $regex: new RegExp('^' + instrumentRawName + '$', 'i') }, exchange_name: altSegment, deleted_at: null }).session(session);
-                        }
-                    }
-                    if (!marginRule) {
-                        marginRule = await TradeMargin.findOne({ exchange_name: normalizedSegment, script_name: { $in: [null, ''] }, deleted_at: null }).session(session);
-                    }
-                    if (!marginRule && (normalizedSegment === 'GLOBAL' || normalizedSegment === 'INDICES')) {
-                        const altSegment = normalizedSegment === 'GLOBAL' ? 'INDICES' : 'GLOBAL';
-                        marginRule = await TradeMargin.findOne({ exchange_name: altSegment, script_name: { $in: [null, ''] }, deleted_at: null }).session(session);
-                    }
-                    if (!marginRule && normalizedSegment.includes('-')) {
-                        const baseExchange = normalizedSegment.split('-')[0];
-                        marginRule = await TradeMargin.findOne({ exchange_name: baseExchange, script_name: { $in: [null, ''] }, deleted_at: null }).session(session);
-                    }
-
-                    if (!marginRule || marginRule.trade_margin <= 0) {
-                        throw new Error(`Trade margin is not configured for ${instrumentRawName || tradingsymbol} (${normalizedSegment}). Please contact your admin.`);
-                    }
-                }
-            }
+            // NOTE: The old Free-Margin + per-instrument margin validation block was
+            // removed for Task 5. Affordability is now enforced by the category-wallet
+            // gate (walletService.block at execution, below), and margin equals the full
+            // traded notional (no per-instrument margin rule). Requirements 4.1–4.5.
 
             const newTrade = new Trade({
                 user_id: user._id,
@@ -1007,6 +903,44 @@ const placeTrade = async (req, res) => {
                 const isBuy = transaction_type === 'BUY';
                 const newNetQty = prevNetQtyForMargin + (isBuy ? quantity : -quantity);
 
+                // ── Category trade-wallet: release the closed portion, then block the opened
+                //    portion (Task 5 / Requirements 3.1–3.5, 4.1, 4.5, 1.4). Runs for EVERY
+                //    executed trade regardless of who places it (user, master or admin) and
+                //    operates on the TARGET user's wallet. Pending LIMIT orders do NOT block
+                //    here — they block at fill time (Task 6). All mutations use this trade's
+                //    `session`, so they roll back atomically with the trade write.
+                {
+                    // Category is derived from the RAW segment (NOT normalizedExchange, which
+                    // maps GLOBAL→INDICES for the legacy ScriptQuantity lookups).
+                    const walletCategory = categoryForSegment(segment || exchange || '');
+
+                    const walletAgg = existingAgg && existingAgg.length > 0 ? existingAgg[0] : null;
+                    const walletAvgBuy = walletAgg && walletAgg.total_buy_qty > 0
+                        ? walletAgg.total_buy_value / walletAgg.total_buy_qty : 0;
+                    const walletAvgSell = walletAgg && walletAgg.total_sell_qty > 0
+                        ? walletAgg.total_sell_value / walletAgg.total_sell_qty : 0;
+
+                    const { closingQty: walletClosingQty, openingQty: walletOpeningQty } =
+                        computeWalletSplit(prevNetQtyForMargin, transaction_type, quantity);
+
+                    // Closed long lots release at avgBuy; closed short lots at avgSell (entry basis).
+                    const walletReleaseBasis = prevNetQtyForMargin > 0 ? walletAvgBuy : walletAvgSell;
+
+                    // Release first — entry notional of the closed quantity, independent of the
+                    // exit price / P&L (Requirement 3.2).
+                    if (walletClosingQty > 0 && walletReleaseBasis > 0) {
+                        await walletService.release('User', user._id, walletCategory, walletClosingQty * walletReleaseBasis, session);
+                    }
+
+                    // Then gate + block the opened/increased portion at the execution price
+                    // (entry notional, Requirements 1.4 / 3.1). block() throws INSUFFICIENT_WALLET
+                    // when the pool cannot cover it, aborting this transaction (the trade write
+                    // rolls back) → clean category + shortfall rejection in the catch below.
+                    if (walletOpeningQty > 0) {
+                        await walletService.block('User', user._id, walletCategory, walletOpeningQty * executedPrice, session);
+                    }
+                }
+
                 const normalizedExchange = ((segment || exchange || '').toUpperCase()) === 'GLOBAL' ? 'INDICES' : (segment || exchange || '').toUpperCase();
                 // Calculate total margin for previous and new net positions directly
                 // calculateMargin handles lot-based (per-lot) vs percentage internally
@@ -1016,6 +950,11 @@ const placeTrade = async (req, res) => {
                 const newMargin = Math.abs(newNetQty) > 0
                     ? await calculateMargin(normalizedExchange, Math.abs(newNetQty), executedPrice, { rawName: instrumentRawName, instrumentToken: instrument_token, tradingsymbol })
                     : 0;
+                // NOTE: marginDelta is now notional (see spec Task 5 flag) — persisted equity
+                // interaction pending review. After Task 3, calculateMargin returns the full
+                // |qty|×price notional, so this term now subtracts notional-sized amounts from
+                // the PERSISTED user.equity running balance (design D2 describes persisted equity
+                // as credit+realised only). Left unchanged per Task 5; flagged for user review.
                 const marginDelta = newMargin - prevMargin; // +ve = more margin needed
 
                 // #7 FIX: Block if free margin goes negative (balance - currentMargin - newMarginDelta < 0)
@@ -1215,6 +1154,33 @@ const placeTrade = async (req, res) => {
         await tradeWriteLease?.release();
         tradeWriteLease = null;
 
+        // Map an insufficient category-wallet rejection (thrown by walletService.block as
+        // the affordability gate) to a clear, user-facing message naming the category and
+        // shortfall (Task 5, Requirements 4.1 / 4.2). The available-balance read runs
+        // outside the aborted transaction and is best-effort.
+        if (error.code === 'INSUFFICIENT_WALLET') {
+            const walletCat = error.category;
+            const requiredAmt = Number(error.requested) || 0;
+            let availableAmt = null;
+            try {
+                const walletTargetId = (req.body.user_id && req.admin)
+                    ? req.body.user_id
+                    : (req.body.user_id || req.user?.id || req.master?.id || req.admin?.id);
+                if (walletTargetId && walletCat) {
+                    const bal = await walletService.getAvailable('User', walletTargetId);
+                    availableAmt = Number(bal[walletCat]) || 0;
+                }
+            } catch (_) { /* best-effort — fall back to a required-only message */ }
+
+            if (availableAmt != null) {
+                const shortfall = Math.max(0, Math.round((requiredAmt - availableAmt) * 100) / 100);
+                error.message = `Insufficient ${walletCat} wallet balance. Required ₹${requiredAmt.toFixed(2)}, available ₹${availableAmt.toFixed(2)} (short ₹${shortfall.toFixed(2)}).`;
+            } else {
+                error.message = `Insufficient ${walletCat} wallet balance. Required ₹${requiredAmt.toFixed(2)}.`;
+            }
+            error.status = 400;
+        }
+
         // Save rejected trade to rejection log for margin/FSL failures
         const isRejectable = error.message.includes('free margin') ||
             error.message.includes('Trade margin is not configured') ||
@@ -1223,6 +1189,7 @@ const placeTrade = async (req, res) => {
             error.message.includes('Trading is currently disabled') ||
             error.message.includes('Insufficient balance') ||
             error.message.includes('Insufficient margin') ||
+            error.message.includes('wallet balance') ||
             error.message.includes('exceeds') ||
             error.message.includes('Option selling is not allowed');
 
@@ -1258,6 +1225,7 @@ const placeTrade = async (req, res) => {
         else if (error.message.includes('Trading is currently disabled')) statusCode = 403;
         else if (error.message.includes('close-only mode')) statusCode = 403;
         else if (error.message.includes('Insufficient balance') || error.message.includes('Insufficient margin') || error.message.includes('Insufficient free margin')) statusCode = 400;
+        else if (error.code === 'INSUFFICIENT_WALLET' || error.message.includes('wallet balance')) statusCode = 400;
         else if (error.message.includes('Could not fetch') || error.message.includes('Invalid')) statusCode = 400;
         else if (error.message.includes('exceeds')) statusCode = 400;
         else if (error.message.includes('Trade margin is not configured')) statusCode = 400;
@@ -1303,6 +1271,7 @@ const getAccountMetrics = async (req, res) => {
                     position_pnl: metrics.position_pnl,
                     m2m_pnl: metrics.m2m_pnl,
                     margin_used: metrics.margin_used,
+                    wallet: metrics.wallet || {},
                     positions: metrics.positions || [],
                 }
             });
@@ -1328,6 +1297,7 @@ const getAccountMetrics = async (req, res) => {
                 position_pnl: 0,
                 m2m_pnl: 0,
                 margin_used: 0,
+                wallet: {},
             }
         });
     } catch (error) {
@@ -1444,27 +1414,6 @@ getPositions = async (req, res) => {
     }
 }
 
-
-/**
- * Get exchange margin rules for frontend calculation
- */
-const getMargins = async (req, res) => {
-    try {
-        const margins = await TradeMargin.find({ deleted_at: null });
-
-        res.status(200).json({
-            success: true,
-            message: 'Trade Margins fetched successfully',
-            data: margins
-        });
-    } catch (error) {
-        res.status(500).json({
-            success: false,
-            message: error.message,
-            data: null
-        });
-    }
-};
 
 /**
  * Cancel a pending limit order
@@ -1744,7 +1693,8 @@ const autoSquareOffExpired = async (req, res) => {
 
 /**
  * GET /trade/instrument-info?token=X
- * Returns trade margin, brokerage rule, and instrument details for the info sheet.
+ * Returns brokerage rule and instrument details for the info sheet.
+ * (Per-instrument trade margin was removed — margin is now notional |qty| × price.)
  */
 const getInstrumentInfo = async (req, res) => {
     try {
@@ -1752,7 +1702,6 @@ const getInstrumentInfo = async (req, res) => {
         if (!token) return res.status(400).json({ success: false, message: 'token is required' });
 
         const KiteInstrument = require('../models/KiteInstrument');
-        const TradeMargin = require('../models/TradeMargin');
         const BrokerageSettings = require('../models/BrokerageSettings');
 
         const instrument = await KiteInstrument.findOne({ instrument_token: token }).lean();
@@ -1762,14 +1711,7 @@ const getInstrumentInfo = async (req, res) => {
         const rawName = instrument.raw_name || '';
         const exchange = seg.split('-')[0] || instrument.exchange || '';
 
-        // Trade margin: 4-level fallback (raw_name+segment → raw_name → segment → exchange)
-        let marginRule = null;
-        if (rawName && seg) marginRule = await TradeMargin.findOne({ script_name: { $regex: new RegExp(`^${rawName}$`, 'i') }, exchange_name: seg.toUpperCase(), deleted_at: null }).lean();
-        if (!marginRule && rawName) marginRule = await TradeMargin.findOne({ script_name: { $regex: new RegExp(`^${rawName}$`, 'i') }, deleted_at: null }).lean();
-        if (!marginRule && seg) marginRule = await TradeMargin.findOne({ exchange_name: seg.toUpperCase(), script_name: { $in: [null, ''] }, deleted_at: null }).lean();
-        if (!marginRule) marginRule = await TradeMargin.findOne({ exchange_name: exchange.toUpperCase(), script_name: { $in: [null, ''] }, deleted_at: null }).lean();
-
-        // Brokerage: same 4-level fallback
+        // Brokerage: 4-level fallback (raw_name+segment → raw_name → segment → exchange)
         let brkRule = null;
         if (rawName && seg) brkRule = await BrokerageSettings.findOne({ script_name: { $regex: new RegExp(`^${rawName}$`, 'i') }, exchange_name: seg.toUpperCase(), deleted_at: null }).lean();
         if (!brkRule && rawName) brkRule = await BrokerageSettings.findOne({ script_name: { $regex: new RegExp(`^${rawName}$`, 'i') }, deleted_at: null }).lean();
@@ -1786,10 +1728,6 @@ const getInstrumentInfo = async (req, res) => {
                 lot_size: instrument.lot_size || 1,
                 tick_size: instrument.tick_size,
                 instrument_type: instrument.instrument_type,
-                trade_margin: marginRule ? {
-                    value: marginRule.trade_margin,
-                    type: marginRule.amount_type,
-                } : null,
                 brokerage: brkRule ? {
                     value: brkRule.brk_value,
                     type: brkRule.type,
@@ -1803,12 +1741,12 @@ const getInstrumentInfo = async (req, res) => {
 
 module.exports = {
     placeTrade,
+    computeWalletSplit,
     cancelTrade,
     deleteTrade,
     getAccountMetrics,
     saveClientMetrics,
     getPositions,
-    getMargins,
     getBrokerageRules,
     autoSquareOffExpired,
     getInstrumentInfo,

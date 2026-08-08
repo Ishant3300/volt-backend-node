@@ -1,7 +1,6 @@
 const Trade = require('../models/Trade');
 const User = require('../models/User');
 const Master = require('../models/Master');
-const TradeMargin = require('../models/TradeMargin');
 
 /**
  * Get aggregated positions across all child users of the logged-in master.
@@ -548,13 +547,23 @@ const getLiveMetrics = async (req, res) => {
       // build a fresh response from DB so the Position tab shows correct equity.
       let metrics = metricsEngine.getCachedMetrics(user_id);
       if (!metrics) {
-        // User not in cache (no active trades) — return their credit + settled_pnl as equity
+        // User not in cache (no active trades) — build a fresh response from DB so the Position tab shows correct equity.
         const User = require('../models/User');
-        const user = await User.findById(user_id).select('credits settled_pnl').lean();
+        const user = await User.findById(user_id).select('credits settled_pnl wallet exchanges_allowed').lean();
         if (user) {
           const credit = user.credits || 0;
-          const settledPnl = user.settled_pnl || 0;
-          const equity = Math.round((credit + settledPnl) * 100) / 100;
+          
+          let equity = 0;
+          if (user.wallet && user.exchanges_allowed) {
+            const { allowedCategories } = require('../utils/walletCategory');
+            const allowedCats = allowedCategories(user.exchanges_allowed);
+            const walletSum = allowedCats.reduce((sum, cat) => sum + (Number(user.wallet[cat]) || 0), 0);
+            equity = Math.round(walletSum * 100) / 100;
+          } else {
+            const settledPnl = user.settled_pnl || 0;
+            equity = Math.round((credit + settledPnl) * 100) / 100; // Fallback if no wallet
+          }
+
           metrics = {
             user_id,
             credit: Math.round(credit * 100) / 100,
