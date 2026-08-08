@@ -104,16 +104,16 @@ function buildNseSettlementOperations(
     }
 
     const token = instrument.instrument_token.toString();
-    closePriceMap[token] = bhav.settle_pr;
+    closePriceMap[token] = bhav.close;
     const settlementFields = {
-      settlement_price: bhav.settle_pr,
+      settlement_price: bhav.close,
       settlement_price_date: new Date(nseDate),
-      settlement_price_source: 'NSE_OFFICIAL_BHAVCOPY_SETTLEMENT',
+      settlement_price_source: 'NSE_OFFICIAL_BHAVCOPY_CLOSE',
       settlement_price_updated_at: updatedAt,
       ohlc_open: bhav.open,
       ohlc_high: bhav.high,
       ohlc_low: bhav.low,
-      ohlc_close: bhav.settle_pr,
+      ohlc_close: bhav.close,
     };
     bulkOps.push({
       updateOne: {
