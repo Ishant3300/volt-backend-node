@@ -625,6 +625,25 @@ Read per-category available balances. A master may read its own wallet or a dire
 { "success": true, "data": { "owner_type": "User", "owner_id": "6a5d...", "wallet": { "NSE": 25000, "MCX": 0, "GLOBAL": 0 } } }
 ```
 
+### GET `/api/master/username/generate`
+Automatically generate a unique 6-digit username and reserve it in cache for 5 minutes. Auth: Admin/Master.
+
+```json
+// Response
+{ "success": true, "data": { "username": "394821" } }
+```
+
+### POST `/api/master/username/release`
+Release a generated username if the master/user creation flow is aborted. Auth: Admin/Master.
+
+```json
+// Request
+{ "username": "394821" }
+
+// Response
+{ "success": true, "message": "Username 394821 released successfully" }
+```
+
 ---
 
 ## 14. Master Flow — Trades & Positions
