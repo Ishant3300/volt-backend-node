@@ -61,6 +61,11 @@ const {
   getWallet,
 } = require('../controllers/walletController');
 
+const {
+  generateUsername,
+  releaseUsername
+} = require('../controllers/usernameController');
+
 // All routes require admin or master authentication
 router.use(authenticateAdminOrMaster);
 
@@ -80,6 +85,16 @@ router.post('/wallet/withdraw', walletWithdraw);
 
 // Read per-category available balances (self or a direct child)
 router.get('/wallet', getWallet);
+
+// ============================================
+// Username Generation Routes
+// ============================================
+
+// Generate a unique 6-digit username (reserved for 5 minutes)
+router.get('/username/generate', generateUsername);
+
+// Release a reserved username if not used
+router.post('/username/release', releaseUsername);
 
 // ============================================
 // Child Master Management Routes
