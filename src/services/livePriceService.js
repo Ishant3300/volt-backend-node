@@ -26,6 +26,7 @@ class LivePriceService {
       this.autoLoginAttempted = false;
       this._consecutiveFails = 0;
       this._lastErrorWas403 = false;
+      this.pendingTokensCache = new Set();
     }
 
   /**
@@ -319,6 +320,11 @@ class LivePriceService {
       const positionTokens = metricsEngine.getPositionTokens();
       positionTokens.forEach(t => this.subscribedTokens.add(t));
     } catch (_) {}
+
+    // Include all pending limit order tokens so they trigger when price reaches limit
+    if (this.pendingTokensCache) {
+      this.pendingTokensCache.forEach(t => this.subscribedTokens.add(t));
+    }
 
     const tokens = Array.from(this.subscribedTokens);
     if (tokens.length === 0) {

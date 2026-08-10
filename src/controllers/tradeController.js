@@ -1085,6 +1085,7 @@ const placeTrade = async (req, res) => {
                 }
 
                 const livePriceService = require('../services/livePriceService');
+                livePriceService.addPendingToken(resultTrade.instrument_token);
                 livePriceService.broadcastToUser(resultTrade.user_id.toString(), {
                     type: 'trade_placed',
                     trade_id: resultTrade._id.toString(),
