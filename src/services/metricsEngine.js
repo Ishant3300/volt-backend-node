@@ -593,7 +593,8 @@ class MetricsEngine {
         position_pnl: metrics.position_pnl,
         realised_pnl: metrics.realised_pnl,
         margin_used: metrics.margin_used,
-        positions: metrics.positions
+        positions: metrics.positions,
+        wallet: metrics.wallet
       });
     }
 
@@ -627,10 +628,27 @@ class MetricsEngine {
       }
 
       if (allUsers.length > 0) {
+        const masterConfig = this._masterConfigMap?.[masterId] || {};
+        
+        // Aggregate wallet for the master
+        const masterWallet = {};
+        for (const u of allUsers) {
+          if (u.wallet) {
+            for (const [cat, val] of Object.entries(u.wallet)) {
+              masterWallet[cat] = (masterWallet[cat] ?? 0) + (Number(val) || 0);
+            }
+          }
+        }
+        for (const cat of Object.keys(masterWallet)) {
+          masterWallet[cat] = Math.round(masterWallet[cat] * 100) / 100;
+        }
+
         this.livePriceService.broadcastToUser(masterId, {
           type: 'master_metrics_update',
           data: {
             total_pnl: Math.round(totalPnl * 100) / 100,
+            credit: masterConfig.credits || 0,
+            wallet: masterWallet,
             users: allUsers
           }
         });
@@ -681,10 +699,29 @@ class MetricsEngine {
             totalPnl += (u.realised_pnl || 0) + (u.position_pnl || 0);
           }
         }
+        // Aggregate wallet for admin across this master's users
+        const adminMasterWallet = {};
+        const allUsersForAdmin = [];
+        for (const mid of allMasterIdsForThis) {
+          const users = directMasterUsers[mid] || [];
+          for (const u of users) {
+             allUsersForAdmin.push(u);
+             if (u.wallet) {
+                for (const [cat, val] of Object.entries(u.wallet)) {
+                   adminMasterWallet[cat] = (adminMasterWallet[cat] ?? 0) + (Number(val) || 0);
+                }
+             }
+          }
+        }
+        for (const cat of Object.keys(adminMasterWallet)) {
+          adminMasterWallet[cat] = Math.round(adminMasterWallet[cat] * 100) / 100;
+        }
+
         adminSummary.push({
           master_id: masterId,
           total_pnl: Math.round(totalPnl * 100) / 100,
-          user_count: userCount
+          user_count: userCount,
+          wallet: adminMasterWallet
         });
       }
 
@@ -720,26 +757,57 @@ class MetricsEngine {
    * Called after a trade is placed — invalidate and rebuild the affected user's cache.
    */
   async onTradeExecuted(userId) {
-    if (!this._initialized) return;
+    if (!userId) return;
     try {
-      const user = await User.findById(userId).select('credits settled_pnl master_id wallet exchanges_allowed').lean();
-      if (!user) return;
-
-      // Clear old token→user mappings for this user
-      for (const [token, users] of this._tokenToUsers) {
-        users.delete(userId);
-        if (users.size === 0) this._tokenToUsers.delete(token);
+      // Find user to refresh full base state (credit, settledPnl, etc)
+      const User = require('../models/User');
+      const user = await User.findById(userId).lean();
+      if (!user || user.deleted_at) {
+        this._userCache.delete(userId);
+        this._metricsCache.delete(userId);
+        return;
       }
-
+      
+      // Rebuild this single user's cache and recompute
       await this._rebuildUserCache(userId, user.credits || 0, user.settled_pnl || 0, user.master_id?.toString(), user.wallet, user.exchanges_allowed);
-
       const metrics = this._computeUserMetrics(userId);
       if (metrics) {
         this._metricsCache.set(userId, metrics);
         this._broadcastUserMetrics(userId, metrics);
       }
-    } catch (e) {
-      console.error(`📊 [MetricsEngine] Error on trade executed for ${userId}:`, e.message);
+    } catch (err) {
+      console.error(`📊 [MetricsEngine] Error refreshing user ${userId}:`, err.message);
+    }
+  }
+
+  /**
+   * Refreshes the cached master configuration (e.g. credits, margin_square_off toggle).
+   * Call this when a master's configuration is modified (e.g., via Admin or Parent Master credit).
+   */
+  async onMasterConfigChanged(masterId) {
+    if (!masterId) return;
+    try {
+      const Master = require('../models/Master');
+      const master = await Master.findById(masterId).lean();
+      if (!master || master.deleted_at) {
+        if (this._masterConfigMap) delete this._masterConfigMap[masterId];
+        return;
+      }
+      
+      if (!this._masterConfigMap) this._masterConfigMap = {};
+      this._masterConfigMap[masterId] = {
+        credits: master.credits || 0,
+        margin_square_off: master.margin_square_off,
+        margin_square_off_percentage: master.margin_square_off_percentage,
+        username: master.username,
+        active_status: master.active_status,
+        deleted_at: null,
+      };
+      
+      // Also broadcast the updated master metrics to reflect new credit
+      this._broadcastMasterMetrics();
+    } catch (err) {
+      console.error(`📊 [MetricsEngine] Error refreshing master config ${masterId}:`, err.message);
     }
   }
 

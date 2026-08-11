@@ -968,35 +968,21 @@ const placeTrade = async (req, res) => {
                 // #5 FIX: Calculate brokerage using BrokerageSettings
                 let brokerage = 0;
                 try {
-                    // Try by raw_name first, then fallback to tradingsymbol
+                    const rawName = instrumentRawName || tradingsymbol.replace(/[0-9]+[A-Z]+$/, '').trim();
+                    let seg = segment || kiteInst?.segment || exchange || '';
+                    
+                    const rules = await BrokerageSettings.find({ deleted_at: null }).lean();
                     let brokerageRule = null;
-                    if (instrumentRawName) {
-                        brokerageRule = await BrokerageSettings.findOne({
-                            exchange_name: normalizedExchange,
-                            script_name: instrumentRawName,
-                            deleted_at: null
-                        });
-                    }
-                    if (!brokerageRule) {
-                        brokerageRule = await BrokerageSettings.findOne({
-                            exchange_name: normalizedExchange,
-                            script_name: tradingsymbol,
-                            deleted_at: null
-                        });
-                    }
+                    if (rawName && seg) brokerageRule = rules.find(r => r.script_name?.toUpperCase() === rawName.toUpperCase() && r.exchange_name === seg.toUpperCase());
+                    if (!brokerageRule && rawName) brokerageRule = rules.find(r => r.script_name?.toUpperCase() === rawName.toUpperCase());
+                    if (!brokerageRule && seg) brokerageRule = rules.find(r => r.exchange_name === seg.toUpperCase() && (!r.script_name || r.script_name.trim() === ''));
+                    if (!brokerageRule) brokerageRule = rules.find(r => r.exchange_name === (seg.split('-')[0] || '').toUpperCase() && (!r.script_name || r.script_name.trim() === ''));
+
                     if (brokerageRule) {
                         if (brokerageRule.type === 'TURNOVER WISE') {
-                            brokerage = (executedPrice * quantity) * (brokerageRule.brk_value / 100);
+                            brokerage = (executedPrice * quantity) * (brokerageRule.brk_value / 10000);
                         } else if (brokerageRule.type === 'LOT WISE') {
-                            let lotSizeForBrokerage = 1;
-                            const kiteInstForBrk = await KiteInstrument.findOne({ instrument_token });
-                            if (kiteInstForBrk && kiteInstForBrk.lot_size) {
-                                lotSizeForBrokerage = kiteInstForBrk.lot_size;
-                            } else {
-                                const lotSizeDoc = await ScriptQuantity.findOne({ exchange_name: normalizedExchange, script_name: tradingsymbol, deleted_at: null });
-                                lotSizeForBrokerage = lotSizeDoc?.lot_size || 1;
-                            }
-                            const lots = quantity / lotSizeForBrokerage;
+                            const lots = lotSize > 1 ? quantity / lotSize : quantity;
                             brokerage = lots * brokerageRule.brk_value;
                         }
                     }
@@ -1363,8 +1349,8 @@ getPositions = async (req, res) => {
         const trades = await Trade.find({
             user_id: targetUserId,
             $or: [
-                // Active regular trades (not system trades) — completed
-                { status: 'completed', deleted_at: null, trade_type: { $nin: ['carry_forward', 'margin_square_off'] } },
+                // Active regular trades and margin square-offs (completed)
+                { status: 'completed', deleted_at: null, trade_type: { $nin: ['carry_forward'] } },
                 // Active carry_forward trades (needed for position calculation, but marked so Flutter can hide from Trade tab)
                 { status: 'completed', deleted_at: null, trade_type: 'carry_forward' },
                 // Pending orders (limit orders waiting to be filled)
@@ -1500,13 +1486,25 @@ const deleteTrade = async (req, res) => {
 
         res.status(200).json({ success: true, message: 'Trade deleted', data: trade });
 
+        const targetUserId = trade.user_id.toString();
+        
+        // Rebuild metrics cache so the deleted trade is removed from open positions instantly
+        const metricsEngine = require('../services/metricsEngine');
+        metricsEngine.onTradeExecuted(targetUserId).catch(() => {});
+
         // FCM notification to trade owner
         try {
-            const targetUserId = trade.user_id.toString();
             firebaseService.sendNotification(targetUserId, 'admin_order_deletion', {
                 title: 'Trade Deleted by Admin',
                 body: `${trade.transaction_type} ${trade.quantity} ${trade.tradingsymbol} has been deleted`,
                 data: { trade_id: trade._id.toString(), tradingsymbol: trade.tradingsymbol },
+            });
+            
+            const livePriceService = require('../services/livePriceService');
+            livePriceService.broadcastToUser(targetUserId, {
+                type: 'trade_deleted',
+                trade_id: trade._id.toString(),
+                instrument_token: trade.instrument_token,
             });
         } catch (fcmErr) {
             console.error('⚠️  [FCM] deleteTrade notification error:', fcmErr.message);

@@ -12,6 +12,7 @@ const { beginTradeWrite } = require('../services/tradeWriteFenceService');
 const walletService = require('../services/walletService');
 const { categoryForSegment } = require('../utils/walletCategory');
 const { applyWalletFunding } = require('./walletController');
+const { calculateBrokerage } = require('../services/brokerageService');
 
 /**
  * Square off all open positions for a user in the given segments.
@@ -62,7 +63,7 @@ async function _squareOffUserSegments(userId, segments, options = {}) {
       const closingPnl = pos.net_qty > 0
         ? (closePrice - avgEntry) * absQty
         : (avgEntry - closePrice) * absQty;
-      tradesToCreate.push({
+      const newTradeObj = {
         user_id: userId,
         master_id: user.master_id,
         admin_id: user.admin_id || null,
@@ -81,7 +82,13 @@ async function _squareOffUserSegments(userId, segments, options = {}) {
         executed_quantity: absQty,
         pnl: Math.round(closingPnl * 100) / 100,
         remarks: `Intraday square-off: ${pos.segment} segment closed by admin`,
-      });
+      };
+      
+      const sessionBrokerage = await calculateBrokerage(newTradeObj, session);
+      newTradeObj.brokerage = sessionBrokerage;
+      newTradeObj.net_amount = newTradeObj.pnl - sessionBrokerage;
+      
+      tradesToCreate.push(newTradeObj);
 
       // Requirement 3.2 / 7.5: collect the closed position's ENTRY notional to
       // release back to its category wallet. Prefer the SEGMENT over the base
@@ -878,6 +885,8 @@ const debitUser = async (req, res) => {
     // Rebuild metricsEngine cache so credit change is reflected in live metrics
     try {
       const metricsEngine = require('../services/metricsEngine');
+      metricsEngine.onTradeExecuted(id);
+      metricsEngine.onMasterConfigChanged(req.master.id);
       const userId = id;
       metricsEngine.onTradeExecuted(userId);
     } catch (_) {}

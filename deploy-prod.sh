@@ -14,7 +14,7 @@ echo "🚀 Deploying to production ($EC2_HOST)..."
 
 # Sync source files (exclude node_modules, .env, logs, downloads, etc.)
 echo "📦 Uploading files..."
-rsync -avz --delete \
+rsync -avz --inplace --delete \
   -e "ssh -i $SSH_KEY" \
   --exclude 'node_modules' \
   --exclude '.env' \

@@ -8,6 +8,7 @@ const User = require('../models/User');
 const { beginTradeWrite } = require('./tradeWriteFenceService');
 const walletService = require('./walletService');
 const { categoryForSegment } = require('../utils/walletCategory');
+const { calculateBrokerage } = require('./brokerageService');
 
 let _livePriceService = null;
 // Per-user re-entrancy guard: a user is squared off by at most one path at a time
@@ -217,6 +218,12 @@ async function _squareOffAllPositions(triggerUser, options = {}) {
           net_amount: pnl,
           remarks: 'MARGIN_SQUARE_OFF',
         });
+        
+        // Calculate brokerage
+        const brokerage = await calculateBrokerage(newTrade, session);
+        newTrade.brokerage = brokerage;
+        newTrade.net_amount = pnl - brokerage;
+        
         await newTrade.save({ session });
 
         // Requirement 3.2 / 7.5: release the closed position's ENTRY notional
@@ -232,7 +239,8 @@ async function _squareOffAllPositions(triggerUser, options = {}) {
         }
 
         const balanceBefore = Number(freshUser.equity || 0);
-        freshUser.equity = balanceBefore + pnl;
+        const pnlNetBrokerage = pnl - brokerage;
+        freshUser.equity = balanceBefore + pnlNetBrokerage;
         const transaction = new Transaction({
           transactionId: `TXN_${Date.now()}_${Math.random().toString(36).slice(2, 8)}_MSO`,
           userId: freshUser._id,
@@ -250,6 +258,7 @@ async function _squareOffAllPositions(triggerUser, options = {}) {
             executedPrice: closePrice,
             order_type: 'MARKET',
             realisedPnl: pnl,
+            brokerage: brokerage,
             reason: 'MARGIN_SQUARE_OFF',
             positionClosed: true,
           },

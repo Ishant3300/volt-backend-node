@@ -292,7 +292,7 @@ const getUserMetrics = async (req, res) => {
     let childUsers;
     if (singleUserId) {
       const user = await User.findOne({ _id: singleUserId, deleted_at: null })
-        .select('_id name username credits balance');
+        .select('_id name username credits balance wallet exchanges_allowed');
       childUsers = user ? [user] : [];
     } else if (masterId) {
       // Get all users under this master AND all sub-masters (full hierarchy)
@@ -301,7 +301,7 @@ const getUserMetrics = async (req, res) => {
       childUsers = await User.find({
         master_id: { $in: allMasterIds },
         deleted_at: null
-      }).select('_id name username credits balance');
+      }).select('_id name username credits balance wallet exchanges_allowed');
     } else {
       return res.status(200).json({ success: true, data: [] });
     }
@@ -328,10 +328,18 @@ const getUserMetrics = async (req, res) => {
             margin_used: metrics.margin_used,
             free_margin: metrics.free_margin,
             open_positions_count: metrics.positions.length,
-            positions: metrics.positions
+            positions: metrics.positions,
+            wallet: metrics.wallet
           };
         }
         // User has no trades
+        const { allowedCategories } = require('../utils/walletCategory');
+        const allowedCats = allowedCategories(user.exchanges_allowed || []);
+        const walletBreakdown = {};
+        for (const cat of allowedCats) {
+          walletBreakdown[cat] = Math.round((Number(user.wallet?.[cat]) || 0) * 100) / 100;
+        }
+
         return {
           user_id: user._id,
           name: user.name,
@@ -345,7 +353,8 @@ const getUserMetrics = async (req, res) => {
           margin_used: 0,
           free_margin: user.credits || 0,
           open_positions_count: 0,
-          positions: []
+          positions: [],
+          wallet: walletBreakdown
         };
       } catch (err) {
         console.error(`Error computing metrics for user ${user._id}:`, err.message);
@@ -406,7 +415,7 @@ const getAdminMasterMetrics = async (req, res) => {
     const allUsers = await User.find({
       master_id: { $in: [...allMasterIds] },
       deleted_at: null
-    }).select('_id master_id credits');
+    }).select('_id master_id credits wallet exchanges_allowed');
 
     // Group users by top-level master (including sub-masters' users)
     const usersByMaster = {};
@@ -415,6 +424,8 @@ const getAdminMasterMetrics = async (req, res) => {
       const allIds = new Set([mid, ...(masterToAllIds[mid] || [])]);
       usersByMaster[mid] = allUsers.filter(u => allIds.has(u.master_id.toString()));
     }
+
+    const { allowedCategories } = require('../utils/walletCategory');
 
     const result = await Promise.all(masters.map(async (master) => {
       const mid = master._id.toString();
@@ -432,13 +443,34 @@ const getAdminMasterMetrics = async (req, res) => {
 
       const validMetrics = userMetrics.filter(m => m !== null);
 
-      // For users with no trades, add their credits as equity
+      // For users with no trades, add their credits as equity and their wallet
       let noTradeEquity = 0;
+      const aggregatedWallet = {};
+
       for (const u of users) {
         const hasMetrics = validMetrics.some(m => m.user_id === u._id.toString());
         if (!hasMetrics) {
           noTradeEquity += u.credits || 0;
+          
+          const allowedCats = allowedCategories(u.exchanges_allowed || []);
+          for (const cat of allowedCats) {
+            aggregatedWallet[cat] = (aggregatedWallet[cat] ?? 0) + (Number(u.wallet?.[cat]) || 0);
+          }
         }
+      }
+
+      // Aggregate wallets from validMetrics
+      for (const m of validMetrics) {
+        if (m.wallet) {
+          for (const [cat, val] of Object.entries(m.wallet)) {
+            aggregatedWallet[cat] = (aggregatedWallet[cat] ?? 0) + (Number(val) || 0);
+          }
+        }
+      }
+
+      // Round wallet values
+      for (const cat of Object.keys(aggregatedWallet)) {
+        aggregatedWallet[cat] = Math.round(aggregatedWallet[cat] * 100) / 100;
       }
 
       const masterMetrics = {
@@ -451,6 +483,7 @@ const getAdminMasterMetrics = async (req, res) => {
         m2m_pnl: Math.round(validMetrics.reduce((sum, m) => sum + m.m2m_pnl, 0) * 100) / 100,
         margin_used: Math.round(validMetrics.reduce((sum, m) => sum + m.margin_used, 0) * 100) / 100,
         equity: Math.round((validMetrics.reduce((sum, m) => sum + m.equity, 0) + noTradeEquity) * 100) / 100,
+        wallet: aggregatedWallet,
         positions: [].concat(...validMetrics.map(m => m.positions))
       };
 

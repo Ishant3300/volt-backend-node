@@ -394,6 +394,14 @@ const creditUserByAdmin = async (req, res) => {
       result = { new_balance: user.credits, amount_credited: amount, current_credits: user.credits };
     });
     session.endSession();
+    
+    try {
+      const metricsEngine = require('../services/metricsEngine');
+      metricsEngine.onTradeExecuted(id);
+    } catch (e) {
+      console.error('Error triggering metrics engine cache rebuild:', e);
+    }
+
     res.status(200).json({ success: true, message: 'Amount credited successfully', data: result });
   } catch (error) {
     session.endSession();
@@ -436,6 +444,14 @@ const debitUserByAdmin = async (req, res) => {
       result = { new_balance: user.credits, amount_debited: amount, current_credits: user.credits };
     });
     session.endSession();
+    
+    try {
+      const metricsEngine = require('../services/metricsEngine');
+      metricsEngine.onTradeExecuted(id);
+    } catch (e) {
+      console.error('Error triggering metrics engine cache rebuild:', e);
+    }
+
     res.status(200).json({ success: true, message: 'Amount debited successfully', data: result });
   } catch (error) {
     session.endSession();

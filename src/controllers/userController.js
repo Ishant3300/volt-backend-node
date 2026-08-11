@@ -86,15 +86,15 @@ const getUserTrades = async (req, res) => {
         if (tradingsymbol) filter.tradingsymbol = { $regex: tradingsymbol, $options: 'i' };
 
         if (date_from || date_to) {
-            filter.created_at = {};
-            if (date_from) filter.created_at.$gte = new Date(date_from);
-            if (date_to) filter.created_at.$lte = new Date(date_to);
+            filter.createdAt = {};
+            if (date_from) filter.createdAt.$gte = new Date(date_from);
+            if (date_to) filter.createdAt.$lte = new Date(date_to);
         }
 
         const trades = await Trade.find(filter)
             .limit(limit * 1)
             .skip((page - 1) * limit)
-            .sort({ created_at: -1 });
+            .sort({ createdAt: -1 });
 
         const count = await Trade.countDocuments(filter);
 

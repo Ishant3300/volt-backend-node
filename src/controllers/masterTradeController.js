@@ -28,7 +28,7 @@ const getAllTrades = async (req, res) => {
 
     const filter = {
       deleted_at: null,
-      trade_type: { $nin: ['carry_forward', 'margin_square_off'] }, // Hide system trades from orders
+      trade_type: { $nin: ['carry_forward'] }, // Hide system carry-forward trades from orders
     };
 
     // Admin calling with master_id: fetch trades for that master and its children
