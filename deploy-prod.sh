@@ -12,6 +12,14 @@ PM2_APP="stocker-backend-node"
 
 echo "🚀 Deploying to production ($EC2_HOST)..."
 
+echo "🧹 Cleaning up remote server to free up space..."
+ssh -i $SSH_KEY ${EC2_USER}@${EC2_HOST} << 'EOF'
+  pm2 flush || true
+  npm cache clean --force || true
+  sudo journalctl --vacuum-size=100M || true
+  sudo rm -rf /tmp/rsync* || true
+EOF
+
 # Sync source files (exclude node_modules, .env, logs, downloads, etc.)
 echo "📦 Uploading files..."
 rsync -avz --inplace --delete \

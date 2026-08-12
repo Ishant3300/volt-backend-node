@@ -131,7 +131,7 @@ const masterSchema = new mongoose.Schema({
   },
   exchanges: {
     type: [String],
-    enum: ['NSE', 'BSE', 'NFO', 'BFO', 'MCX', 'CDS'],
+    enum: ['NSE', 'BSE', 'NFO', 'BFO', 'MCX', 'CDS', 'NCO', 'BCO', 'BCD'],
     default: []
   },
   permissions: {

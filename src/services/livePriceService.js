@@ -302,6 +302,33 @@ class LivePriceService {
     }
 
   /**
+   * Add a pending limit order token to the cache so it receives price updates
+   * @param {string|number} token
+   */
+  addPendingToken(token) {
+    if (!token) return;
+    const numToken = Number(token);
+    if (!this.pendingTokensCache.has(numToken)) {
+      this.pendingTokensCache.add(numToken);
+      this._updateKiteSubscription(); // Refresh subscription immediately
+    }
+  }
+
+  /**
+   * Remove a pending limit order token when it's executed or cancelled
+   * @param {string|number} token 
+   */
+  removePendingToken(token) {
+    if (!token) return;
+    const numToken = Number(token);
+    if (this.pendingTokensCache.has(numToken)) {
+      this.pendingTokensCache.delete(numToken);
+      // We don't strictly need to force an immediate unsubscribe, 
+      // it will be cleaned up on the next natural _updateKiteSubscription cycle if no longer needed.
+    }
+  }
+
+  /**
    * Update Kite subscription with current tokens
    */
   _updateKiteSubscription() {
