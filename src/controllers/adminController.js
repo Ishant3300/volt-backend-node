@@ -111,7 +111,7 @@ const createUser = async (req, res) => {
 // Get All Users
 const getAllUsers = async (req, res) => {
   try {
-    const { page = 1, limit = 20, status, server_id, master_id } = req.query;
+    const { page = 1, limit = 20, status, server_id, master_id, search } = req.query;
 
     const filter = {};
     if (status) filter.status = status;
@@ -125,6 +125,14 @@ const getAllUsers = async (req, res) => {
     }
 
     filter.deleted_at = null;
+
+    // Search by username or name
+    if (search) {
+      filter.$or = [
+        { username: { $regex: search, $options: 'i' } },
+        { name: { $regex: search, $options: 'i' } },
+      ];
+    }
 
     const users = await User.find(filter)
       .populate('server_id', 'name')
