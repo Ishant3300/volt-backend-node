@@ -88,15 +88,16 @@ const placeTrade = async (req, res) => {
     const session = await mongoose.startSession();
     let tradeWriteLease = null;
     try {
-        // #8 FIX: When admin places trade for a user, use req.body.user_id as the target, not the admin's own ID.
+        // #8 FIX: When admin/master places trade for a user, use req.body.user_id as the target, not the caller's own ID.
         const callerId = req.user?.id || req.master?.id || req.admin?.id;
-        const targetUserId = (req.body.user_id && req.admin) ? req.body.user_id : (req.body.user_id || callerId);
+        const isAdminOrMaster = !!(req.admin || req.master);
+        const targetUserId = (req.body.user_id && isAdminOrMaster) ? req.body.user_id : (req.body.user_id || callerId);
         if (!targetUserId) {
             return res.status(401).json({ success: false, message: 'Unauthorized / User ID missing' });
         }
-        // Admin must always specify a user_id — admin is not a User and cannot trade for themselves
-        if (req.admin && !req.body.user_id) {
-            return res.status(400).json({ success: false, message: 'Admin must select a user to place a trade on their behalf. Please search and select a user first.' });
+        // Admin/Master must always specify a user_id — they cannot trade for themselves
+        if (isAdminOrMaster && !req.body.user_id) {
+            return res.status(400).json({ success: false, message: 'Please select a user to place a trade on their behalf.' });
         }
 
         const {

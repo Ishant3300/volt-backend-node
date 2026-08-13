@@ -358,7 +358,7 @@ const createUser = async (req, res) => {
 // Get All Users
 const getAllUsers = async (req, res) => {
   try {
-    const { page = 1, limit = 20, status, server_id } = req.query;
+    const { page = 1, limit = 20, status, server_id, search } = req.query;
 
     // Only return DIRECT child users of this master (not sub-masters' users)
     const filter = {
@@ -368,6 +368,14 @@ const getAllUsers = async (req, res) => {
 
     if (status) filter.status = status;
     if (server_id) filter.server_id = server_id;
+
+    // Search by username or name
+    if (search) {
+      filter.$or = [
+        { username: { $regex: search, $options: 'i' } },
+        { name: { $regex: search, $options: 'i' } },
+      ];
+    }
 
     const users = await User.find(filter)
       .populate('server_id', 'name')
