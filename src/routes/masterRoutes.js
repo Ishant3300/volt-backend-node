@@ -1,6 +1,6 @@
 const express = require('express');
 const router = express.Router();
-const { authenticateAdminOrMaster } = require('../middlewares/auth');
+const { authenticateAdminOrMaster, authenticateAdmin } = require('../middlewares/auth');
 const {
   createMaster,
   getAllMasters,
@@ -23,7 +23,7 @@ const {
 
 
 // Master CRUD
-router.post('/', authenticateAdminOrMaster, createMaster);
+router.post('/', authenticateAdmin, createMaster);
 router.get('/', authenticateAdminOrMaster, getAllMasters);
 
 // Trades (admin can see all trades) — must be before /:id to avoid matching

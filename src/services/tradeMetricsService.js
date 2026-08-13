@@ -48,7 +48,9 @@ class TradeMetricsService {
         let totalMarginUsed = 0;
 
         // Recalculate brokerage from BrokerageSettings (stored trade.brokerage is unreliable)
-        const brkRules = await BrokerageSettings.find({ deleted_at: null }).lean();
+        // Try user-specific rules first, fall back to global
+        let brkRules = await BrokerageSettings.find({ user_id: user._id, deleted_at: null }).lean();
+        if (brkRules.length === 0) brkRules = await BrokerageSettings.find({ user_id: null, deleted_at: null }).lean();
 
         const rawTrades = await Trade.find({
             user_id: user._id, status: 'completed', deleted_at: null

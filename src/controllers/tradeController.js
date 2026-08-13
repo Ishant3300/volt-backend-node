@@ -446,7 +446,7 @@ const placeTrade = async (req, res) => {
                     deleted_at: null
                 });
 
-                if (fslLimit) {
+                if (fslLimit && user.fresh_stoploss === true) {
                     // Get live CMP from metricsEngine — use bid/ask (same as orders page P&L)
                     // BUY position exits at bid, SELL position exits at ask
                     const metricsEngFSL = require('../services/metricsEngine');
@@ -971,7 +971,10 @@ const placeTrade = async (req, res) => {
                     const rawName = instrumentRawName || tradingsymbol.replace(/[0-9]+[A-Z]+$/, '').trim();
                     let seg = segment || kiteInst?.segment || exchange || '';
                     
-                    const rules = await BrokerageSettings.find({ deleted_at: null }).lean();
+                    // Try user-specific rules first, then global (user_id: null)
+                    const userRules = await BrokerageSettings.find({ user_id: user._id, deleted_at: null }).lean();
+                    const globalRules = userRules.length === 0 ? await BrokerageSettings.find({ user_id: null, deleted_at: null }).lean() : [];
+                    const rules = userRules.length > 0 ? userRules : globalRules;
                     let brokerageRule = null;
                     if (rawName && seg) brokerageRule = rules.find(r => r.script_name?.toUpperCase() === rawName.toUpperCase() && r.exchange_name === seg.toUpperCase());
                     if (!brokerageRule && rawName) brokerageRule = rules.find(r => r.script_name?.toUpperCase() === rawName.toUpperCase());
@@ -1519,7 +1522,12 @@ const deleteTrade = async (req, res) => {
  */
 const getBrokerageRules = async (req, res) => {
     try {
-        const rules = await BrokerageSettings.find({ deleted_at: null });
+        const userId = req.user?._id || req.user?.id || null;
+        // Try user-specific rules; if none exist, fall back to global
+        let rules = userId ? await BrokerageSettings.find({ user_id: userId, deleted_at: null }) : [];
+        if (rules.length === 0) {
+            rules = await BrokerageSettings.find({ user_id: null, deleted_at: null });
+        }
         res.status(200).json({
             success: true,
             message: 'Brokerage rules fetched successfully',
@@ -1711,11 +1719,22 @@ const getInstrumentInfo = async (req, res) => {
         const exchange = seg.split('-')[0] || instrument.exchange || '';
 
         // Brokerage: 4-level fallback (raw_name+segment → raw_name → segment → exchange)
+        // Try user-specific rules first, then global (user_id: null)
+        const userId = req.user?._id || req.user?.id || null;
         let brkRule = null;
-        if (rawName && seg) brkRule = await BrokerageSettings.findOne({ script_name: { $regex: new RegExp(`^${rawName}$`, 'i') }, exchange_name: seg.toUpperCase(), deleted_at: null }).lean();
-        if (!brkRule && rawName) brkRule = await BrokerageSettings.findOne({ script_name: { $regex: new RegExp(`^${rawName}$`, 'i') }, deleted_at: null }).lean();
-        if (!brkRule && seg) brkRule = await BrokerageSettings.findOne({ exchange_name: seg.toUpperCase(), script_name: { $in: [null, ''] }, deleted_at: null }).lean();
-        if (!brkRule) brkRule = await BrokerageSettings.findOne({ exchange_name: exchange.toUpperCase(), script_name: { $in: [null, ''] }, deleted_at: null }).lean();
+
+        async function findBrkRule(uid) {
+            const uidFilter = { user_id: uid, deleted_at: null };
+            let r = null;
+            if (rawName && seg) r = await BrokerageSettings.findOne({ ...uidFilter, script_name: { $regex: new RegExp(`^${rawName}$`, 'i') }, exchange_name: seg.toUpperCase() }).lean();
+            if (!r && rawName) r = await BrokerageSettings.findOne({ ...uidFilter, script_name: { $regex: new RegExp(`^${rawName}$`, 'i') } }).lean();
+            if (!r && seg) r = await BrokerageSettings.findOne({ ...uidFilter, exchange_name: seg.toUpperCase(), script_name: { $in: [null, ''] } }).lean();
+            if (!r) r = await BrokerageSettings.findOne({ ...uidFilter, exchange_name: exchange.toUpperCase(), script_name: { $in: [null, ''] } }).lean();
+            return r;
+        }
+
+        if (userId) brkRule = await findBrkRule(userId);
+        if (!brkRule) brkRule = await findBrkRule(null);
 
         res.status(200).json({
             success: true,

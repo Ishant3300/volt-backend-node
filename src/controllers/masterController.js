@@ -292,7 +292,17 @@ const updateMaster = async (req, res) => {
     } = req.body;
 
     const query = { _id: id, deleted_at: null };
-    if (req.master) query.master_id = req.master.id;
+    if (req.master) {
+      const { getAllSubMasterIds } = require('../services/masterHierarchyService');
+      const allowedSubMasters = await getAllSubMasterIds(req.master.id);
+      if (!allowedSubMasters.includes(id)) {
+        return res.status(403).json({
+          success: false,
+          message: 'Not authorized to update this master',
+          data: null
+        });
+      }
+    }
 
     const master = await Master.findOne(query);
 
@@ -319,7 +329,8 @@ const updateMaster = async (req, res) => {
 
     if (name) master.name = name;
     if (note !== undefined) master.note = note;
-    if (credits !== undefined) master.credits = credits;
+    // Bug 5 fix: Prevent bypass of credit/debit flow. Use credit/debit endpoints!
+    // if (credits !== undefined) master.credits = credits;
 
     if (pnl_sharing !== undefined) {
       if (pnl_sharing < 0 || pnl_sharing > 100) {
@@ -561,10 +572,22 @@ const deleteMaster = async (req, res) => {
   try {
     const { id } = req.params;
 
-    const master = await Master.findOne({
-      _id: id,
-      deleted_at: null
-    });
+    // Admin can delete any master; master can only delete their children in the hierarchy
+    const query = { _id: id, deleted_at: null };
+    
+    if (req.master) {
+      const { getAllSubMasterIds } = require('../services/masterHierarchyService');
+      const allowedSubMasters = await getAllSubMasterIds(req.master.id);
+      if (!allowedSubMasters.includes(id)) {
+        return res.status(403).json({
+          success: false,
+          message: 'Not authorized to delete this master',
+          data: null
+        });
+      }
+    }
+
+    const master = await Master.findOne(query);
 
     if (!master) {
       return res.status(404).json({
@@ -576,6 +599,21 @@ const deleteMaster = async (req, res) => {
 
     master.deleted_at = new Date();
     await master.save();
+    
+    // Bug 6 fix applied here too: Cascade soft-delete to users under this master's hierarchy
+    const User = require('../models/User');
+    const { getAllSubMasterIds } = require('../services/masterHierarchyService');
+    const allHierarchyMasterIds = await getAllSubMasterIds(id);
+    
+    await User.updateMany(
+      { master_id: { $in: allHierarchyMasterIds }, deleted_at: null },
+      { $set: { deleted_at: new Date() } }
+    );
+    // Also cascade soft-delete to sub-masters
+    await Master.updateMany(
+      { _id: { $in: allHierarchyMasterIds }, _id: { $ne: id }, deleted_at: null },
+      { $set: { deleted_at: new Date() } }
+    );
 
     res.status(200).json({
       success: true,
@@ -609,9 +647,23 @@ const creditMaster = async (req, res) => {
     let resultData;
 
     await session.withTransaction(async () => {
-      // Admin can manage any master; master scopes by master_id (their child)
+      // Admin can manage any master; master scopes by hierarchy
       const query = { _id: id, deleted_at: null };
-      if (req.master) query.master_id = req.master.id;
+      let parentMaster = null;
+
+      if (req.master) {
+        const { getAllSubMasterIds } = require('../services/masterHierarchyService');
+        const allowedSubMasters = await getAllSubMasterIds(req.master.id);
+        if (!allowedSubMasters.includes(id)) {
+          throw new Error('Not authorized to credit this master');
+        }
+        
+        parentMaster = await Master.findById(req.master.id).session(session);
+        if (!parentMaster) throw new Error('Parent master not found');
+        if (parentMaster.equity < amount) {
+          throw new Error('Insufficient parent balance to credit');
+        }
+      }
 
       const master = await Master.findOne(query).session(session);
 
@@ -621,6 +673,12 @@ const creditMaster = async (req, res) => {
 
       const previousCredits = master.credits;
       const previousBalance = master.equity;
+
+      // Deduct from parent if caller is a master
+      if (parentMaster) {
+        parentMaster.equity -= amount;
+        await parentMaster.save({ session });
+      }
 
       // Balance increases; credits only rises if balance exceeds it
       master.equity += amount;
@@ -713,9 +771,20 @@ const debitMaster = async (req, res) => {
     let resultData;
 
     await session.withTransaction(async () => {
-      // Admin can manage any master; master scopes by master_id (their child)
+      // Admin can manage any master; master scopes by hierarchy
       const query = { _id: id, deleted_at: null };
-      if (req.master) query.master_id = req.master.id;
+      let parentMaster = null;
+
+      if (req.master) {
+        const { getAllSubMasterIds } = require('../services/masterHierarchyService');
+        const allowedSubMasters = await getAllSubMasterIds(req.master.id);
+        if (!allowedSubMasters.includes(id)) {
+          throw new Error('Not authorized to debit this master');
+        }
+        
+        parentMaster = await Master.findById(req.master.id).session(session);
+        if (!parentMaster) throw new Error('Parent master not found');
+      }
 
       const master = await Master.findOne(query).session(session);
 
@@ -729,6 +798,12 @@ const debitMaster = async (req, res) => {
 
       const previousCredits = master.credits;
       const previousBalance = master.equity;
+
+      // Refund to parent if caller is a master
+      if (parentMaster) {
+        parentMaster.equity += amount;
+        await parentMaster.save({ session });
+      }
 
       // Deduct from balance only; credits stay unchanged
       master.equity -= amount;

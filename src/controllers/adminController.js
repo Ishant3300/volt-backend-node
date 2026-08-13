@@ -670,26 +670,47 @@ const createScriptQuantity = async (req, res) => {
     const { exchange_name, script_name, lot_size, max_qty, brk_qty, owner_id, owner_type } = req.body;
 
     if (!exchange_name || !script_name || lot_size === undefined || max_qty === undefined || brk_qty === undefined) {
-      return res.status(400).json({
-        success: false,
-        message: 'exchange_name, script_name, lot_size, max_qty, and brk_qty are required',
-        data: null
-      });
+      return res.status(400).json({ success: false, message: 'exchange_name, script_name, lot_size, max_qty, and brk_qty are required', data: null });
     }
 
-    // Determine the effective owner: use provided owner_id/owner_type, or fall back to the
-    // calling admin/master themselves so records always have a valid owner.
     const callerId = req.admin?.id || req.master?.id;
     const callerType = req.admin ? 'Admin' : 'Master';
     const effectiveOwnerId = owner_id || callerId;
-    const effectiveOwnerType = owner_type || callerType;
+    const effectiveOwnerType = owner_id ? (owner_type || 'User') : callerType;
 
     if (!effectiveOwnerId) {
-      return res.status(400).json({
-        success: false,
-        message: 'Could not determine owner for script quantity',
-        data: null
-      });
+      return res.status(400).json({ success: false, message: 'Could not determine owner for script quantity', data: null });
+    }
+
+    if (req.master) {
+      if (effectiveOwnerId !== req.master.id) {
+        if (effectiveOwnerType !== 'User') {
+          return res.status(403).json({ success: false, message: 'Not authorized to create for this owner type' });
+        }
+        const user = await User.findById(effectiveOwnerId);
+        if (!user || user.master_id.toString() !== req.master.id) {
+          return res.status(403).json({ success: false, message: 'Not authorized to create for this user' });
+        }
+      }
+
+      let ceilingLimit;
+      if (effectiveOwnerId === req.master.id) {
+        const adminGlobal = await ScriptQuantity.findOne({ owner_type: 'Admin', exchange_name, script_name, deleted_at: null }).lean();
+        if (!adminGlobal) {
+          return res.status(400).json({ success: false, message: 'Admin has not set a global limit for this script' });
+        }
+        ceilingLimit = adminGlobal.max_qty;
+      } else {
+        const masterLimit = await ScriptQuantity.findOne({ owner_id: req.master.id, owner_type: 'Master', exchange_name, script_name, deleted_at: null }).lean();
+        if (!masterLimit) {
+          return res.status(400).json({ success: false, message: 'You do not have a limit set for this script' });
+        }
+        ceilingLimit = masterLimit.max_qty;
+      }
+
+      if (max_qty > ceilingLimit) {
+        return res.status(400).json({ success: false, message: `max_qty cannot exceed limit of ${ceilingLimit}` });
+      }
     }
 
     const scriptQty = await ScriptQuantity.findOneAndUpdate(
@@ -698,29 +719,19 @@ const createScriptQuantity = async (req, res) => {
       { upsert: true, new: true, setDefaultsOnInsert: true }
     );
 
-    // If the owner is a Master, cascade the new script down to all their direct users.
     if (effectiveOwnerType === 'Master') {
       const { cascadeNewScriptToUsers } = require('../services/scriptQuantityCopyService');
       await cascadeNewScriptToUsers(effectiveOwnerId, exchange_name, script_name, { lot_size, max_qty, brk_qty });
     }
 
-    // If the owner is Admin (global record), cascade to all Masters and their users.
     if (effectiveOwnerType === 'Admin') {
       const { cascadeNewScriptGlobally } = require('../services/scriptQuantityCopyService');
       await cascadeNewScriptGlobally(exchange_name, script_name, { lot_size, max_qty, brk_qty }, effectiveOwnerId);
     }
 
-    res.status(201).json({
-      success: true,
-      message: 'Script quantity saved successfully',
-      data: scriptQty.toJSON()
-    });
+    res.status(201).json({ success: true, message: 'Script quantity saved successfully', data: scriptQty.toJSON() });
   } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: error.message,
-      data: null
-    });
+    res.status(500).json({ success: false, message: error.message, data: null });
   }
 };
 
@@ -795,11 +806,44 @@ const updateScriptQuantity = async (req, res) => {
     const scriptQty = await ScriptQuantity.findById(id);
 
     if (!scriptQty || scriptQty.deleted_at) {
-      return res.status(404).json({
-        success: false,
-        message: 'Script quantity not found',
-        data: null
-      });
+      return res.status(404).json({ success: false, message: 'Script quantity not found', data: null });
+    }
+
+    if (req.master) {
+      if (scriptQty.owner_id.toString() !== req.master.id) {
+        if (scriptQty.owner_type !== 'User') {
+          return res.status(403).json({ success: false, message: 'Not authorized to edit other masters' });
+        }
+        const user = await User.findById(scriptQty.owner_id);
+        if (!user || user.master_id.toString() !== req.master.id) {
+          return res.status(403).json({ success: false, message: 'Not authorized to edit this user' });
+        }
+      }
+
+      if (max_qty !== undefined) {
+        let ceilingLimit;
+        if (scriptQty.owner_id.toString() === req.master.id) {
+          const ex = exchange_name || scriptQty.exchange_name;
+          const sc = script_name || scriptQty.script_name;
+          const adminGlobal = await ScriptQuantity.findOne({ owner_type: 'Admin', exchange_name: ex, script_name: sc, deleted_at: null }).lean();
+          if (!adminGlobal) {
+            return res.status(400).json({ success: false, message: 'Admin has not set a global limit for this script' });
+          }
+          ceilingLimit = adminGlobal.max_qty;
+        } else {
+          const ex = exchange_name || scriptQty.exchange_name;
+          const sc = script_name || scriptQty.script_name;
+          const masterLimit = await ScriptQuantity.findOne({ owner_id: req.master.id, owner_type: 'Master', exchange_name: ex, script_name: sc, deleted_at: null }).lean();
+          if (!masterLimit) {
+            return res.status(400).json({ success: false, message: 'You do not have a limit set for this script' });
+          }
+          ceilingLimit = masterLimit.max_qty;
+        }
+
+        if (max_qty > ceilingLimit) {
+          return res.status(400).json({ success: false, message: `max_qty cannot exceed limit of ${ceilingLimit}` });
+        }
+      }
     }
 
     if (exchange_name) scriptQty.exchange_name = exchange_name;
@@ -810,38 +854,17 @@ const updateScriptQuantity = async (req, res) => {
 
     await scriptQty.save();
 
-    // If the caller is admin, always cascade globally — update ALL Masters and Users
-    // for this script regardless of who owns the record being edited.
-    if (req.admin) {
+    if (req.admin && scriptQty.owner_type === 'Admin') {
       const { cascadeNewScriptGlobally } = require('../services/scriptQuantityCopyService');
-      await cascadeNewScriptGlobally(
-        scriptQty.exchange_name,
-        scriptQty.script_name,
-        { lot_size: scriptQty.lot_size, max_qty: scriptQty.max_qty, brk_qty: scriptQty.brk_qty },
-        req.admin.id
-      );
+      await cascadeNewScriptGlobally(scriptQty.exchange_name, scriptQty.script_name, { lot_size: scriptQty.lot_size, max_qty: scriptQty.max_qty, brk_qty: scriptQty.brk_qty }, req.admin.id);
     } else if (scriptQty.owner_type === 'Master') {
-      // Master updating their own script — cascade only to their direct users
       const { cascadeToDirectUsers } = require('../services/scriptQuantityCopyService');
-      await cascadeToDirectUsers(
-        scriptQty.owner_id.toString(),
-        scriptQty.exchange_name,
-        scriptQty.script_name,
-        { max_qty: scriptQty.max_qty, brk_qty: scriptQty.brk_qty, lot_size: scriptQty.lot_size }
-      );
+      await cascadeToDirectUsers(scriptQty.owner_id.toString(), scriptQty.exchange_name, scriptQty.script_name, { max_qty: scriptQty.max_qty, brk_qty: scriptQty.brk_qty, lot_size: scriptQty.lot_size });
     }
 
-    res.status(200).json({
-      success: true,
-      message: 'Script quantity updated successfully',
-      data: scriptQty.toJSON()
-    });
+    res.status(200).json({ success: true, message: 'Script quantity updated successfully', data: scriptQty.toJSON() });
   } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: error.message,
-      data: null
-    });
+    res.status(500).json({ success: false, message: error.message, data: null });
   }
 };
 
@@ -853,47 +876,40 @@ const deleteScriptQuantity = async (req, res) => {
     const scriptQty = await ScriptQuantity.findById(id);
 
     if (!scriptQty || scriptQty.deleted_at) {
-      return res.status(404).json({
-        success: false,
-        message: 'Script quantity not found',
-        data: null
-      });
+      return res.status(404).json({ success: false, message: 'Script quantity not found', data: null });
+    }
+
+    if (req.master) {
+      if (scriptQty.owner_id.toString() !== req.master.id) {
+        if (scriptQty.owner_type !== 'User') {
+          return res.status(403).json({ success: false, message: 'Not authorized to delete other masters' });
+        }
+        const user = await User.findById(scriptQty.owner_id);
+        if (!user || user.master_id.toString() !== req.master.id) {
+          return res.status(403).json({ success: false, message: 'Not authorized to delete this user script' });
+        }
+      }
     }
 
     scriptQty.deleted_at = new Date();
     await scriptQty.save();
 
-    // Cascade soft-delete to all users under the owner (if owner is a Master).
     if (scriptQty.owner_type === 'Master') {
       const { cascadeDeleteScriptToUsers } = require('../services/scriptQuantityCopyService');
-      await cascadeDeleteScriptToUsers(
-        scriptQty.owner_id.toString(),
-        scriptQty.exchange_name,
-        scriptQty.script_name
-      );
+      await cascadeDeleteScriptToUsers(scriptQty.owner_id.toString(), scriptQty.exchange_name, scriptQty.script_name);
     }
 
-    // If this is an Admin-level global record, cascade delete to all Masters and their users.
     if (scriptQty.owner_type === 'Admin') {
       const { cascadeDeleteScriptGlobally } = require('../services/scriptQuantityCopyService');
       await cascadeDeleteScriptGlobally(scriptQty.exchange_name, scriptQty.script_name, scriptQty.owner_id.toString());
-    } else if (req.admin) {
-      // Admin deleting a non-Admin record from global view — still cascade to their hierarchy
+    } else if (req.admin && scriptQty.owner_type === 'Master') {
       const { cascadeDeleteScriptGlobally } = require('../services/scriptQuantityCopyService');
       await cascadeDeleteScriptGlobally(scriptQty.exchange_name, scriptQty.script_name, req.admin.id);
     }
 
-    res.status(200).json({
-      success: true,
-      message: 'Script quantity deleted successfully',
-      data: null
-    });
+    res.status(200).json({ success: true, message: 'Script quantity deleted successfully', data: null });
   } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: error.message,
-      data: null
-    });
+    res.status(500).json({ success: false, message: error.message, data: null });
   }
 };
 
@@ -902,7 +918,7 @@ const deleteScriptQuantity = async (req, res) => {
 // Create Brokerage Settings
 const createBrokerageSettings = async (req, res) => {
   try {
-    const { type, exchange_name, script_name, brk_value } = req.body;
+    const { type, exchange_name, script_name, brk_value, user_id } = req.body;
 
     if (!type || !exchange_name || !script_name || brk_value === undefined) {
       return res.status(400).json({
@@ -913,9 +929,9 @@ const createBrokerageSettings = async (req, res) => {
     }
 
     const newBrokerageSettings = await BrokerageSettings.findOneAndUpdate(
-      { type, exchange_name, script_name, deleted_at: null },
+      { type, exchange_name, script_name, user_id: user_id || null, deleted_at: null },
       // effective_from stamps the moment this rate takes effect (insert or update).
-      { type, exchange_name, script_name, brk_value, deleted_at: null, effective_from: new Date() },
+      { type, exchange_name, script_name, user_id: user_id || null, brk_value, deleted_at: null, effective_from: new Date() },
       { upsert: true, new: true, setDefaultsOnInsert: true }
     );
 
@@ -936,9 +952,9 @@ const createBrokerageSettings = async (req, res) => {
 // Get All Brokerage Settings
 const getAllBrokerageSettings = async (req, res) => {
   try {
-    const { page = 1, limit = 20 } = req.query;
+    const { page = 1, limit = 20, user_id } = req.query;
 
-    const filter = { deleted_at: null };
+    const filter = { user_id: user_id || null, deleted_at: null };
 
     const brokerageSettings = await BrokerageSettings.find(filter)
       .limit(limit * 1)

@@ -1,3 +1,4 @@
+const User = require('../models/User');
 const GroupedQuantity = require('../models/GroupedQuantity');
 const KiteInstrument = require('../models/KiteInstrument');
 
@@ -186,12 +187,13 @@ const bulkCreateGroup = async (req, res) => {
             raw_name: r._id,
             instrument_id: '',
             instrument_symbol: r._id,
-            max_qty: default_max_qty,
-            break_qty: default_break_qty,
+            
             lot_size: r.lot_size || 1,
             created_at: new Date()
           },
           $set: {
+            max_qty: default_max_qty,
+            break_qty: default_break_qty,
             updated_at: new Date(),
             deleted_at: null
           }
@@ -299,7 +301,7 @@ const BrokerageSettings = require('../models/BrokerageSettings');
  */
 const bulkCreateBrokerage = async (req, res) => {
   try {
-    const { exchange_name, type, default_brk_value } = req.body;
+    const { exchange_name, type, default_brk_value, user_id } = req.body;
     if (!exchange_name || !type || default_brk_value === undefined) {
       return res.status(400).json({ success: false, message: 'exchange_name, type, and default_brk_value are required', data: null });
     }
@@ -315,9 +317,9 @@ const bulkCreateBrokerage = async (req, res) => {
     }
     const bulkOps = results.map(r => ({
       updateOne: {
-        filter: { type: type.toUpperCase(), exchange_name: normalizedExchange, script_name: r._id, deleted_at: null },
+        filter: { type: type.toUpperCase(), exchange_name: normalizedExchange, script_name: r._id, user_id: user_id || null, deleted_at: null },
         update: {
-          $setOnInsert: { type: type.toUpperCase(), exchange_name: normalizedExchange, script_name: r._id, brk_value: default_brk_value, created_at: new Date() },
+          $setOnInsert: { type: type.toUpperCase(), exchange_name: normalizedExchange, script_name: r._id, user_id: user_id || null, brk_value: default_brk_value, created_at: new Date() },
           $set: { updated_at: new Date(), deleted_at: null }
         },
         upsert: true
@@ -341,8 +343,8 @@ const bulkCreateBrokerage = async (req, res) => {
 const getBrokerageByExchange = async (req, res) => {
   try {
     const { exchange_name } = req.params;
-    const { type, page = 1, limit = 500 } = req.query;
-    const filter = { exchange_name: exchange_name.toUpperCase(), deleted_at: null };
+    const { type, user_id, page = 1, limit = 500 } = req.query;
+    const filter = { exchange_name: exchange_name.toUpperCase(), user_id: user_id || null, deleted_at: null };
     if (type) filter.type = type.toUpperCase();
     const items = await BrokerageSettings.find(filter)
       .limit(parseInt(limit)).skip((parseInt(page) - 1) * parseInt(limit)).sort({ script_name: 1 });
@@ -381,10 +383,41 @@ const bulkCreateScriptQuantity = async (req, res) => {
       return res.status(404).json({ success: false, message: `No instruments found for ${normalizedExchange}`, data: null });
     }
 
-    // Determine effective owner: use provided owner_id/owner_type, or fall back to the
-    // calling admin so records always have a valid owner.
     const effectiveOwnerId = owner_id || (req.admin ? req.admin.id : req.master?.id);
-    const effectiveOwnerType = owner_id ? (owner_type || 'Master') : (req.admin ? 'Admin' : 'Master');
+    const effectiveOwnerType = owner_id ? (owner_type || 'User') : (req.admin ? 'Admin' : 'Master');
+
+    if (req.master) {
+      if (effectiveOwnerId !== req.master.id) {
+        if (effectiveOwnerType !== 'User') {
+          return res.status(403).json({ success: false, message: 'Not authorized to create for this owner type' });
+        }
+        const user = await User.findById(effectiveOwnerId);
+        if (!user || user.master_id.toString() !== req.master.id) {
+          return res.status(403).json({ success: false, message: 'Not authorized to create for this user' });
+        }
+      }
+
+      // We only check against the first script for limit ceiling, as bulk applies the same limit.
+      const sampleScript = results[0]._id;
+      let ceilingLimit;
+      if (effectiveOwnerId === req.master.id) {
+        const adminGlobal = await ScriptQuantity.findOne({ owner_type: 'Admin', exchange_name: normalizedExchange, script_name: sampleScript, deleted_at: null }).lean();
+        if (!adminGlobal) {
+          return res.status(400).json({ success: false, message: 'Admin has not set global limits for this exchange' });
+        }
+        ceilingLimit = adminGlobal.max_qty;
+      } else {
+        const masterLimit = await ScriptQuantity.findOne({ owner_id: req.master.id, owner_type: 'Master', exchange_name: normalizedExchange, script_name: sampleScript, deleted_at: null }).lean();
+        if (!masterLimit) {
+          return res.status(400).json({ success: false, message: 'You do not have a limit set for this exchange' });
+        }
+        ceilingLimit = masterLimit.max_qty;
+      }
+
+      if (default_max_qty > ceilingLimit) {
+        return res.status(400).json({ success: false, message: `max_qty cannot exceed limit of ${ceilingLimit}` });
+      }
+    }
 
     const baseFilter = { exchange_name: normalizedExchange, owner_id: effectiveOwnerId, owner_type: effectiveOwnerType, deleted_at: null };
 
@@ -395,33 +428,29 @@ const bulkCreateScriptQuantity = async (req, res) => {
           $setOnInsert: {
             exchange_name: normalizedExchange,
             script_name: r._id,
-            lot_size: r.lot_size || 1,
-            max_qty: default_max_qty,
-            brk_qty: default_brk_qty,
             owner_id: effectiveOwnerId,
             owner_type: effectiveOwnerType,
             created_at: new Date(),
           },
-          $set: { updated_at: new Date(), deleted_at: null }
+          $set: { 
+            lot_size: r.lot_size || 1,
+            max_qty: default_max_qty,
+            brk_qty: default_brk_qty,
+            updated_at: new Date(), 
+            deleted_at: null 
+          }
         },
         upsert: true
       }
     }));
     const bulkResult = await ScriptQuantity.bulkWrite(bulkOps);
 
-    // If updating a master's data, cascade to direct users
     if (effectiveOwnerType === 'Master') {
-      const { cascadeToDirectUsers } = require('../services/scriptQuantityCopyService');
-      for (const r of results) {
-        await cascadeToDirectUsers(effectiveOwnerId, normalizedExchange, r._id, {
-          max_qty: default_max_qty,
-          brk_qty: default_brk_qty,
-          lot_size: r.lot_size || 1,
-        });
-      }
+      const { bulkCascadeNewScriptsToUsers } = require('../services/scriptQuantityCopyService');
+      const scriptsToCascade = results.map(r => ({ script_name: r._id, max_qty: default_max_qty, brk_qty: default_brk_qty, lot_size: r.lot_size || 1 }));
+      await bulkCascadeNewScriptsToUsers(effectiveOwnerId, normalizedExchange, scriptsToCascade);
     }
 
-    // If Admin global bulk-create, cascade each script to all Masters and their users
     if (effectiveOwnerType === 'Admin') {
       const { cascadeNewScriptGlobally } = require('../services/scriptQuantityCopyService');
       for (const r of results) {
@@ -445,7 +474,6 @@ const bulkCreateScriptQuantity = async (req, res) => {
 
 /**
  * GET /api/admin/script-quantities/exchange/:exchange_name
- * Query: ?page=1&limit=500
  */
 const getScriptQuantityByExchange = async (req, res) => {
   try {

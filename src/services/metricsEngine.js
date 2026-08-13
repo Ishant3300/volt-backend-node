@@ -24,6 +24,7 @@ class MetricsEngine {
 
     // In-memory caches (rebuilt on init + periodically)
     this._brokerageRules = [];
+    this._brokerageRulesMap = {}; // { userId: rules[], 'global': rules[] }
     this._kiteMap = {};           // instrument_token → { lot_size, segment, raw_name }
 
     // Per-user trade aggregation cache: userId → { credit, positions[], fifoPnl, brokerage }
@@ -128,6 +129,13 @@ class MetricsEngine {
   async _loadRules() {
     try {
       this._brokerageRules = await BrokerageSettings.find({ deleted_at: null }).lean();
+      // Build per-user map for fast lookups
+      this._brokerageRulesMap = {};
+      for (const rule of this._brokerageRules) {
+        const key = rule.user_id ? rule.user_id.toString() : 'global';
+        if (!this._brokerageRulesMap[key]) this._brokerageRulesMap[key] = [];
+        this._brokerageRulesMap[key].push(rule);
+      }
 
       const instruments = await KiteInstrument.find({}, 'instrument_token lot_size segment raw_name').lean();
       this._kiteMap = {};
@@ -254,11 +262,16 @@ class MetricsEngine {
           const rawName = ki.raw_name || '';
           const lotSize = ki.lot_size || 1;
 
+          // Get user-specific brokerage rules, fallback to global
+          const userRulesArr = this._brokerageRulesMap[userId] || [];
+          const globalRulesArr = this._brokerageRulesMap['global'] || [];
+          const applicableRules = userRulesArr.length > 0 ? userRulesArr : globalRulesArr;
+
           let brkRule = null;
-          if (rawName && seg) brkRule = this._brokerageRules.find(r => r.script_name?.toUpperCase() === rawName.toUpperCase() && r.exchange_name === seg.toUpperCase());
-          if (!brkRule && rawName) brkRule = this._brokerageRules.find(r => r.script_name?.toUpperCase() === rawName.toUpperCase());
-          if (!brkRule && seg) brkRule = this._brokerageRules.find(r => r.exchange_name === seg.toUpperCase() && !r.script_name);
-          if (!brkRule) brkRule = this._brokerageRules.find(r => r.exchange_name === (seg.split('-')[0] || '').toUpperCase() && !r.script_name);
+          if (rawName && seg) brkRule = applicableRules.find(r => r.script_name?.toUpperCase() === rawName.toUpperCase() && r.exchange_name === seg.toUpperCase());
+          if (!brkRule && rawName) brkRule = applicableRules.find(r => r.script_name?.toUpperCase() === rawName.toUpperCase());
+          if (!brkRule && seg) brkRule = applicableRules.find(r => r.exchange_name === seg.toUpperCase() && !r.script_name);
+          if (!brkRule) brkRule = applicableRules.find(r => r.exchange_name === (seg.split('-')[0] || '').toUpperCase() && !r.script_name);
 
           if (brkRule) {
             if (brkRule.type === 'TURNOVER WISE') {

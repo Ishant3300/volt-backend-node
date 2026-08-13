@@ -1082,7 +1082,12 @@ function buildDisplayName(instrument, fallback) {
   return `${instrument.name} ${expiry.getUTCDate()} ${month}`;
 }
 
-function buildSnapshot({ group, instrument, settlementPrice, settlementPriceDate, run, settlementTime, brokerageRules, isExpired }) {
+function buildSnapshot({ group, instrument, settlementPrice, settlementPriceDate, run, settlementTime, brokerageRulesMap, isExpired }) {
+  // Get user-specific brokerage rules, fallback to global
+  const userKey = group.userId.toString();
+  const userRulesArr = brokerageRulesMap[userKey] || [];
+  const globalRulesArr = brokerageRulesMap['global'] || [];
+  const brokerageRules = userRulesArr.length > 0 ? userRulesArr : globalRulesArr;
   let realizedPnl = 0;
   let brokerage = 0;
   const openingFill = group.fills.find(fill => fill.trade_type === 'carry_forward');
@@ -1198,7 +1203,14 @@ async function commitSettlementTransaction({ run, lockOwner, tradingDate, faultI
         .select('instrument_token tradingsymbol display_name name raw_name expiry strike instrument_type exchange segment lot_size settlement_price settlement_price_date settlement_price_source ohlc_close last_price')
         .session(session)
         .lean();
-      const brokerageRules = await BrokerageSettings.find({ deleted_at: null }).session(session).lean();
+      const allBrokerageRules = await BrokerageSettings.find({ deleted_at: null }).session(session).lean();
+      // Build per-user map for brokerage rules
+      const brokerageRulesMap = {};
+      for (const rule of allBrokerageRules) {
+        const key = rule.user_id ? rule.user_id.toString() : 'global';
+        if (!brokerageRulesMap[key]) brokerageRulesMap[key] = [];
+        brokerageRulesMap[key].push(rule);
+      }
       const settlementUsers = await User.find({ _id: { $in: userIds }, deleted_at: null }).select('_id').session(session).lean();
       const pendingIds = await Trade.find({
         status: 'pending',
@@ -1300,7 +1312,7 @@ async function commitSettlementTransaction({ run, lockOwner, tradingDate, faultI
         settlementPriceDate: group.netQty === 0 ? null : priceDateMap[group.token],
         run,
         settlementTime,
-        brokerageRules,
+        brokerageRulesMap,
         isExpired: expiredTokens.has(group.token),
       }));
 

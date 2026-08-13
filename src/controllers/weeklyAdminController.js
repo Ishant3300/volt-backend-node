@@ -153,7 +153,9 @@ async function _getUserBrokerage(userId) {
 
   if (trades.length === 0) return 0;
 
-  const brkRules = await BrokerageSettings.find({ deleted_at: null }).lean();
+  // Try user-specific rules first, fall back to global
+  let brkRules = await BrokerageSettings.find({ user_id: userId, deleted_at: null }).lean();
+  if (brkRules.length === 0) brkRules = await BrokerageSettings.find({ user_id: null, deleted_at: null }).lean();
   const allTokens = [...new Set(trades.map(t => t.instrument_token))];
   const kiteInstruments = await KiteInstrument.find(
     { instrument_token: { $in: allTokens } }, 'instrument_token lot_size segment raw_name'

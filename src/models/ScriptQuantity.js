@@ -8,7 +8,7 @@ const scriptQuantitySchema = new mongoose.Schema({
   },
   owner_type: {
     type: String,
-    enum: ['Master', 'User'],
+    enum: ['Admin', 'Master', 'User'],
     required: true
   },
   exchange_name: {
@@ -72,7 +72,10 @@ scriptQuantitySchema.index({ deleted_at: 1 });
 scriptQuantitySchema.index({ exchange_name: 1 });
 scriptQuantitySchema.index({ script_name: 1 });
 scriptQuantitySchema.index({ owner_id: 1, exchange_name: 1 });
-scriptQuantitySchema.index({ owner_id: 1, exchange_name: 1, script_name: 1 });
+scriptQuantitySchema.index(
+  { owner_id: 1, exchange_name: 1, script_name: 1 }, 
+  { unique: true, partialFilterExpression: { deleted_at: null } }
+);
 
 const ScriptQuantity = mongoose.model('ScriptQuantity', scriptQuantitySchema);
 

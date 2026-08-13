@@ -1,6 +1,11 @@
 const mongoose = require('mongoose');
 
 const brokerageSettingsSchema = new mongoose.Schema({
+  user_id: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'User',
+    default: null
+  },
   type: {
     type: String,
     required: true,
@@ -61,6 +66,8 @@ brokerageSettingsSchema.pre('save', function(next) {
 
 // Index for faster queries
 brokerageSettingsSchema.index({ deleted_at: 1 });
+brokerageSettingsSchema.index({ user_id: 1, deleted_at: 1 });
+brokerageSettingsSchema.index({ user_id: 1, exchange_name: 1, deleted_at: 1 });
 
 const BrokerageSettings = mongoose.model('BrokerageSettings', brokerageSettingsSchema);
 

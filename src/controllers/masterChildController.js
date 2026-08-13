@@ -7,6 +7,7 @@ const CreditTransaction = require('../models/CreditTransaction');
 const mongoose = require('mongoose');
 const Transaction = require('../models/Transaction');
 const { applyWalletFunding } = require('./walletController');
+const { getAllSubMasterIds } = require('../services/masterHierarchyService');
 
 // Create Child Master
 const createChildMaster = async (req, res) => {
@@ -407,9 +408,19 @@ const updateChildMasterDetails = async (req, res) => {
       trade_limit
     } = req.body;
 
-    // Admin can update any master; master can only update their children
+    // Admin can update any master; master can only update their children in the hierarchy
     const detailQuery = { _id: id, deleted_at: null };
-    if (req.master) detailQuery.master_id = req.master.id;
+    
+    if (req.master) {
+      const allowedSubMasters = await getAllSubMasterIds(req.master.id);
+      if (!allowedSubMasters.includes(id)) {
+        return res.status(403).json({
+          success: false,
+          message: 'Not authorized to update this master',
+          data: null
+        });
+      }
+    }
 
     const childMaster = await Master.findOne(detailQuery);
 
@@ -435,7 +446,8 @@ const updateChildMasterDetails = async (req, res) => {
     }
 
     if (name) childMaster.name = name;
-    if (credits !== undefined) childMaster.credits = credits;
+    // Bug 5 fix: Do not allow direct updates to credits here. Use credit/debit endpoints!
+    // if (credits !== undefined) childMaster.credits = credits; 
     if (note) childMaster.note = note;
     if (exchanges_allowed) childMaster.exchanges_allowed = exchanges_allowed;
     if (trade_limit) childMaster.trade_limit = trade_limit;
@@ -497,9 +509,28 @@ const creditChildMaster = async (req, res) => {
       });
     }
 
-    // Admin can credit any master; master can only credit their own children
+    // Admin can credit any master; master can only credit their children in the hierarchy
     const query = { _id: id, deleted_at: null };
-    if (req.master) query.master_id = req.master.id;
+    let parentMaster = null;
+
+    if (req.master) {
+      const allowedSubMasters = await getAllSubMasterIds(req.master.id);
+      if (!allowedSubMasters.includes(id)) {
+        return res.status(403).json({
+          success: false,
+          message: 'Not authorized to credit this master',
+          data: null
+        });
+      }
+      
+      parentMaster = await Master.findById(req.master.id);
+      if (!parentMaster) {
+        return res.status(404).json({ success: false, message: 'Parent master not found' });
+      }
+      if (parentMaster.equity < amount) {
+        return res.status(400).json({ success: false, message: 'Insufficient parent balance to credit' });
+      }
+    }
 
     const childMaster = await Master.findOne(query);
 
@@ -513,6 +544,12 @@ const creditChildMaster = async (req, res) => {
 
     const previousCredits = childMaster.credits;
     const previousBalance = childMaster.equity;
+
+    // Deduct from parent if caller is a master
+    if (parentMaster) {
+      console.log('Deducting from parent: ' + parentMaster._id + ', amount: ' + amount + ', before: ' + parentMaster.equity); parentMaster.equity -= amount; console.log('After: ' + parentMaster.equity);
+      await parentMaster.save();
+    }
 
     // Balance increases; credits only rises if balance exceeds it
     childMaster.equity += amount;
@@ -566,9 +603,25 @@ const debitChildMaster = async (req, res) => {
       });
     }
 
-    // Admin can debit any master; master can only debit their own children
+    // Admin can debit any master; master can only debit their children in the hierarchy
     const query = { _id: id, deleted_at: null };
-    if (req.master) query.master_id = req.master.id;
+    let parentMaster = null;
+
+    if (req.master) {
+      const allowedSubMasters = await getAllSubMasterIds(req.master.id);
+      if (!allowedSubMasters.includes(id)) {
+        return res.status(403).json({
+          success: false,
+          message: 'Not authorized to debit this master',
+          data: null
+        });
+      }
+      
+      parentMaster = await Master.findById(req.master.id);
+      if (!parentMaster) {
+        return res.status(404).json({ success: false, message: 'Parent master not found' });
+      }
+    }
 
     const childMaster = await Master.findOne(query);
 
@@ -590,6 +643,12 @@ const debitChildMaster = async (req, res) => {
 
     const previousCredits = childMaster.credits;
     const previousBalance = childMaster.equity;
+
+    // Refund to parent if caller is a master
+    if (parentMaster) {
+      parentMaster.equity += amount;
+      await parentMaster.save();
+    }
 
     // Deduct from balance only; credits stay unchanged
     childMaster.equity -= amount;
@@ -754,9 +813,19 @@ const deleteChildMaster = async (req, res) => {
   try {
     const { id } = req.params;
 
-    // Admin can delete any master; master can only delete their children
+    // Admin can delete any master; master can only delete their children in the hierarchy
     const delQuery = { _id: id, deleted_at: null };
-    if (req.master) delQuery.master_id = req.master.id;
+    
+    if (req.master) {
+      const allowedSubMasters = await getAllSubMasterIds(req.master.id);
+      if (!allowedSubMasters.includes(id)) {
+        return res.status(403).json({
+          success: false,
+          message: 'Not authorized to delete this master',
+          data: null
+        });
+      }
+    }
 
     const childMaster = await Master.findOne(delQuery);
 
@@ -770,6 +839,19 @@ const deleteChildMaster = async (req, res) => {
 
     childMaster.deleted_at = new Date();
     await childMaster.save();
+    
+    // Bug 6 fix: Cascade soft-delete to users under this master's hierarchy
+    const User = require('../models/User');
+    const allHierarchyMasterIds = await getAllSubMasterIds(id);
+    await User.updateMany(
+      { master_id: { $in: allHierarchyMasterIds }, deleted_at: null },
+      { $set: { deleted_at: new Date() } }
+    );
+    // Also cascade soft-delete to sub-masters
+    await Master.updateMany(
+      { _id: { $in: allHierarchyMasterIds, $ne: id }, deleted_at: null },
+      { $set: { deleted_at: new Date() } }
+    );
 
     res.status(200).json({
       success: true,

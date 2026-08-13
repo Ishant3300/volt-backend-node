@@ -6,21 +6,34 @@ async function calculateBrokerage(trade, session) {
   try {
     const instrument = await KiteInstrument.findOne({ instrument_token: trade.instrument_token }).session(session).lean();
     const rawName = instrument?.raw_name || instrument?.name || null;
-    let rule = null;
-    if (rawName) {
-      rule = await BrokerageSettings.findOne({
-        exchange_name: trade.exchange,
-        script_name: rawName,
-        deleted_at: null,
-      }).session(session).lean();
+    const userId = trade.user_id || null;
+
+    // Helper: find rule for a specific user_id (or null for global)
+    async function findRule(uid) {
+      let r = null;
+      if (rawName) {
+        r = await BrokerageSettings.findOne({
+          user_id: uid,
+          exchange_name: trade.exchange,
+          script_name: rawName,
+          deleted_at: null,
+        }).session(session).lean();
+      }
+      if (!r) {
+        r = await BrokerageSettings.findOne({
+          user_id: uid,
+          exchange_name: trade.exchange,
+          script_name: trade.tradingsymbol,
+          deleted_at: null,
+        }).session(session).lean();
+      }
+      return r;
     }
-    if (!rule) {
-      rule = await BrokerageSettings.findOne({
-        exchange_name: trade.exchange,
-        script_name: trade.tradingsymbol,
-        deleted_at: null,
-      }).session(session).lean();
-    }
+
+    // 1) Try user-specific rule
+    let rule = userId ? await findRule(userId) : null;
+    // 2) Fallback to global rule (user_id: null)
+    if (!rule) rule = await findRule(null);
     if (!rule) return 0;
     
     if (rule.type === 'TURNOVER WISE') {

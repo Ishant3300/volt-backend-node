@@ -200,7 +200,14 @@ const getTradeReport = async (req, res) => {
     }
 
     // Load brokerage rules and instrument info for recalculation
-    const brkRules = await BrokerageSettings.find({ deleted_at: null }).lean();
+    // Try user-specific rules first, fall back to global
+    let brkRules;
+    if (targetUserId) {
+      brkRules = await BrokerageSettings.find({ user_id: targetUserId, deleted_at: null }).lean();
+    }
+    if (!brkRules || brkRules.length === 0) {
+      brkRules = await BrokerageSettings.find({ user_id: null, deleted_at: null }).lean();
+    }
     const allTokens = [...new Set(trades.map(t => t.instrument_token))];
     const kiteInstruments = await KiteInstrument.find(
       { instrument_token: { $in: allTokens } },
