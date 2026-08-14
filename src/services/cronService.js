@@ -244,6 +244,33 @@ class CronService {
         }, { timezone: 'Asia/Kolkata' });
         this.jobs.push(intradaySquareOffMCX);
 
+        // ── Auto-Cancel Pending Orders at Market Close ───────────────────
+        // Cancels all unfilled limit/stop orders once the market closes.
+        // Runs 1 minute after intraday square-off to avoid clashing.
+        // NFO-FUT, NFO-OPT: 3:42 PM IST
+        const cancelPendingNSE = cron.schedule('42 15 * * 1-5', async () => {
+            console.log('🗑️ [CRON] Cancelling pending orders (NSE/NFO close)...');
+            try {
+                const count = await this.cancelPendingOrdersBySegment(['NFO-FUT', 'NFO-OPT']);
+                console.log(`✅ [CRON] Cancelled ${count} pending NSE/NFO order(s).`);
+            } catch (error) {
+                console.error('❌ [CRON] Error cancelling NSE pending orders:', error);
+            }
+        }, { timezone: 'Asia/Kolkata' });
+        this.jobs.push(cancelPendingNSE);
+
+        // MCX-FUT, MCX-OPT: 11:32 PM IST
+        const cancelPendingMCX = cron.schedule('32 23 * * 1-5', async () => {
+            console.log('🗑️ [CRON] Cancelling pending orders (MCX close)...');
+            try {
+                const count = await this.cancelPendingOrdersBySegment(['MCX-FUT', 'MCX-OPT']);
+                console.log(`✅ [CRON] Cancelled ${count} pending MCX order(s).`);
+            } catch (error) {
+                console.error('❌ [CRON] Error cancelling MCX pending orders:', error);
+            }
+        }, { timezone: 'Asia/Kolkata' });
+        this.jobs.push(cancelPendingMCX);
+
         // GLOBAL/INDICES: no fixed close — skip for now (24hr market)
 
         // ── Weekend Carry Forward (DISABLED — admin triggers manually via Settlement UI) ──
@@ -311,6 +338,59 @@ class CronService {
         }
 
         console.log(`   ✅ Total: ${totalSquaredOff} position(s) squared off for ${users.length} user(s).`);
+    }
+
+    /**
+     * Cancel all pending (unfilled) limit/stop orders for instruments in the given segments.
+     * Called at market close to clean up stale orders that won't fill until next day.
+     * Returns the number of orders cancelled.
+     */
+    async cancelPendingOrdersBySegment(segments) {
+        const Trade = require('../models/Trade');
+        const KiteInstrument = require('../models/KiteInstrument');
+        const orderBookService = require('./orderBookService');
+        const redisService = require('./redisService');
+
+        // Get all instrument tokens for the given segments
+        const segmentsUpper = segments.map(s => s.toUpperCase());
+        const instruments = await KiteInstrument.find({
+            segment: { $in: segmentsUpper },
+            is_active: true,
+            deleted_at: null,
+        }).select('instrument_token').lean();
+
+        const tokens = instruments.map(i => i.instrument_token.toString());
+        if (tokens.length === 0) return 0;
+
+        // Find and cancel all pending orders for these instruments
+        const pendingOrders = await Trade.find({
+            status: 'pending',
+            instrument_token: { $in: tokens },
+            deleted_at: null,
+        }).select('_id instrument_token transaction_type').lean();
+
+        if (pendingOrders.length === 0) return 0;
+
+        const ids = pendingOrders.map(o => o._id);
+        await Trade.updateMany(
+            { _id: { $in: ids }, status: 'pending', deleted_at: null },
+            { $set: { status: 'cancelled', remarks: 'Auto-cancelled: market closed' } }
+        );
+
+        // Remove from Redis order book if available
+        if (redisService.isAvailable()) {
+            for (const order of pendingOrders) {
+                try {
+                    await orderBookService.removeOrder(
+                        order._id.toString(),
+                        order.instrument_token.toString(),
+                        order.transaction_type
+                    );
+                } catch (_) {}
+            }
+        }
+
+        return pendingOrders.length;
     }
 
     /**
