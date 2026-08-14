@@ -196,7 +196,7 @@ class CronService {
         // ── Expiry Auto Square-Off ───────────────────────────────────────
         // 3:35 PM IST (after NSE close) + 11:32 PM IST (after MCX close at 11:30 PM)
         // Checks for instruments that expired today and auto-squares-off open positions
-        const expirySquareOffNSE = cron.schedule('35 15 * * 1-5', async () => {
+        const expirySquareOffNSE = cron.schedule('46 15 * * 1-5', async () => {
             console.log('📊 [CRON] Expiry auto square-off check (NSE close)...');
             try {
                 await this.autoSquareOffExpiredPositions();
@@ -207,7 +207,7 @@ class CronService {
         }, { timezone: 'Asia/Kolkata' });
         this.jobs.push(expirySquareOffNSE);
 
-        const expirySquareOffMCX = cron.schedule('32 23 * * 1-5', async () => {
+        const expirySquareOffMCX = cron.schedule('33 23 * * 1-5', async () => {
             console.log('📊 [CRON] Expiry auto square-off check (MCX close)...');
             try {
                 await this.autoSquareOffExpiredPositions();
@@ -221,7 +221,7 @@ class CronService {
         // ── Intraday Square-Off at Market Close ──────────────────────────
         // Squares off positions for users who have intraday_squareoff enabled for the segment.
         // NSE/NFO: 3:30 PM IST
-        const intradaySquareOffNSE = cron.schedule('30 15 * * 1-5', async () => {
+        const intradaySquareOffNSE = cron.schedule('41 15 * * 1-5', async () => {
             console.log('🔄 [CRON] Intraday square-off (NSE/NFO close)...');
             try {
                 await this.runIntradaySquareOff(['NFO-FUT', 'NFO-OPT']);
@@ -233,7 +233,7 @@ class CronService {
         this.jobs.push(intradaySquareOffNSE);
 
         // MCX: 11:30 PM IST
-        const intradaySquareOffMCX = cron.schedule('30 23 * * 1-5', async () => {
+        const intradaySquareOffMCX = cron.schedule('31 23 * * 1-5', async () => {
             console.log('🔄 [CRON] Intraday square-off (MCX close)...');
             try {
                 await this.runIntradaySquareOff(['MCX-FUT', 'MCX-OPT']);
