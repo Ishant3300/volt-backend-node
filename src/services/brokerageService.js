@@ -37,7 +37,7 @@ async function calculateBrokerage(trade, session) {
     if (!rule) return 0;
     
     if (rule.type === 'TURNOVER WISE') {
-        return (trade.price * trade.quantity) * (rule.brk_value / 100);
+        return (trade.price * trade.quantity) * (rule.brk_value / 10000);
     }
     if (rule.type !== 'LOT WISE') return 0;
 

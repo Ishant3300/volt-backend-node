@@ -196,6 +196,14 @@ const createChildMaster = async (req, res) => {
         await copyFromGroupedQuantityToMaster(childMaster._id, session);
       }
 
+      // Copy parent's brokerage rates to the new child master
+      const { copyBrokerageFromParent, copyBrokerageFromGlobal } = require('../services/brokerageCopyService');
+      if (parentMaster) {
+        await copyBrokerageFromParent(parentMaster._id.toString(), childMaster._id.toString(), session);
+      } else {
+        await copyBrokerageFromGlobal(childMaster._id.toString(), session);
+      }
+
       // Task 13 / design §13.3: apply any inline initial wallet funding for the new
       // child master. A MASTER creating the child → TRANSFER (debits the master's
       // own category pool); an ADMIN creating it → GRANT (no debit). It runs inside

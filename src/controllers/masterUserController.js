@@ -310,6 +310,10 @@ const createUser = async (req, res) => {
       const { copyFromMasterToUser } = require('../services/scriptQuantityCopyService');
       await copyFromMasterToUser(parentMaster._id.toString(), user._id.toString(), session);
 
+      // Copy master's brokerage rates to the new user
+      const { copyBrokerageFromParent } = require('../services/brokerageCopyService');
+      await copyBrokerageFromParent(parentMaster._id.toString(), user._id.toString(), session);
+
       // Task 13 / design §13.3: apply any inline initial wallet funding. Because
       // createUser is a master route, this is a TRANSFER — the master's OWN
       // category pool is debited and the new user credited via walletService.assign.

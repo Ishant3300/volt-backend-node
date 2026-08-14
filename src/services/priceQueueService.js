@@ -102,7 +102,7 @@ async function calculateBrokerage(trade, session) {
   // 2) Fallback to global rule (user_id: null)
   if (!rule) rule = await findRule(null);
   if (!rule) return 0;
-  if (rule.type === 'TURNOVER WISE') return (trade.price * trade.quantity) * (rule.brk_value / 100);
+  if (rule.type === 'TURNOVER WISE') return (trade.price * trade.quantity) * (rule.brk_value / 10000);
   if (rule.type !== 'LOT WISE') return 0;
 
   let lotSize = Number(instrument?.lot_size || 0);

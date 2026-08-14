@@ -6,7 +6,7 @@ set -e
 
 EC2_HOST="13.204.61.199"
 EC2_USER="ec2-user"
-SSH_KEY="~/.ssh/my-ec2-key"
+SSH_KEY="/Users/devarshukani/Work/Keys/apex/my-ec2-key"
 REMOTE_DIR="/home/ec2-user/stocker-backend-node"
 PM2_APP="stocker-backend-node"
 

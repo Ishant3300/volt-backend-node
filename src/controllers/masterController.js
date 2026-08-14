@@ -131,6 +131,10 @@ const createMaster = async (req, res) => {
       const { copyFromGroupedQuantityToMaster } = require('../services/scriptQuantityCopyService');
       await copyFromGroupedQuantityToMaster(master._id, session);
 
+      // Copy global brokerage rates to this new master
+      const { copyBrokerageFromGlobal } = require('../services/brokerageCopyService');
+      await copyBrokerageFromGlobal(master._id.toString(), session);
+
       // Task 13 / design §13.3: apply any inline initial wallet funding. createMaster
       // is admin-only (admin_id: req.admin.id), so this is a GRANT — the target is
       // credited with no debit source. It runs inside this transaction (session

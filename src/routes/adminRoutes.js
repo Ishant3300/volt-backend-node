@@ -94,6 +94,26 @@ router.put('/brokerage-settings/bulk-update', authenticateAdminOrMaster, async (
       return res.status(400).json({ success: false, message: 'ids array and brk_value are required', data: null });
     }
     const BrokerageSettings = require('../models/BrokerageSettings');
+
+    // Floor validation: check the first record to determine owner, then validate
+    // Admin bypasses this — admin can set any rate on their children
+    const sampleRecord = await BrokerageSettings.findOne({ _id: { $in: ids }, deleted_at: null }).lean();
+    if (sampleRecord && sampleRecord.user_id && !req.admin) {
+      const { validateBrokerageFloor } = require('../services/brokerageCopyService');
+      const User = require('../models/User');
+      const ownerUser = await User.findById(sampleRecord.user_id).select('_id').lean();
+      const ownerType = ownerUser ? 'User' : 'Master';
+      const effectiveType = type || sampleRecord.type;
+
+      const floorError = await validateBrokerageFloor(
+        sampleRecord.user_id.toString(), ownerType,
+        sampleRecord.exchange_name, sampleRecord.script_name, effectiveType, brk_value
+      );
+      if (floorError) {
+        return res.status(422).json({ success: false, message: floorError, data: null });
+      }
+    }
+
     // Stamp effective_from so this new rate only applies to trades from now onwards.
     const updateFields = { brk_value, effective_from: new Date() };
     if (type) updateFields.type = type;

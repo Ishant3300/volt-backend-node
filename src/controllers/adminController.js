@@ -1035,6 +1035,28 @@ const updateBrokerageSettings = async (req, res) => {
       });
     }
 
+    // Floor validation: if this record belongs to a user/master, ensure new rate >= parent's rate
+    // Admin bypasses this — admin can set any rate on their children
+    if (brk_value !== undefined && brokerageSettings.user_id && !req.admin) {
+      const { validateBrokerageFloor } = require('../services/brokerageCopyService');
+      // Determine owner type
+      const User = require('../models/User');
+      const Master = require('../models/Master');
+      const ownerUser = await User.findById(brokerageSettings.user_id).select('_id').lean();
+      const ownerType = ownerUser ? 'User' : 'Master';
+      const effectiveExchange = exchange_name || brokerageSettings.exchange_name;
+      const effectiveScript = script_name || brokerageSettings.script_name;
+      const effectiveType = type || brokerageSettings.type;
+
+      const floorError = await validateBrokerageFloor(
+        brokerageSettings.user_id.toString(), ownerType,
+        effectiveExchange, effectiveScript, effectiveType, brk_value
+      );
+      if (floorError) {
+        return res.status(422).json({ success: false, message: floorError, data: null });
+      }
+    }
+
     if (type) brokerageSettings.type = type;
     if (exchange_name) brokerageSettings.exchange_name = exchange_name;
     if (script_name) brokerageSettings.script_name = script_name;
