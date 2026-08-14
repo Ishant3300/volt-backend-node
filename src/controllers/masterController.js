@@ -182,12 +182,17 @@ const createMaster = async (req, res) => {
 // Get All Masters
 const getAllMasters = async (req, res) => {
   try {
-    const { page = 1, limit = 20, status, server_id } = req.query;
+    const { page = 1, limit = 20, status, server_id, include_submasters } = req.query;
 
     const filter = {
-      master_id: null,
       deleted_at: null
     };
+
+    // By default, only return top-level masters (master_id: null)
+    // If include_submasters=true, return ALL masters (including sub-masters)
+    if (include_submasters !== 'true') {
+      filter.master_id = null;
+    }
 
     if (status) filter.status = status;
     if (server_id) filter.server_id = server_id;
@@ -501,6 +506,26 @@ const updateMasterPermissions = async (req, res) => {
       });
     }
 
+    // Report permission keys — only Admin can change these on Masters/SubMasters
+    const reportPermKeys = [
+      'account_summary', 'pnl_summary', 'client_summary', 'settlement_report',
+      'generate_pdf', 'weekly_admin', 'intraday_history', 'userwise_open_position',
+      'script_quantity', 'deleted_trade', 'trade_account'
+    ];
+
+    // If caller is a Master, block them from updating report permissions on other Masters
+    if (req.master) {
+      const hasReportPerm = reportPermKeys.some(key => permissions[key] !== undefined);
+      if (hasReportPerm) {
+        return res.status(403).json({
+          success: false,
+          message: 'Only Admin can manage report permissions for Masters/SubMasters',
+          data: null
+        });
+      }
+    }
+
+    // Admin can update ANY Master/SubMaster; Master can only update their direct child
     const permQuery = { _id: id, deleted_at: null };
     if (req.master) permQuery.master_id = req.master.id;
 
@@ -552,6 +577,13 @@ const updateMasterPermissions = async (req, res) => {
         } catch (_) {}
       }
     }
+
+    // ── Report permissions: no cascade to sub-Masters ──
+    // When Admin turns OFF a report permission for a Master, it only affects
+    // that Master and its direct Users. Sub-Masters are independent — they just
+    // can't enable a permission their parent doesn't have (enforced at update time).
+    // The User's effective permission = their own setting AND their parent Master's,
+    // so turning off the Master's permission automatically hides it from their Users.
 
     res.status(200).json({
       success: true,

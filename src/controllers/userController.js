@@ -1,4 +1,5 @@
 const User = require('../models/User');
+const Master = require('../models/Master');
 const Trade = require('../models/Trade');
 const KiteInstrument = require('../models/KiteInstrument');
 
@@ -50,10 +51,31 @@ const getUserProfile = async (req, res) => {
             });
         }
 
+        // Compute effective report permissions: User's own setting AND parent Master's setting.
+        // A User can never have a permission their parent Master doesn't have.
+        const userData = user.toJSON();
+        const parentMaster = await Master.findById(user.master_id).select('permissions').lean();
+        const reportPermKeys = [
+            'account_summary', 'pnl_summary', 'client_summary', 'settlement_report',
+            'generate_pdf', 'weekly_admin', 'intraday_history', 'userwise_open_position',
+            'script_quantity', 'deleted_trade', 'trade_account'
+        ];
+        const effectivePermissions = {};
+        for (const key of reportPermKeys) {
+            const masterHas = parentMaster && parentMaster.permissions
+                ? (parentMaster.permissions[key] !== undefined ? parentMaster.permissions[key] : true)
+                : true;
+            const userHas = user.report_permissions
+                ? (user.report_permissions[key] !== undefined ? user.report_permissions[key] : true)
+                : true;
+            effectivePermissions[key] = masterHas && userHas;
+        }
+        userData.report_permissions = effectivePermissions;
+
         res.status(200).json({
             success: true,
             message: 'User profile retrieved successfully',
-            data: user.toJSON()
+            data: userData
         });
     } catch (error) {
         res.status(500).json({

@@ -129,6 +129,19 @@ const userSchema = new mongoose.Schema({
     type: Boolean,
     default: true
   },
+  report_permissions: {
+    account_summary: { type: Boolean, default: true },
+    pnl_summary: { type: Boolean, default: true },
+    client_summary: { type: Boolean, default: true },
+    settlement_report: { type: Boolean, default: true },
+    generate_pdf: { type: Boolean, default: true },
+    weekly_admin: { type: Boolean, default: true },
+    intraday_history: { type: Boolean, default: true },
+    userwise_open_position: { type: Boolean, default: true },
+    script_quantity: { type: Boolean, default: true },
+    deleted_trade: { type: Boolean, default: true },
+    trade_account: { type: Boolean, default: true }
+  },
   change_pass_on_first_login: {
     type: Boolean,
     default: false

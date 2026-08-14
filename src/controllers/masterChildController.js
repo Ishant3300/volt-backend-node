@@ -348,6 +348,25 @@ const updateChildMasterPermissions = async (req, res) => {
       });
     }
 
+    // Report permission keys — only Admin can change these on Masters/SubMasters
+    const reportPermKeys = [
+      'account_summary', 'pnl_summary', 'client_summary', 'settlement_report',
+      'generate_pdf', 'weekly_admin', 'intraday_history', 'userwise_open_position',
+      'script_quantity', 'deleted_trade', 'trade_account'
+    ];
+
+    // If caller is a Master, block them from updating report permissions on child Masters
+    if (req.master) {
+      const hasReportPerm = reportPermKeys.some(key => permissions[key] !== undefined);
+      if (hasReportPerm) {
+        return res.status(403).json({
+          success: false,
+          message: 'Only Admin can manage report permissions for Masters/SubMasters',
+          data: null
+        });
+      }
+    }
+
     // Admin can update any master's permissions; master can only update their children
     const parentMaster = req.master ? await Master.findById(req.master.id) : null;
     const permQuery = { _id: id, deleted_at: null };
@@ -384,6 +403,9 @@ const updateChildMasterPermissions = async (req, res) => {
     });
 
     await childMaster.save();
+
+    // Report permissions only apply to this Master and its direct Users.
+    // Sub-Masters are independent — they just can't exceed the parent's ceiling.
 
     res.status(200).json({
       success: true,

@@ -1183,6 +1183,97 @@ const updateUserMarginSquareoffPercentage = async (req, res) => {
   }
 };
 
+// Update User Report Permissions
+const updateUserReportPermissions = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { report_permissions } = req.body;
+
+    if (!report_permissions || typeof report_permissions !== 'object') {
+      return res.status(400).json({
+        success: false,
+        message: 'report_permissions object is required',
+        data: null
+      });
+    }
+
+    // Find the user — must belong to the calling master's hierarchy
+    const user = await User.findOne({ _id: id, deleted_at: null });
+    if (!user) {
+      return res.status(404).json({
+        success: false,
+        message: 'User not found',
+        data: null
+      });
+    }
+
+    // Determine caller and validate ownership
+    let parentMaster = null;
+    if (req.master) {
+      // Master/SubMaster can only update their DIRECT users
+      if (user.master_id.toString() !== req.master.id) {
+        return res.status(403).json({
+          success: false,
+          message: 'Not authorized to update this user. You can only manage your direct users.',
+          data: null
+        });
+      }
+      parentMaster = await Master.findById(req.master.id).select('permissions').lean();
+    } else if (req.admin) {
+      parentMaster = await Master.findById(user.master_id).select('permissions').lean();
+    } else {
+      return res.status(403).json({ success: false, message: 'Unauthorized', data: null });
+    }
+
+    // Validate: cannot grant a permission the parent Master doesn't have
+    const reportPermKeys = [
+      'account_summary', 'pnl_summary', 'client_summary', 'settlement_report',
+      'generate_pdf', 'weekly_admin', 'intraday_history', 'userwise_open_position',
+      'script_quantity', 'deleted_trade', 'trade_account'
+    ];
+
+    for (const key of reportPermKeys) {
+      if (report_permissions[key] === true && parentMaster && parentMaster.permissions) {
+        if (parentMaster.permissions[key] === false) {
+          return res.status(403).json({
+            success: false,
+            message: `Cannot grant '${key}' - parent master doesn't have this permission`,
+            data: null
+          });
+        }
+      }
+    }
+
+    // Update only provided report permission keys
+    if (!user.report_permissions) {
+      user.report_permissions = {};
+    }
+    for (const key of reportPermKeys) {
+      if (report_permissions[key] !== undefined) {
+        user.report_permissions[key] = report_permissions[key];
+      }
+    }
+    user.markModified('report_permissions');
+    await user.save();
+
+    res.status(200).json({
+      success: true,
+      message: 'User report permissions updated successfully',
+      data: {
+        id: user._id,
+        username: user.username,
+        report_permissions: user.report_permissions
+      }
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: error.message,
+      data: null
+    });
+  }
+};
+
 module.exports = {
   createUser,
   getAllUsers,
@@ -1190,6 +1281,7 @@ module.exports = {
   updateUserDetails,
   updateUserIntradaySquareoff,
   updateUserMarginSquareoffPercentage,
+  updateUserReportPermissions,
   creditUser,
   debitUser,
   getUserPosition,

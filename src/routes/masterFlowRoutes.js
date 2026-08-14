@@ -26,6 +26,7 @@ const {
   updateUserDetails,
   updateUserIntradaySquareoff,
   updateUserMarginSquareoffPercentage,
+  updateUserReportPermissions,
   creditUser,
   debitUser,
   getUserPosition,
@@ -154,6 +155,9 @@ router.put('/users/:id/intraday-squareoff', updateUserIntradaySquareoff);
 
 // Update user margin squareoff percentage
 router.put('/users/:id/margin-squareoff-percentage', updateUserMarginSquareoffPercentage);
+
+// Update user report permissions
+router.put('/users/:id/report-permissions', updateUserReportPermissions);
 
 // Credit user
 router.post('/users/:id/credit', creditUser);
