@@ -16,6 +16,11 @@ let _livePriceService = null;
 const _squaringOff = new Set();
 // Per-master re-entrancy guard for the master cascade (design §13.1).
 const _squaringOffMasters = new Set();
+// Tracks users who have already been alerted at 80% threshold — prevents spam.
+// Cleared when user recovers below threshold or gets squared off.
+const _alertedUsers = new Set();
+
+const MARGIN_ALERT_THRESHOLD = 80; // Alert at 80% of credit loss
 
 const init = livePriceService => {
   _livePriceService = livePriceService;
@@ -76,11 +81,43 @@ const checkUser = async (userId, metrics) => {
       .lean();
     if (!user || !user.active_status || user.deleted_at) return;
     if (!user.margin_square_off && !(user.margin_square_off_percentage > 0)) return;
+
+    // ── Margin Alert at 80% — notify user before square-off triggers ──
+    const credit = Number(user.credits || 0);
+    const m2m = Number(metrics?.m2m_pnl || 0);
+    if (credit > 0 && m2m < 0) {
+      const lossPercent = Math.abs(m2m) / credit * 100;
+      if (lossPercent >= MARGIN_ALERT_THRESHOLD && !_alertedUsers.has(userId)) {
+        // Send push notification once
+        _alertedUsers.add(userId);
+        try {
+          const firebaseService = require('./firebaseService');
+          if (firebaseService.isAvailable()) {
+            firebaseService.sendNotification(userId, 'margin_alert', {
+              title: 'Margin Alert',
+              body: `Warning: Your losses have reached ${Math.round(lossPercent)}% of your credit (₹${Math.abs(m2m).toFixed(0)} / ₹${credit.toFixed(0)}). Positions may be auto-closed soon.`,
+            });
+            console.log(`⚠️  [MarginAlert] ${user.username}: loss at ${lossPercent.toFixed(1)}% — notification sent`);
+          }
+        } catch (alertErr) {
+          console.error(`⚠️  [MarginAlert] Failed to send alert for ${user.username}:`, alertErr.message);
+        }
+      } else if (lossPercent < MARGIN_ALERT_THRESHOLD && _alertedUsers.has(userId)) {
+        // User recovered below threshold — clear alert flag so they get alerted again if it drops
+        _alertedUsers.delete(userId);
+      }
+    } else if (_alertedUsers.has(userId)) {
+      // No loss or no credit — clear alert
+      _alertedUsers.delete(userId);
+    }
+
     if (!metrics?.positions?.length || !shouldSquareOff(user, metrics, true)) return;
 
     _squaringOff.add(userId);
     try {
       await _squareOffAllPositions(user);
+      // Clear alert flag after square-off completes
+      _alertedUsers.delete(userId);
     } finally {
       _squaringOff.delete(userId);
     }
