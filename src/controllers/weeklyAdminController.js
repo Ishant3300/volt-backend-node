@@ -73,8 +73,14 @@ const getWeeklyAdminReport = async (req, res) => {
  */
 async function _getUserEntry(userDoc, metricsEngine, callerMaster) {
   const metrics = await metricsEngine.getFreshMetrics(userDoc._id.toString());
-  const realised = metrics ? metrics.realised_pnl : 0;
-  const position = metrics ? metrics.position_pnl : 0;
+  let realised = 0, position = 0;
+  if (metrics && (metrics.realised_pnl || metrics.position_pnl)) {
+    realised = metrics.realised_pnl || 0;
+    position = metrics.position_pnl || 0;
+  } else {
+    // Fallback: compute from trades when metricsEngine has no cache
+    realised = await _computePnlFromTrades(userDoc._id);
+  }
   const m2mPnl = realised + position;
 
   // Compute user's total brokerage and turnover
@@ -131,6 +137,10 @@ async function _getAggregatedEntry(masterId, masterDoc, metricsEngine, callerPnl
     if (metrics) {
       realised += metrics.realised_pnl;
       position += metrics.position_pnl;
+    } else {
+      // Fallback: compute from trades when metricsEngine has no cache (weekends, server restart)
+      const userPnl = await _computePnlFromTrades(u._id);
+      realised += userPnl;
     }
   }
 
@@ -166,6 +176,18 @@ async function _getAggregatedEntry(masterId, masterDoc, metricsEngine, callerPnl
     caller_profit: _r2(callerProfit),
     total_caller: _r2(callerProfit + callerBrk),
   };
+}
+
+/**
+ * Fallback: compute realized P&L from trades when metricsEngine has no cache.
+ * Sums up pnl field from all completed, non-deleted trades for a user.
+ */
+async function _computePnlFromTrades(userId) {
+  const result = await Trade.aggregate([
+    { $match: { user_id: userId, status: 'completed', deleted_at: null } },
+    { $group: { _id: null, totalPnl: { $sum: '$pnl' } } }
+  ]);
+  return result.length > 0 ? (result[0].totalPnl || 0) : 0;
 }
 
 /**

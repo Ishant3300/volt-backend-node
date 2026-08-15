@@ -84,7 +84,13 @@ const getAccountSummary = async (req, res) => {
     // Group by instrument — use pre-computed pnl from trade engine, recalculate brokerage
     const BrokerageSettings = require('../models/BrokerageSettings');
     const KiteInstrument = require('../models/KiteInstrument');
-    const brkRules = await BrokerageSettings.find({ deleted_at: null }).lean();
+    
+    // Load user-specific brokerage rules first, fall back to global
+    const targetUserId = req.query.user_id || req.user?.id || req.master?.id || req.admin?.id;
+    let brkRules = await BrokerageSettings.find({ user_id: targetUserId, deleted_at: null }).lean();
+    if (brkRules.length === 0) {
+      brkRules = await BrokerageSettings.find({ user_id: null, deleted_at: null }).lean();
+    }
 
     // Build instrument info map for lot_size + segment
     const allTokens = [...new Set(trades.map(t => t.instrument_token))];
