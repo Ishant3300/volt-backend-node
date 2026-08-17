@@ -18,9 +18,11 @@ const _squaringOff = new Set();
 const _squaringOffMasters = new Set();
 // Tracks users who have already been alerted at 80% threshold — prevents spam.
 // Cleared when user recovers below threshold or gets squared off.
-const _alertedUsers = new Set();
+const _alertedUsers80 = new Set();
+const _alertedUsers90 = new Set();
 
-const MARGIN_ALERT_THRESHOLD = 80; // Alert at 80% of credit loss
+const MARGIN_ALERT_THRESHOLD_80 = 80;
+const MARGIN_ALERT_THRESHOLD_90 = 90;
 
 const init = livePriceService => {
   _livePriceService = livePriceService;
@@ -82,14 +84,31 @@ const checkUser = async (userId, metrics) => {
     if (!user || !user.active_status || user.deleted_at) return;
     if (!user.margin_square_off && !(user.margin_square_off_percentage > 0)) return;
 
-    // ── Margin Alert at 80% — notify user before square-off triggers ──
+    // ── Margin Alert at 80% and 90% — notify user before square-off triggers ──
     const credit = Number(user.credits || 0);
     const m2m = Number(metrics?.m2m_pnl || 0);
     if (credit > 0 && m2m < 0) {
       const lossPercent = Math.abs(m2m) / credit * 100;
-      if (lossPercent >= MARGIN_ALERT_THRESHOLD && !_alertedUsers.has(userId)) {
-        // Send push notification once
-        _alertedUsers.add(userId);
+
+      // 90% alert (higher priority — check first)
+      if (lossPercent >= MARGIN_ALERT_THRESHOLD_90 && !_alertedUsers90.has(userId)) {
+        _alertedUsers90.add(userId);
+        try {
+          const firebaseService = require('./firebaseService');
+          if (firebaseService.isAvailable()) {
+            firebaseService.sendNotification(userId, 'margin_alert', {
+              title: 'Critical Margin Alert',
+              body: `Your losses have reached ${Math.round(lossPercent)}% of your credit (₹${Math.abs(m2m).toFixed(0)} / ₹${credit.toFixed(0)}). Positions will be auto-closed imminently.`,
+            });
+            console.log(`🚨 [MarginAlert] ${user.username}: loss at ${lossPercent.toFixed(1)}% — 90% CRITICAL notification sent`);
+          }
+        } catch (alertErr) {
+          console.error(`⚠️  [MarginAlert] Failed to send 90% alert for ${user.username}:`, alertErr.message);
+        }
+      }
+      // 80% alert
+      else if (lossPercent >= MARGIN_ALERT_THRESHOLD_80 && !_alertedUsers80.has(userId)) {
+        _alertedUsers80.add(userId);
         try {
           const firebaseService = require('./firebaseService');
           if (firebaseService.isAvailable()) {
@@ -97,18 +116,24 @@ const checkUser = async (userId, metrics) => {
               title: 'Margin Alert',
               body: `Warning: Your losses have reached ${Math.round(lossPercent)}% of your credit (₹${Math.abs(m2m).toFixed(0)} / ₹${credit.toFixed(0)}). Positions may be auto-closed soon.`,
             });
-            console.log(`⚠️  [MarginAlert] ${user.username}: loss at ${lossPercent.toFixed(1)}% — notification sent`);
+            console.log(`⚠️  [MarginAlert] ${user.username}: loss at ${lossPercent.toFixed(1)}% — 80% warning notification sent`);
           }
         } catch (alertErr) {
-          console.error(`⚠️  [MarginAlert] Failed to send alert for ${user.username}:`, alertErr.message);
+          console.error(`⚠️  [MarginAlert] Failed to send 80% alert for ${user.username}:`, alertErr.message);
         }
-      } else if (lossPercent < MARGIN_ALERT_THRESHOLD && _alertedUsers.has(userId)) {
-        // User recovered below threshold — clear alert flag so they get alerted again if it drops
-        _alertedUsers.delete(userId);
       }
-    } else if (_alertedUsers.has(userId)) {
-      // No loss or no credit — clear alert
-      _alertedUsers.delete(userId);
+
+      // Clear flags if user recovers below thresholds
+      if (lossPercent < MARGIN_ALERT_THRESHOLD_80) {
+        _alertedUsers80.delete(userId);
+        _alertedUsers90.delete(userId);
+      } else if (lossPercent < MARGIN_ALERT_THRESHOLD_90) {
+        _alertedUsers90.delete(userId);
+      }
+    } else {
+      // No loss — clear both alerts
+      _alertedUsers80.delete(userId);
+      _alertedUsers90.delete(userId);
     }
 
     if (!metrics?.positions?.length || !shouldSquareOff(user, metrics, true)) return;
@@ -116,8 +141,9 @@ const checkUser = async (userId, metrics) => {
     _squaringOff.add(userId);
     try {
       await _squareOffAllPositions(user);
-      // Clear alert flag after square-off completes
-      _alertedUsers.delete(userId);
+      // Clear alert flags after square-off completes
+      _alertedUsers80.delete(userId);
+      _alertedUsers90.delete(userId);
     } finally {
       _squaringOff.delete(userId);
     }
