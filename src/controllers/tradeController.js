@@ -749,52 +749,7 @@ const placeTrade = async (req, res) => {
             let tradeRealisedPnl = 0;
             let existingAgg = [];
             if (shouldExecuteNow) {
-                // Fetch all previous completed trades for this instrument in chronological order (FIFO)
-                const prevTrades = await Trade.find({
-                    user_id: user._id,
-                    instrument_token: instrument_token,
-                    status: 'completed',
-                    deleted_at: null
-                }).sort({ executed_at: 1 }).session(session);
-
-                // Build FIFO queue of open lots (supports both long and short positions)
-                // Each entry: { qty, price, side: 'BUY'|'SELL' }
-                const fifoQueue = [];
-                let netQtyFromPrev = 0; // positive = long, negative = short
-
-                for (const pt of prevTrades) {
-                    const isBuy = pt.transaction_type === 'BUY';
-                    const qty = pt.executed_quantity;
-                    const price = pt.executed_price;
-                    const prevNet = netQtyFromPrev;
-
-                    const isOpening = (isBuy && prevNet >= 0) || (!isBuy && prevNet <= 0);
-                    const isClosing = (isBuy && prevNet < 0) || (!isBuy && prevNet > 0);
-
-                    if (isOpening && !isClosing) {
-                        // Pure opening — add to queue
-                        fifoQueue.push({ qty, price, side: isBuy ? 'BUY' : 'SELL' });
-                    } else if (isClosing) {
-                        // Closing (may partially reverse into new position)
-                        let remaining = Math.min(qty, Math.abs(prevNet));
-                        while (remaining > 0 && fifoQueue.length > 0) {
-                            const front = fifoQueue[0];
-                            const matched = Math.min(remaining, front.qty);
-                            front.qty -= matched;
-                            remaining -= matched;
-                            if (front.qty <= 0) fifoQueue.shift();
-                        }
-                        // If qty exceeds |prevNet|, the excess opens a new position
-                        const excess = qty - Math.abs(prevNet);
-                        if (excess > 0) {
-                            fifoQueue.push({ qty: excess, price, side: isBuy ? 'BUY' : 'SELL' });
-                        }
-                    }
-
-                    netQtyFromPrev += isBuy ? qty : -qty;
-                }
-
-                // Also build aggregate for margin calculation (still needed)
+                // Aggregate all previous trades for average price and net position
                 existingAgg = await Trade.aggregate([
                     {
                         $match: {
@@ -835,32 +790,20 @@ const placeTrade = async (req, res) => {
                     }
                 ]).session(session);
 
-                // Calculate P&L using FIFO (First In, First Out)
-                // Matches the same logic used by /trade/report for PDF generation.
+                // Calculate P&L using Average Price method
+                const agg = existingAgg.length > 0 ? existingAgg[0] : { total_buy_qty: 0, total_sell_qty: 0, total_buy_value: 0, total_sell_value: 0 };
+                const netQtyFromPrev = agg.total_buy_qty - agg.total_sell_qty;
+                const avgBuyPrice = agg.total_buy_qty > 0 ? agg.total_buy_value / agg.total_buy_qty : 0;
+                const avgSellPrice = agg.total_sell_qty > 0 ? agg.total_sell_value / agg.total_sell_qty : 0;
+
                 if (transaction_type === 'SELL' && netQtyFromPrev > 0) {
-                    // Closing a long position: consume oldest BUY lots from fifoQueue
+                    // Closing a long: P&L = (sell price - avg buy price) × closing qty
                     const closingQty = Math.min(quantity, netQtyFromPrev);
-                    let remaining = closingQty;
-                    while (remaining > 0 && fifoQueue.length > 0) {
-                        const front = fifoQueue[0];
-                        const matched = Math.min(remaining, front.qty);
-                        tradeRealisedPnl += (executedPrice - front.price) * matched;
-                        front.qty -= matched;
-                        remaining -= matched;
-                        if (front.qty <= 0) fifoQueue.shift();
-                    }
+                    tradeRealisedPnl = (executedPrice - avgBuyPrice) * closingQty;
                 } else if (transaction_type === 'BUY' && netQtyFromPrev < 0) {
-                    // Closing a short position: consume oldest SELL lots from fifoQueue
+                    // Closing a short: P&L = (avg sell price - buy price) × closing qty
                     const closingQty = Math.min(quantity, Math.abs(netQtyFromPrev));
-                    let remaining = closingQty;
-                    while (remaining > 0 && fifoQueue.length > 0) {
-                        const front = fifoQueue[0];
-                        const matched = Math.min(remaining, front.qty);
-                        tradeRealisedPnl += (front.price - executedPrice) * matched;
-                        front.qty -= matched;
-                        remaining -= matched;
-                        if (front.qty <= 0) fifoQueue.shift();
-                    }
+                    tradeRealisedPnl = (avgSellPrice - executedPrice) * closingQty;
                 }
                 tradeRealisedPnl = Math.round(tradeRealisedPnl * 100) / 100;
             }

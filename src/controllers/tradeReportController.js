@@ -606,23 +606,20 @@ const getSettlementHistory = async (req, res) => {
  * Also updates the `pnl` field on each closing trade object for per-row PDF display.
  *
  * @param {Array} allTrades - chronological fills with {type, buy_qty, sell_qty, rate, ...}
- * @returns {number} total FIFO P&L for this instrument
+/**
+ * Compute P&L for an instrument using Average Price method.
+ * avgBuyPrice = totalBuyValue / totalBuyQty
+ * For each closing trade: pnl = (exitPrice - avgEntryPrice) × closingQty
+ *
+ * @param {Array} allTrades - trades sorted chronologically, each with buy_qty/sell_qty/rate
+ * @returns {number} total P&L for this instrument
  */
 function _computeFifoPnl(allTrades) {
-  // Sort chronologically
   const sorted = [...allTrades].sort((a, b) => new Date(a.date) - new Date(b.date));
 
-  // First pass: determine net direction to know which side is "opening" vs "closing"
-  let netQty = 0;
-  for (const t of sorted) {
-    netQty += (t.buy_qty || 0) - (t.sell_qty || 0);
-  }
-  // We don't use net direction to decide FIFO order — instead we use running position.
-  // A trade that ADDS to position is opening; one that REDUCES is closing.
-
-  // FIFO queue of opening lots: [{qty, price, side: 'BUY'|'SELL'}]
-  const openQueue = [];
-  let runningNet = 0; // positive = long, negative = short
+  let totalBuyQty = 0, totalBuyValue = 0;
+  let totalSellQty = 0, totalSellValue = 0;
+  let runningNet = 0;
   let totalPnl = 0;
 
   for (const trade of sorted) {
@@ -632,49 +629,35 @@ function _computeFifoPnl(allTrades) {
 
     const price = trade.rate || 0;
     const prevNet = runningNet;
-    const newNet = isBuy ? runningNet + qty : runningNet - qty;
-
-    // Determine if this trade opens, closes, or both (reversal)
-    const isOpening = (isBuy && prevNet >= 0) || (!isBuy && prevNet <= 0);
     const isClosing = (isBuy && prevNet < 0) || (!isBuy && prevNet > 0);
 
-    if (isOpening && !isClosing) {
-      // Pure opening trade — no P&L
-      openQueue.push({ qty, price, side: isBuy ? 'BUY' : 'SELL' });
+    if (!isClosing) {
+      if (isBuy) { totalBuyQty += qty; totalBuyValue += qty * price; }
+      else { totalSellQty += qty; totalSellValue += qty * price; }
       trade.pnl = 0;
-    } else if (isClosing) {
-      // Closing trade (may partially reverse into new position)
-      let remainingToClose = Math.min(qty, Math.abs(prevNet));
+    } else {
+      const closingQty = Math.min(qty, Math.abs(prevNet));
       let tradePnl = 0;
 
-      while (remainingToClose > 0 && openQueue.length > 0) {
-        const oldest = openQueue[0];
-        const matched = Math.min(remainingToClose, oldest.qty);
-
-        if (oldest.side === 'BUY') {
-          // Closing a long: profit = (sell_price - buy_cost) × qty
-          tradePnl += (price - oldest.price) * matched;
-        } else {
-          // Closing a short: profit = (sell_cost - buy_price) × qty
-          tradePnl += (oldest.price - price) * matched;
-        }
-
-        oldest.qty -= matched;
-        remainingToClose -= matched;
-        if (oldest.qty <= 0) openQueue.shift();
+      if (!isBuy && prevNet > 0) {
+        const avgBuy = totalBuyQty > 0 ? totalBuyValue / totalBuyQty : 0;
+        tradePnl = (price - avgBuy) * closingQty;
+      } else if (isBuy && prevNet < 0) {
+        const avgSell = totalSellQty > 0 ? totalSellValue / totalSellQty : 0;
+        tradePnl = (avgSell - price) * closingQty;
       }
 
       trade.pnl = Math.round(tradePnl * 100) / 100;
       totalPnl += tradePnl;
 
-      // If this trade reverses direction (qty > |prevNet|), the excess opens new position
       const excess = qty - Math.abs(prevNet);
       if (excess > 0) {
-        openQueue.push({ qty: excess, price, side: isBuy ? 'BUY' : 'SELL' });
+        if (isBuy) { totalBuyQty = excess; totalBuyValue = excess * price; totalSellQty = 0; totalSellValue = 0; }
+        else { totalSellQty = excess; totalSellValue = excess * price; totalBuyQty = 0; totalBuyValue = 0; }
       }
     }
 
-    runningNet = newNet;
+    runningNet = isBuy ? runningNet + qty : runningNet - qty;
   }
 
   return Math.round(totalPnl * 100) / 100;
