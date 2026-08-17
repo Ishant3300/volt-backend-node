@@ -21,13 +21,17 @@ exports.generateUsername = async (req, res) => {
       // Generate a random 6-digit number (100000 to 999999)
       const potentialUsername = Math.floor(100000 + Math.random() * 900000).toString();
 
-      // 1. Check Redis for existing reservation
-      if (redisService.isAvailable()) {
-        const client = redisService.getClient();
-        const existsInRedis = await client.exists(`${RESERVATION_PREFIX}${potentialUsername}`);
-        if (existsInRedis) {
-          continue; // Try again
+      // 1. Check Redis for existing reservation (non-critical — skip if Redis fails)
+      try {
+        if (redisService.isAvailable()) {
+          const client = redisService.getClient();
+          const existsInRedis = await client.exists(`${RESERVATION_PREFIX}${potentialUsername}`);
+          if (existsInRedis) {
+            continue; // Try again
+          }
         }
+      } catch (_) {
+        // Redis unavailable — skip reservation check, rely on DB uniqueness
       }
 
       // 2. Check MongoDB (Master and User collections)
@@ -42,9 +46,13 @@ exports.generateUsername = async (req, res) => {
       }
 
       // 3. We found a unique one! Reserve it in Redis if available
-      if (redisService.isAvailable()) {
-        const client = redisService.getClient();
-        await client.setex(`${RESERVATION_PREFIX}${potentialUsername}`, RESERVATION_TTL, 'reserved');
+      try {
+        if (redisService.isAvailable()) {
+          const client = redisService.getClient();
+          await client.setex(`${RESERVATION_PREFIX}${potentialUsername}`, RESERVATION_TTL, 'reserved');
+        }
+      } catch (_) {
+        // Redis reservation failed — proceed without it, DB check is the authority
       }
 
       generatedUsername = potentialUsername;
