@@ -1417,6 +1417,70 @@ const deleteTrade = async (req, res) => {
             return res.status(404).json({ success: false, message: 'Trade not found' });
         }
 
+        // ── Wallet reversal for completed trades ──
+        // Before soft-deleting, release/adjust the wallet to undo the margin impact
+        if (trade.status === 'completed' && trade.executed_quantity > 0) {
+            try {
+                const walletCategory = categoryForSegment(trade.exchange || '');
+                const userId = trade.user_id;
+
+                // Aggregate current position INCLUDING the trade being deleted
+                const currentAgg = await Trade.aggregate([
+                    { $match: { user_id: userId, instrument_token: trade.instrument_token, status: 'completed', deleted_at: null } },
+                    { $group: {
+                        _id: null,
+                        total_buy_qty: { $sum: { $cond: [{ $eq: ['$transaction_type', 'BUY'] }, '$executed_quantity', 0] } },
+                        total_sell_qty: { $sum: { $cond: [{ $eq: ['$transaction_type', 'SELL'] }, '$executed_quantity', 0] } },
+                        total_buy_value: { $sum: { $cond: [{ $eq: ['$transaction_type', 'BUY'] }, { $multiply: ['$executed_quantity', '$executed_price'] }, 0] } },
+                        total_sell_value: { $sum: { $cond: [{ $eq: ['$transaction_type', 'SELL'] }, { $multiply: ['$executed_quantity', '$executed_price'] }, 0] } },
+                    }}
+                ]);
+
+                // Aggregate AFTER deletion (exclude this trade)
+                const afterAgg = await Trade.aggregate([
+                    { $match: { user_id: userId, instrument_token: trade.instrument_token, status: 'completed', deleted_at: null, _id: { $ne: trade._id } } },
+                    { $group: {
+                        _id: null,
+                        total_buy_qty: { $sum: { $cond: [{ $eq: ['$transaction_type', 'BUY'] }, '$executed_quantity', 0] } },
+                        total_sell_qty: { $sum: { $cond: [{ $eq: ['$transaction_type', 'SELL'] }, '$executed_quantity', 0] } },
+                        total_buy_value: { $sum: { $cond: [{ $eq: ['$transaction_type', 'BUY'] }, { $multiply: ['$executed_quantity', '$executed_price'] }, 0] } },
+                        total_sell_value: { $sum: { $cond: [{ $eq: ['$transaction_type', 'SELL'] }, { $multiply: ['$executed_quantity', '$executed_price'] }, 0] } },
+                    }}
+                ]);
+
+                const cur = currentAgg.length > 0 ? currentAgg[0] : { total_buy_qty: 0, total_sell_qty: 0, total_buy_value: 0, total_sell_value: 0 };
+                const aft = afterAgg.length > 0 ? afterAgg[0] : { total_buy_qty: 0, total_sell_qty: 0, total_buy_value: 0, total_sell_value: 0 };
+
+                // Current blocked = |currentNetQty| × avgEntryPrice
+                const curNetQty = cur.total_buy_qty - cur.total_sell_qty;
+                const curAvgEntry = curNetQty > 0
+                    ? (cur.total_buy_qty > 0 ? cur.total_buy_value / cur.total_buy_qty : 0)
+                    : (cur.total_sell_qty > 0 ? cur.total_sell_value / cur.total_sell_qty : 0);
+                const currentBlocked = Math.abs(curNetQty) * curAvgEntry;
+
+                // After blocked = |afterNetQty| × avgEntryPrice (after removing this trade)
+                const aftNetQty = aft.total_buy_qty - aft.total_sell_qty;
+                const aftAvgEntry = aftNetQty > 0
+                    ? (aft.total_buy_qty > 0 ? aft.total_buy_value / aft.total_buy_qty : 0)
+                    : (aft.total_sell_qty > 0 ? aft.total_sell_value / aft.total_sell_qty : 0);
+                const afterBlocked = Math.abs(aftNetQty) * aftAvgEntry;
+
+                // Release the difference (if current > after, funds should be freed)
+                const walletDelta = currentBlocked - afterBlocked;
+                if (walletDelta > 0) {
+                    await walletService.release('User', userId, walletCategory, walletDelta);
+                    console.log(`🗑️  [DeleteTrade] Released ₹${walletDelta.toFixed(2)} from ${walletCategory} wallet for user ${userId}`);
+                } else if (walletDelta < 0) {
+                    // Position increased on delete (rare — e.g., deleting a closing trade re-opens position)
+                    // Don't block — let metricsEngine handle it; blocking could fail if insufficient funds
+                    console.log(`⚠️  [DeleteTrade] Position increased by ₹${Math.abs(walletDelta).toFixed(2)} after delete — wallet not re-blocked`);
+                }
+            } catch (walletErr) {
+                console.error(`⚠️  [DeleteTrade] Wallet reversal failed (non-fatal):`, walletErr.message);
+                // Continue with delete even if wallet reversal fails
+            }
+        }
+
         trade.deleted_at = new Date();
         await withTradeWriteLease('delete_trade', () => trade.save());
 
