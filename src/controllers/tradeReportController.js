@@ -123,6 +123,8 @@ const getTradeReport = async (req, res) => {
           executed_at: at,
           pnl: f.pnl || 0,
           trade_type: f.trade_type || 'regular',
+          order_type: f.order_type || 'MARKET',
+          placed_by: f.placed_by || 'USER',
           _stored_brokerage: f.brokerage || 0,  // brokerage calculated at settlement time
           _is_ledger: true,
         });
@@ -146,6 +148,8 @@ const getTradeReport = async (req, res) => {
             executed_at: settleDate,
             pnl: s.settlement_pnl || 0,
             trade_type: 'settlement_close',
+            order_type: 'MARKET',
+            placed_by: 'SYSTEM',
             _stored_brokerage: 0,
             _is_ledger: true,
           });
@@ -191,11 +195,16 @@ const getTradeReport = async (req, res) => {
         date: t.executed_at,
         type: t.transaction_type,
         trade_type: t.trade_type || 'regular',
+        order_type: t.order_type || 'MARKET',
+        placed_by: t.placed_by || 'USER',
         buy_qty: t.transaction_type === 'BUY' ? (t.executed_quantity || 0) : 0,
         sell_qty: t.transaction_type === 'SELL' ? (t.executed_quantity || 0) : 0,
         rate: t.executed_price || 0,
-        brokerage: 0, // Will be recalculated below
+        brokerage: t.brokerage || 0,
         pnl: t.pnl || 0,
+        order_type_label: _getOrderTypeLabel(t),
+        _is_ledger: t._is_ledger || false,
+        _stored_brokerage: t._stored_brokerage || t.brokerage || 0,
       });
     }
 
@@ -307,7 +316,10 @@ const getTradeReport = async (req, res) => {
           continue;
         }
 
-        // Live fill: find effective rule at the trade date to avoid retroactive changes.
+        // Live fill: use the brokerage already stored on the trade (calculated at execution time).
+        // Only recalculate if the stored value is 0 and we can find an effective rule.
+        if (at.brokerage > 0) continue;
+
         if (at.rate && (at.buy_qty || at.sell_qty)) {
           const tradeDate = new Date(at.date);
           const effectiveRules = brkRules.filter(r =>
@@ -606,6 +618,30 @@ const getSettlementHistory = async (req, res) => {
  * Also updates the `pnl` field on each closing trade object for per-row PDF display.
  *
  * @param {Array} allTrades - chronological fills with {type, buy_qty, sell_qty, rate, ...}
+/**
+ * Determine the display label for the "Type" column in the M2M report.
+ */
+function _getOrderTypeLabel(trade) {
+  const tradeType = trade.trade_type || 'regular';
+  const orderType = (trade.order_type || 'MARKET').toUpperCase();
+  const placedBy = (trade.placed_by || 'USER').toUpperCase();
+
+  // Carry-forward from settlement
+  if (tradeType === 'carry_forward') return 'CF';
+  // Settlement closing trade
+  if (tradeType === 'settlement_close') return 'SETTLEMENT';
+  // Placed by admin
+  if (placedBy === 'ADMIN') return 'ADMIN';
+  // Placed by master
+  if (placedBy === 'MASTER') return 'MASTER';
+  // Placed by system (margin square-off, intraday square-off)
+  if (placedBy === 'SYSTEM') return 'SYSTEM';
+  // Limit or Stop-Loss order
+  if (orderType === 'LIMIT' || orderType === 'SL' || orderType === 'SL-M') return 'LIMIT';
+  // Market order by user
+  return 'NORMAL';
+}
+
 /**
  * Compute P&L for an instrument using Average Price method.
  * avgBuyPrice = totalBuyValue / totalBuyQty
