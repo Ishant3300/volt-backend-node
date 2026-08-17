@@ -105,6 +105,26 @@ router.put('/brokerage-settings/bulk-update', authenticateAdminOrMaster, async (
       const ownerType = ownerUser ? 'User' : 'Master';
       const effectiveType = type || sampleRecord.type;
 
+      // Also check against the CALLER's own rate (the logged-in master)
+      // The child's rate must be >= the caller master's rate
+      const callerId = req.master.id;
+      const callerRule = await BrokerageSettings.findOne({
+        user_id: callerId,
+        exchange_name: sampleRecord.exchange_name,
+        script_name: sampleRecord.script_name,
+        type: effectiveType,
+        deleted_at: null,
+      }).lean();
+
+      if (callerRule && brk_value < callerRule.brk_value) {
+        return res.status(422).json({
+          success: false,
+          message: `Brokerage cannot be less than the parent limit (${callerRule.brk_value})`,
+          data: null
+        });
+      }
+
+      // Fallback: also run the hierarchy-based validation
       const floorError = await validateBrokerageFloor(
         sampleRecord.user_id.toString(), ownerType,
         sampleRecord.exchange_name, sampleRecord.script_name, effectiveType, brk_value

@@ -1048,6 +1048,25 @@ const updateBrokerageSettings = async (req, res) => {
       const effectiveScript = script_name || brokerageSettings.script_name;
       const effectiveType = type || brokerageSettings.type;
 
+      // Direct check: new rate must be >= caller's own rate
+      const callerId = req.master.id;
+      const callerRule = await BrokerageSettings.findOne({
+        user_id: callerId,
+        exchange_name: effectiveExchange.toUpperCase(),
+        script_name: effectiveScript,
+        type: effectiveType,
+        deleted_at: null,
+      }).lean();
+
+      if (callerRule && brk_value < callerRule.brk_value) {
+        return res.status(422).json({
+          success: false,
+          message: `Brokerage cannot be less than the parent limit (${callerRule.brk_value})`,
+          data: null
+        });
+      }
+
+      // Also run hierarchy-based validation as fallback
       const floorError = await validateBrokerageFloor(
         brokerageSettings.user_id.toString(), ownerType,
         effectiveExchange, effectiveScript, effectiveType, brk_value
