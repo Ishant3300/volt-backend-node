@@ -2,6 +2,7 @@ const User = require('../models/User');
 const Master = require('../models/Master');
 const GroupedQuantity = require('../models/GroupedQuantity');
 const ScriptQuantity = require('../models/ScriptQuantity');
+const redisService = require('../services/redisService');
 
 /**
  * GET /api/trade/script-qty-details
@@ -245,6 +246,17 @@ const getAllLots = async (req, res) => {
       return res.status(403).json({ success: false, message: 'Not authorized', data: null });
     }
 
+    // Check Redis cache first
+    const CACHE_KEY = 'cache:script-qty-all-lots';
+    const CACHE_TTL = 60; // 60 seconds
+
+    if (redisService.isAvailable()) {
+      const cached = await redisService.getClient().get(CACHE_KEY);
+      if (cached) {
+        return res.status(200).json(JSON.parse(cached));
+      }
+    }
+
     // Get all active grouped quantities
     const allGrouped = await GroupedQuantity.find({ deleted_at: null }).lean();
 
@@ -293,10 +305,17 @@ const getAllLots = async (req, res) => {
       }))
     }));
 
-    res.status(200).json({
+    const response = {
       success: true,
       data: { exchanges }
-    });
+    };
+
+    // Cache result in Redis
+    if (redisService.isAvailable()) {
+      await redisService.getClient().setex(CACHE_KEY, CACHE_TTL, JSON.stringify(response));
+    }
+
+    res.status(200).json(response);
   } catch (error) {
     res.status(500).json({ success: false, message: error.message, data: null });
   }
