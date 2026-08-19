@@ -116,24 +116,52 @@ const getWeeklyAdminReport = async (req, res) => {
       usersByMaster[mid].push(u);
     }
 
-    // 5. Load trades for all users in scope, scoped to the report window —
+    // 5. Load trades for all users in scope.
+    //
+    // Default (no date_from/date_to override) means "current week" — the
+    // exact window weeklyReportCache.js keeps precomputed per user, updated
+    // the instant each trade completes (see metricsEngine.onTradeExecuted).
+    // Only that default case can use the cache; an explicit historical
+    // range always needs a live query, since the cache only ever tracks
+    // the current week.
+    const allUserIds = allUsers.map(u => u._id);
+    const tradesByUser = {};
+    const usersNeedingLiveQuery = [];
+
+    if (!date_from && !date_to) {
+      const weeklyReportCache = require('../services/weeklyReportCache');
+      await Promise.all(allUserIds.map(async (uid) => {
+        const cached = await weeklyReportCache.getUserWeeklyTrades(uid.toString());
+        if (cached) {
+          tradesByUser[uid.toString()] = cached;
+        } else {
+          usersNeedingLiveQuery.push(uid);
+        }
+      }));
+    } else {
+      usersNeedingLiveQuery.push(...allUserIds);
+    }
+
+    // Cache misses (cold start, Redis unavailable, or an explicit date
+    // range) fall back to the same bounded, indexed live query as before —
     // uses the existing { user_id, status, deleted_at, executed_at } index
     // (Trade.js line 161), which an unbounded query never hit.
-    const allUserIds = allUsers.map(u => u._id);
-    const allTrades = await Trade.find({
-      user_id: { $in: allUserIds },
-      status: 'completed',
-      deleted_at: null,
-      executed_at: executedAtFilter
-    }).select('user_id instrument_token executed_price executed_quantity pnl').lean();
+    if (usersNeedingLiveQuery.length > 0) {
+      const liveTrades = await Trade.find({
+        user_id: { $in: usersNeedingLiveQuery },
+        status: 'completed',
+        deleted_at: null,
+        executed_at: executedAtFilter
+      }).select('user_id instrument_token executed_price executed_quantity pnl').lean();
 
-    // Group trades by user
-    const tradesByUser = {};
-    for (const t of allTrades) {
-      const uid = t.user_id.toString();
-      if (!tradesByUser[uid]) tradesByUser[uid] = [];
-      tradesByUser[uid].push(t);
+      for (const t of liveTrades) {
+        const uid = t.user_id.toString();
+        if (!tradesByUser[uid]) tradesByUser[uid] = [];
+        tradesByUser[uid].push(t);
+      }
     }
+
+    const allTrades = Object.values(tradesByUser).flat();
 
     // 6. Load ALL KiteInstruments for tokens in trades
     const allTokens = [...new Set(allTrades.map(t => t.instrument_token))];

@@ -788,6 +788,12 @@ class MetricsEngine {
         this._metricsCache.set(userId, metrics);
         this._broadcastUserMetrics(userId, metrics);
       }
+
+      // Keep the weekly-admin-report cache in sync with this trade — every
+      // call site that reaches onTradeExecuted() is a real trade-completion
+      // event, so this is the one place that needs to know about it.
+      // Fire-and-forget: never block trade execution on this.
+      require('./weeklyReportCache').refreshUserWeeklyAggregate(userId).catch(() => {});
     } catch (err) {
       console.error(`📊 [MetricsEngine] Error refreshing user ${userId}:`, err.message);
     }
