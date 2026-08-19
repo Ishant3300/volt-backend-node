@@ -333,14 +333,30 @@ function _getAggregatedEntryBatched(masterId, masterDoc, metricsEngine, callerId
     users.push(...usersForMaster);
   }
 
+  // P&L sharing must be computed PER USER and summed, same as caller_brk
+  // below — not as one flat multiplier applied to the combined total. The
+  // previous implementation (_getPnlUnpassedMultiplierBatched, removed)
+  // only walked masterId's direct children, ignoring anything deeper, and
+  // even fully recursive, a single blended rate is wrong the moment two
+  // branches of the subtree have different pnl_sharing rates — which real
+  // accounts do (confirmed: 100%, 90%, 98%, 50%, 20%, 0% all seen on
+  // different masters). _getPnlUnpassedMultiplierForUserBatched already
+  // walks each user's own path correctly and already stops at the right
+  // boundary relative to callerId (it's what _getUserEntryBatched uses for
+  // individual client rows) — reusing it here per user, exactly like
+  // caller_brk already does, fixes both problems at once.
   let totalGrossPnl = 0;
   let totalFloatingPnl = 0;
+  let callerProfit = 0;
   for (const u of users) {
     const uid = u._id.toString();
     const metrics = metricsEngine.getCachedMetrics(uid);
     totalFloatingPnl += metrics?.position_pnl || 0;
-    totalGrossPnl += _getGrossPnlBatched(uid, tradesByUser);
+    const userGrossPnl = _getGrossPnlBatched(uid, tradesByUser);
+    totalGrossPnl += userGrossPnl;
+    callerProfit += (-userGrossPnl) * _getPnlUnpassedMultiplierForUserBatched(uid, callerId, u, masterMap);
   }
+  callerProfit = _r2(callerProfit);
 
   let totalBrokerage = 0, totalTurnover = 0;
   for (const u of users) {
@@ -360,10 +376,6 @@ function _getAggregatedEntryBatched(masterId, masterDoc, metricsEngine, callerId
       masterMap, brkRulesByUser, globalBrkRules, u
     );
   }
-
-  // P&L sharing
-  const callerPnlKeep = _getPnlUnpassedMultiplierBatched(masterId, callerId, masterMap, masterChildrenMap);
-  const callerProfit = _r2((-totalGrossPnl) * callerPnlKeep);
 
   return {
     id: masterId,
@@ -452,29 +464,6 @@ function _computeCallerBrkForUserBatched(userId, callerId, callerRole, tradesByU
   const unpassedAmount = spreadAboveCaller * unpassedPct;
 
   return callerBaseClearance + unpassedAmount;
-}
-
-/**
- * Walk from a master down through its sub-tree to compute the P&L unpassed multiplier. (No DB queries)
- *
- * Same logic as original _getPnlUnpassedMultiplier.
- */
-function _getPnlUnpassedMultiplierBatched(masterId, callerId, masterMap, masterChildrenMap) {
-  let multiplier = 1;
-
-  // First: mainmaster's own unpassed fraction (what flows past mainmaster to admin)
-  const targetMaster = masterMap[masterId];
-  if (targetMaster) {
-    multiplier *= (100 - (targetMaster.pnl_sharing || 0)) / 100;
-  }
-
-  // Then: any sub-masters below also retain their share before passing up
-  const subMasters = masterChildrenMap[masterId] || [];
-  for (const sub of subMasters) {
-    multiplier *= (100 - (sub.pnl_sharing || 0)) / 100;
-  }
-
-  return multiplier;
 }
 
 /**
