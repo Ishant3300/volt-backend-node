@@ -491,13 +491,16 @@ function _computeCallerBrkForUserBatched(userId, callerId, callerRole, tradesByU
  *
  * Same logic as original _getPnlUnpassedMultiplierForUser.
  *
- * maxDepth is a corrupted-data safety net (guards against a circular
- * master_id reference looping forever), not a real ceiling on hierarchy
- * depth — it was previously 10, which silently truncated the cascade for
- * any real hierarchy deeper than that, attributing the wrong share to
- * every tier above the 10th instead of continuing to the real caller.
- * Real hierarchies here run 50-60+ tiers deep, so this must be well above
- * any plausible real depth.
+ * No depth limit — real hierarchies here run 50-60+ tiers deep, and a
+ * fixed cap (previously 10, then 500) silently truncates the cascade for
+ * anything deeper, attributing the wrong share to every tier above the
+ * cap instead of continuing to the real caller. The only guard is cycle
+ * detection: a `visited` set stops the walk if the SAME master is reached
+ * twice, which can only happen from a corrupted circular master_id
+ * reference (impossible in a valid tree) — without it, that one bad row
+ * would spin this synchronous loop forever and freeze the whole Node
+ * process (this runs on the single-threaded event loop), not just fail
+ * one request.
  */
 function _getPnlUnpassedMultiplierForUserBatched(userId, callerId, userDoc, masterMap) {
   const userMasterId = userDoc?.master_id?.toString();
@@ -505,10 +508,10 @@ function _getPnlUnpassedMultiplierForUserBatched(userId, callerId, userDoc, mast
 
   let multiplier = 1;
   let currentMasterId = userMasterId;
+  const visited = new Set();
 
-  const maxDepth = 500;
-  let depth = 0;
-  while (currentMasterId && depth < maxDepth) {
+  while (currentMasterId && !visited.has(currentMasterId)) {
+    visited.add(currentMasterId);
     const master = masterMap[currentMasterId];
     if (!master) break;
 
@@ -517,7 +520,6 @@ function _getPnlUnpassedMultiplierForUserBatched(userId, callerId, userDoc, mast
     // If this master's parent is the caller (or null for admin), stop
     if (!master.master_id || master.master_id.toString() === callerId) break;
     currentMasterId = master.master_id.toString();
-    depth++;
   }
 
   return multiplier;
@@ -532,8 +534,8 @@ function _getPnlUnpassedMultiplierForUserBatched(userId, callerId, userDoc, mast
  * in each one's own brokerage_sharing%, instead of only looking at a
  * single master along the path.
  *
- * maxDepth is a corrupted-data safety net, not a real ceiling — see
- * _getPnlUnpassedMultiplierForUserBatched's comment on the same constant.
+ * No depth limit, same cycle-detection safety net — see
+ * _getPnlUnpassedMultiplierForUserBatched's comment on the same pattern.
  */
 function _getBrkUnpassedMultiplierForUserBatched(userId, callerId, userDoc, masterMap) {
   const userMasterId = userDoc?.master_id?.toString();
@@ -541,10 +543,10 @@ function _getBrkUnpassedMultiplierForUserBatched(userId, callerId, userDoc, mast
 
   let multiplier = 1;
   let currentMasterId = userMasterId;
+  const visited = new Set();
 
-  const maxDepth = 500;
-  let depth = 0;
-  while (currentMasterId && depth < maxDepth) {
+  while (currentMasterId && !visited.has(currentMasterId)) {
+    visited.add(currentMasterId);
     const master = masterMap[currentMasterId];
     if (!master) break;
 
@@ -553,7 +555,6 @@ function _getBrkUnpassedMultiplierForUserBatched(userId, callerId, userDoc, mast
     // If this master's parent is the caller (or null for admin), stop
     if (!master.master_id || master.master_id.toString() === callerId) break;
     currentMasterId = master.master_id.toString();
-    depth++;
   }
 
   return multiplier;

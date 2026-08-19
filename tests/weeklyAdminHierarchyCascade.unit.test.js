@@ -58,7 +58,7 @@ describe('_getBrkUnpassedMultiplierForUserBatched — per-tier brokerage_sharing
   });
 });
 
-describe('deep hierarchy (real deployments run 50-60+ tiers) — maxDepth must not truncate the cascade', () => {
+describe('deep hierarchy (real deployments run 50-60+ tiers) — no depth limit, only cycle detection', () => {
   function buildChain(n, sharingPct) {
     const masterMap = {};
     for (let i = 0; i < n; i++) {
@@ -88,6 +88,30 @@ describe('deep hierarchy (real deployments run 50-60+ tiers) — maxDepth must n
     const fullCascade = Math.pow(0.5, N);
     expect(mult).toBeCloseTo(fullCascade, 10);
     expect(mult).not.toBeCloseTo(truncatedAt10, 6);
+  });
+
+  test('a 1000-tier chain still resolves correctly with no fixed ceiling', () => {
+    const N = 1000;
+    const masterMap = buildChain(N, 10);
+    const userDoc = { master_id: 'm' + (N - 1) };
+    const mult = _getBrkUnpassedMultiplierForUserBatched('user', 'ADMIN', userDoc, masterMap);
+    expect(mult).toBeGreaterThan(0);
+    expect(Number.isFinite(mult)).toBe(true);
+  });
+
+  test('a corrupted circular master_id reference terminates instead of hanging forever', () => {
+    // In valid data this can never happen (master_id always points strictly
+    // upward), but a bad row must not freeze the whole Node process — this
+    // loop is synchronous, so an actual infinite loop here blocks every
+    // other request on the server, not just this one.
+    const cyclicMap = {
+      a: { master_id: 'b', brokerage_sharing: 10 },
+      b: { master_id: 'a', brokerage_sharing: 10 },
+    };
+    const start = Date.now();
+    const mult = _getBrkUnpassedMultiplierForUserBatched('user', 'ADMIN', { master_id: 'a' }, cyclicMap);
+    expect(Date.now() - start).toBeLessThan(1000);
+    expect(Number.isFinite(mult)).toBe(true);
   });
 
   test('P&L cascade is equally unaffected by depth', () => {
