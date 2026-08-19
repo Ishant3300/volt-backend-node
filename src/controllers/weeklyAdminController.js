@@ -468,32 +468,20 @@ function _computeCallerBrkForUserBatched(userId, callerId, callerRole, tradesByU
     }
   }
 
-  // Find the immediate child master of the caller (walk up from user's master)
-  let immediateChildSharing = 0;
-  const userMasterId = userDoc?.master_id?.toString();
-  if (userMasterId) {
-    let masterId = userMasterId;
-    const maxWalk = 10;
-    let walk = 0;
-    while (masterId && walk < maxWalk) {
-      const m = masterMap[masterId];
-      if (!m) break;
-      // If this master's parent is null (admin is caller) or equals callerId, this is the immediate child
-      if (!m.master_id || m.master_id.toString() === callerId) {
-        immediateChildSharing = m.brokerage_sharing || 0;
-        break;
-      }
-      masterId = m.master_id.toString();
-      walk++;
-    }
-  }
+  // Cascade through EVERY intermediate master's own brokerage_sharing%
+  // between the user and the caller — mirrors
+  // _getPnlUnpassedMultiplierForUserBatched exactly. Previously this only
+  // looked at the SINGLE topmost master below the caller (the first whose
+  // own parent was the caller) and applied just that one master's
+  // brokerage_sharing% to the entire spread, silently ignoring any
+  // different brokerage_sharing% configured on deeper intermediate masters
+  // — correct by coincidence for 1- and 2-tier hierarchies (nothing to
+  // ignore), wrong for 3+ tiers.
+  const unpassedFraction = _getBrkUnpassedMultiplierForUserBatched(userId, callerId, userDoc, masterMap);
 
   // Spread above caller's base = what's left after caller takes their base
   const spreadAboveCaller = Math.max(0, userTotalBrk - callerBaseClearance);
-
-  // Admin gets (100 - immediateChildSharing)% of the spread
-  const unpassedPct = (100 - immediateChildSharing) / 100;
-  const unpassedAmount = spreadAboveCaller * unpassedPct;
+  const unpassedAmount = spreadAboveCaller * unpassedFraction;
 
   return callerBaseClearance + unpassedAmount;
 }
@@ -517,6 +505,39 @@ function _getPnlUnpassedMultiplierForUserBatched(userId, callerId, userDoc, mast
     if (!master) break;
 
     multiplier *= (100 - (master.pnl_sharing || 0)) / 100;
+
+    // If this master's parent is the caller (or null for admin), stop
+    if (!master.master_id || master.master_id.toString() === callerId) break;
+    currentMasterId = master.master_id.toString();
+    depth++;
+  }
+
+  return multiplier;
+}
+
+/**
+ * For a direct user: compute what fraction of their brokerage spread flows
+ * up to the caller. (No DB queries)
+ *
+ * Structural mirror of _getPnlUnpassedMultiplierForUserBatched — walks
+ * every intermediate master between the user and the caller, multiplying
+ * in each one's own brokerage_sharing%, instead of only looking at a
+ * single master along the path.
+ */
+function _getBrkUnpassedMultiplierForUserBatched(userId, callerId, userDoc, masterMap) {
+  const userMasterId = userDoc?.master_id?.toString();
+  if (!userMasterId) return 0;
+
+  let multiplier = 1;
+  let currentMasterId = userMasterId;
+
+  const maxDepth = 10;
+  let depth = 0;
+  while (currentMasterId && depth < maxDepth) {
+    const master = masterMap[currentMasterId];
+    if (!master) break;
+
+    multiplier *= (100 - (master.brokerage_sharing || 0)) / 100;
 
     // If this master's parent is the caller (or null for admin), stop
     if (!master.master_id || master.master_id.toString() === callerId) break;
@@ -603,4 +624,11 @@ function _sumTotals(data) {
 
 const _r2 = (n) => Math.round(n * 100) / 100;
 
-module.exports = { getWeeklyAdminReport };
+module.exports = {
+  getWeeklyAdminReport,
+  _private: {
+    _computeCallerBrkForUserBatched,
+    _getPnlUnpassedMultiplierForUserBatched,
+    _getBrkUnpassedMultiplierForUserBatched,
+  },
+};

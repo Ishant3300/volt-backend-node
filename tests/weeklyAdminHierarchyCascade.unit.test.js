@@ -1,0 +1,97 @@
+'use strict';
+
+// Regression coverage for the multi-tier brokerage-sharing cascade bug: the caller's
+// brokerage share only ever looked at the SINGLE topmost master below the caller,
+// applying just that one master's own brokerage_sharing% to the entire spread and
+// silently ignoring any different brokerage_sharing% configured on deeper
+// intermediate masters. Correct by coincidence for 1- and 2-tier paths (nothing to
+// ignore, or the ignored tier's own spread happened to be zero), wrong for 3+ tiers.
+//
+// Uses the same 3-user, 4-tier hierarchy (ADMIN -> newfix(90%) -> newfixsub(80%) ->
+// newfix_subsubs(70%), with user1/user2/user3 at different depths) that surfaced the
+// bug via an external reference script. No test previously existed for this file at
+// all — that's how the bug shipped unnoticed.
+
+const {
+  _computeCallerBrkForUserBatched,
+  _getPnlUnpassedMultiplierForUserBatched,
+  _getBrkUnpassedMultiplierForUserBatched,
+} = require('../src/controllers/weeklyAdminController')._private;
+
+const masterMap = {
+  '157459': { master_id: null, brokerage_sharing: 90, pnl_sharing: 90 },
+  newfixsub: { master_id: '157459', brokerage_sharing: 80, pnl_sharing: 80 },
+  newfix_subsubs: { master_id: 'newfixsub', brokerage_sharing: 70, pnl_sharing: 70 },
+};
+
+const kiteMap = { TOK: { lot_size: 1, segment: 'MCX-FUT', raw_name: 'TESTSCRIPT' } };
+const callerRules = [{ script_name: 'TESTSCRIPT', exchange_name: 'MCX-FUT', type: 'LOT WISE', brk_value: 200 }];
+
+const tradesFor = (lots, rate) => [{ instrument_token: 'TOK', executed_price: rate, executed_quantity: lots }];
+
+const user1 = { doc: { master_id: 'newfix_subsubs' }, lots: 12, rate: 800, totalBrk: 12 * 800 };
+const user2 = { doc: { master_id: 'newfixsub' }, lots: 16, rate: 400, totalBrk: 16 * 400 };
+const user3 = { doc: { master_id: '157459' }, lots: 18, rate: 800, totalBrk: 18 * 800 };
+
+describe('_getBrkUnpassedMultiplierForUserBatched — per-tier brokerage_sharing cascade', () => {
+  test('3 tiers deep (newfix_subsubs -> newfixsub -> newfix): multiplies ALL three, not just one', () => {
+    const mult = _getBrkUnpassedMultiplierForUserBatched('u1', 'ADMIN', user1.doc, masterMap);
+    expect(mult).toBeCloseTo(0.30 * 0.20 * 0.10, 10); // (1-.70)*(1-.80)*(1-.90) = 0.006
+  });
+
+  test('2 tiers deep (newfixsub -> newfix): multiplies both', () => {
+    const mult = _getBrkUnpassedMultiplierForUserBatched('u2', 'ADMIN', user2.doc, masterMap);
+    expect(mult).toBeCloseTo(0.20 * 0.10, 10); // (1-.80)*(1-.90) = 0.02
+  });
+
+  test('1 tier deep (direct child of newfix): just that tier', () => {
+    const mult = _getBrkUnpassedMultiplierForUserBatched('u3', 'ADMIN', user3.doc, masterMap);
+    expect(mult).toBeCloseTo(0.10, 10); // (1-.90) = 0.10
+  });
+
+  test('mirrors _getPnlUnpassedMultiplierForUserBatched\'s structure exactly (same shape, different field)', () => {
+    const brkMult = _getBrkUnpassedMultiplierForUserBatched('u1', 'ADMIN', user1.doc, masterMap);
+    const pnlMult = _getPnlUnpassedMultiplierForUserBatched('u1', 'ADMIN', user1.doc, masterMap);
+    // Same masterMap has brokerage_sharing === pnl_sharing at every tier in this
+    // fixture, so both cascades must produce an identical multiplier.
+    expect(brkMult).toBeCloseTo(pnlMult, 10);
+  });
+});
+
+describe('_computeCallerBrkForUserBatched — admin\'s brokerage share for each user', () => {
+  test('user1 (3 tiers): cascades through all three intermediate shares', () => {
+    const trades = tradesFor(user1.lots, user1.rate);
+    const callerBrk = _computeCallerBrkForUserBatched(
+      'u1', 'ADMIN', 'admin', { u1: trades }, callerRules, kiteMap,
+      masterMap, {}, [], user1.doc, user1.totalBrk,
+    );
+    // callerBaseClearance = 12*200 = 2400; spread = 9600-2400 = 7200;
+    // unpassed = 7200 * 0.006 = 43.20; total = 2443.20
+    expect(callerBrk).toBeCloseTo(2443.20, 2);
+    // Must NOT equal the old buggy result, which only applied newfix's own 90%
+    // (ignoring newfixsub's 80% and newfix_subsubs's own 70%): 2400 + 7200*0.10 = 3120.
+    expect(callerBrk).not.toBeCloseTo(3120, 2);
+  });
+
+  test('user2 (2 tiers): cascades through both intermediate shares', () => {
+    const trades = tradesFor(user2.lots, user2.rate);
+    const callerBrk = _computeCallerBrkForUserBatched(
+      'u2', 'ADMIN', 'admin', { u2: trades }, callerRules, kiteMap,
+      masterMap, {}, [], user2.doc, user2.totalBrk,
+    );
+    // callerBaseClearance = 16*200 = 3200; spread = 6400-3200 = 3200;
+    // unpassed = 3200 * 0.02 = 64; total = 3264.00
+    expect(callerBrk).toBeCloseTo(3264.00, 2);
+  });
+
+  test('user3 (1 tier): single-tier case is unaffected by the fix', () => {
+    const trades = tradesFor(user3.lots, user3.rate);
+    const callerBrk = _computeCallerBrkForUserBatched(
+      'u3', 'ADMIN', 'admin', { u3: trades }, callerRules, kiteMap,
+      masterMap, {}, [], user3.doc, user3.totalBrk,
+    );
+    // callerBaseClearance = 18*200 = 3600; spread = 14400-3600 = 10800;
+    // unpassed = 10800 * 0.10 = 1080; total = 4680.00
+    expect(callerBrk).toBeCloseTo(4680.00, 2);
+  });
+});
