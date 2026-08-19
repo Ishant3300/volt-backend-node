@@ -29,6 +29,12 @@ function currentWeekStart() {
 }
 
 const getWeeklyAdminReport = async (req, res) => {
+  // Timing breakdown — logged, not returned, so we can see exactly which
+  // phase is slow instead of guessing from a single end-to-end number.
+  const _t0 = Date.now();
+  const _timings = {};
+  const _mark = (label) => { _timings[label] = Date.now() - _t0; };
+
   try {
     const role = req.admin ? 'admin' : 'master';
     const callerId = req.admin?.id || req.master?.id;
@@ -70,6 +76,7 @@ const getWeeklyAdminReport = async (req, res) => {
         }
       }
     }
+    _mark('1_masters');
 
     // 2. Determine scope based on role
     let topEntities; // masters to report on (top-level for admin, children for master)
@@ -115,6 +122,7 @@ const getWeeklyAdminReport = async (req, res) => {
       if (!usersByMaster[mid]) usersByMaster[mid] = [];
       usersByMaster[mid].push(u);
     }
+    _mark('2_users');
 
     // 5. Load trades for all users in scope.
     //
@@ -141,6 +149,9 @@ const getWeeklyAdminReport = async (req, res) => {
     } else {
       usersNeedingLiveQuery.push(...allUserIds);
     }
+    _mark('3_cacheLookup');
+    _timings.cacheHits = allUserIds.length - usersNeedingLiveQuery.length;
+    _timings.cacheMisses = usersNeedingLiveQuery.length;
 
     // Cache misses (cold start, Redis unavailable, or an explicit date
     // range) fall back to the same bounded, indexed live query as before —
@@ -160,6 +171,10 @@ const getWeeklyAdminReport = async (req, res) => {
         tradesByUser[uid].push(t);
       }
     }
+    _mark('4_trades');
+    _timings.tradeCount = usersNeedingLiveQuery.length > 0
+      ? Object.values(tradesByUser).reduce((n, arr) => n + arr.length, 0)
+      : 0;
 
     const allTrades = Object.values(tradesByUser).flat();
 
@@ -173,6 +188,7 @@ const getWeeklyAdminReport = async (req, res) => {
     for (const ki of kiteInstruments) {
       kiteMap[ki.instrument_token] = ki;
     }
+    _mark('5_instruments');
 
     // 7. Load ALL BrokerageSettings (user-specific + global)
     const allBrkSettings = await BrokerageSettings.find({
@@ -181,6 +197,7 @@ const getWeeklyAdminReport = async (req, res) => {
         { user_id: null, deleted_at: null }
       ]
     }).lean();
+    _mark('6_brokerageSettings');
 
     // Also load caller's brokerage rules
     const callerRuleOwnerId = role === 'admin' ? null : callerId;
@@ -245,6 +262,12 @@ const getWeeklyAdminReport = async (req, res) => {
       }
     }
 
+    _mark('7_compute');
+    _timings.totalMs = Date.now() - _t0;
+    _timings.masterCount = allMasters.length;
+    _timings.userCount = allUsers.length;
+    console.log(`[WeeklyAdminReport] ${_timings.totalMs}ms —`, JSON.stringify(_timings));
+
     res.json({ success: true, data, totals: _sumTotals(data) });
   } catch (error) {
     console.error('[WeeklyAdminReport] Error:', error.message);
@@ -294,7 +317,7 @@ function _getUserEntryBatched(userDoc, metricsEngine, callerMaster, callerId, ca
   // Caller's brokerage share (per-instrument cascade)
   const callerBrk = _computeCallerBrkForUserBatched(
     userId, callerId, callerRole, tradesByUser, callerRules, kiteMap,
-    masterMap, brkRulesByUser, globalBrkRules, userDoc
+    masterMap, brkRulesByUser, globalBrkRules, userDoc, totalBrokerage
   );
 
   // P&L sharing: caller's share = product of unpassed fractions from user up to caller
@@ -333,49 +356,47 @@ function _getAggregatedEntryBatched(masterId, masterDoc, metricsEngine, callerId
     users.push(...usersForMaster);
   }
 
-  // P&L sharing must be computed PER USER and summed, same as caller_brk
-  // below — not as one flat multiplier applied to the combined total. The
-  // previous implementation (_getPnlUnpassedMultiplierBatched, removed)
-  // only walked masterId's direct children, ignoring anything deeper, and
-  // even fully recursive, a single blended rate is wrong the moment two
-  // branches of the subtree have different pnl_sharing rates — which real
-  // accounts do (confirmed: 100%, 90%, 98%, 50%, 20%, 0% all seen on
-  // different masters). _getPnlUnpassedMultiplierForUserBatched already
-  // walks each user's own path correctly and already stops at the right
-  // boundary relative to callerId (it's what _getUserEntryBatched uses for
-  // individual client rows) — reusing it here per user, exactly like
-  // caller_brk already does, fixes both problems at once.
+  // Single pass per user for every per-user figure this row needs — P&L
+  // share, brokerage/turnover, and the caller's brokerage cut. Used to be
+  // three separate loops over the same `users` array, two of which
+  // (brokerage and caller_brk) independently recomputed the same per-trade
+  // sums via _getUserBrokerageAndTurnoverBatched.
+  //
+  // P&L sharing is computed PER USER and summed, not as one flat
+  // multiplier applied to the combined total — the previous implementation
+  // (_getPnlUnpassedMultiplierBatched, removed) only walked masterId's
+  // direct children, ignoring anything deeper, and even walked fully, a
+  // single blended rate is wrong the moment two branches of the subtree
+  // have different pnl_sharing rates, which real accounts do (100%, 90%,
+  // 98%, 50%, 20%, 0% all seen on different masters).
+  // _getPnlUnpassedMultiplierForUserBatched already walks each user's own
+  // path correctly and stops at the right boundary relative to callerId
+  // (it's what _getUserEntryBatched uses for individual client rows).
   let totalGrossPnl = 0;
   let totalFloatingPnl = 0;
   let callerProfit = 0;
+  let totalBrokerage = 0, totalTurnover = 0, callerBrk = 0;
   for (const u of users) {
     const uid = u._id.toString();
+
     const metrics = metricsEngine.getCachedMetrics(uid);
     totalFloatingPnl += metrics?.position_pnl || 0;
+
     const userGrossPnl = _getGrossPnlBatched(uid, tradesByUser);
     totalGrossPnl += userGrossPnl;
     callerProfit += (-userGrossPnl) * _getPnlUnpassedMultiplierForUserBatched(uid, callerId, u, masterMap);
-  }
-  callerProfit = _r2(callerProfit);
 
-  let totalBrokerage = 0, totalTurnover = 0;
-  for (const u of users) {
-    const uid = u._id.toString();
     const { brokerage, turnover } = _getUserBrokerageAndTurnoverBatched(
       uid, tradesByUser, brkRulesByUser, globalBrkRules, kiteMap
     );
     totalBrokerage += brokerage;
     totalTurnover += turnover;
-  }
-
-  // Caller's brokerage share across all users in this master's hierarchy
-  let callerBrk = 0;
-  for (const u of users) {
     callerBrk += _computeCallerBrkForUserBatched(
-      u._id.toString(), callerId, callerRole, tradesByUser, callerRules, kiteMap,
-      masterMap, brkRulesByUser, globalBrkRules, u
+      uid, callerId, callerRole, tradesByUser, callerRules, kiteMap,
+      masterMap, brkRulesByUser, globalBrkRules, u, brokerage
     );
   }
+  callerProfit = _r2(callerProfit);
 
   return {
     id: masterId,
@@ -396,9 +417,15 @@ function _getAggregatedEntryBatched(masterId, masterDoc, metricsEngine, callerId
  * Compute caller's brokerage share for a single user using per-instrument cascade. (No DB queries)
  *
  * Same logic as original _computeCallerBrkForUser but reads from pre-loaded maps.
+ *
+ * `userTotalBrk` is passed in rather than recomputed — every call site
+ * already calls _getUserBrokerageAndTurnoverBatched for this same user a
+ * few lines earlier (for the report's own `brokerage` column); this used
+ * to redo that same per-trade iteration a second time internally, doubling
+ * the JS-side work for every user in the report.
  */
 function _computeCallerBrkForUserBatched(userId, callerId, callerRole, tradesByUser, callerRules, kiteMap,
-  masterMap, brkRulesByUser, globalBrkRules, userDoc) {
+  masterMap, brkRulesByUser, globalBrkRules, userDoc, userTotalBrk) {
 
   const trades = tradesByUser[userId] || [];
   if (trades.length === 0) return 0;
@@ -450,11 +477,6 @@ function _computeCallerBrkForUserBatched(userId, callerId, callerRole, tradesByU
       walk++;
     }
   }
-
-  // Total brokerage billed to user
-  const { brokerage: userTotalBrk } = _getUserBrokerageAndTurnoverBatched(
-    userId, tradesByUser, brkRulesByUser, globalBrkRules, kiteMap
-  );
 
   // Spread above caller's base = what's left after caller takes their base
   const spreadAboveCaller = Math.max(0, userTotalBrk - callerBaseClearance);
