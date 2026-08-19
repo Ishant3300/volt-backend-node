@@ -160,7 +160,7 @@ class MetricsEngine {
       const activeUserIds = await Trade.distinct('user_id', { status: 'completed', deleted_at: null });
       const requestedUserIds = options.includeUserIds || [];
       const userIds = [...new Set([...activeUserIds, ...requestedUserIds].map(id => id.toString()))];
-      const users = await User.find({ _id: { $in: userIds }, deleted_at: null }).select('_id credits settled_pnl master_id wallet exchanges_allowed').lean();
+      const users = await User.find({ _id: { $in: userIds }, deleted_at: null }).select('_id credits settled_pnl master_id wallet exchanges_allowed margin_square_off margin_square_off_percentage username active_status server_id').lean();
 
       // Build master hierarchy maps for broadcast aggregation. Also cache each
       // master's square-off config here (Task 11) so the master-aggregate path can
@@ -195,7 +195,13 @@ class MetricsEngine {
       this._metricsCache.clear();
 
       for (const user of users) {
-        await this._rebuildUserCache(user._id.toString(), user.credits || 0, user.settled_pnl || 0, user.master_id?.toString(), user.wallet, user.exchanges_allowed);
+        await this._rebuildUserCache(user._id.toString(), user.credits || 0, user.settled_pnl || 0, user.master_id?.toString(), user.wallet, user.exchanges_allowed, {
+          margin_square_off: user.margin_square_off,
+          margin_square_off_percentage: user.margin_square_off_percentage,
+          username: user.username,
+          active_status: user.active_status,
+          server_id: user.server_id,
+        });
       }
 
       for (const userId of this._userCache.keys()) {
@@ -211,7 +217,7 @@ class MetricsEngine {
   /**
    * Rebuild cache for a single user.
    */
-  async _rebuildUserCache(userId, credit, settledPnl, masterId, wallet, exchangesAllowed) {
+  async _rebuildUserCache(userId, credit, settledPnl, masterId, wallet, exchangesAllowed, marginConfig) {
     try {
       // Normalize the wallet + allowed categories once so both cache branches
       // (flat/no-trades and the main aggregation) store identical shapes.
@@ -239,6 +245,7 @@ class MetricsEngine {
           openPositions: [],
           wallet: walletBalances,
           allowedCategories: allowedCats,
+          marginConfig: marginConfig || null,
         });
         return;
       }
@@ -359,6 +366,7 @@ class MetricsEngine {
         openPositions,
         wallet: walletBalances,
         allowedCategories: allowedCats,
+        marginConfig: marginConfig || null,
       });
     } catch (e) {
       console.error(`📊 [MetricsEngine] Error rebuilding cache for user ${userId}:`, e.message);
@@ -782,7 +790,13 @@ class MetricsEngine {
       }
       
       // Rebuild this single user's cache and recompute
-      await this._rebuildUserCache(userId, user.credits || 0, user.settled_pnl || 0, user.master_id?.toString(), user.wallet, user.exchanges_allowed);
+      await this._rebuildUserCache(userId, user.credits || 0, user.settled_pnl || 0, user.master_id?.toString(), user.wallet, user.exchanges_allowed, {
+        margin_square_off: user.margin_square_off,
+        margin_square_off_percentage: user.margin_square_off_percentage,
+        username: user.username,
+        active_status: user.active_status,
+        server_id: user.server_id,
+      });
       const metrics = this._computeUserMetrics(userId);
       if (metrics) {
         this._metricsCache.set(userId, metrics);
@@ -1068,6 +1082,24 @@ class MetricsEngine {
    */
   getPositionTokens() {
     return Array.from(this._tokenToUsers.keys()).map(t => parseInt(t)).filter(t => !isNaN(t));
+  }
+
+  /**
+   * Returns the cached margin config for a user (loaded during cache rebuild).
+   * Used by marginSquareOffService to avoid per-tick DB reads.
+   */
+  getUserMarginConfig(userId) {
+    const cache = this._userCache.get(userId);
+    if (!cache) return null;
+    return {
+      margin_square_off: cache.marginConfig?.margin_square_off,
+      margin_square_off_percentage: cache.marginConfig?.margin_square_off_percentage,
+      credits: cache.credit,
+      username: cache.marginConfig?.username,
+      active_status: cache.marginConfig?.active_status,
+      server_id: cache.marginConfig?.server_id,
+      master_id: cache.masterId,
+    };
   }
 }
 

@@ -183,7 +183,7 @@ class CronService {
         // Every PM2 worker observes the durable committed generation and rebuilds
         // its own metrics/live-price maps. On-demand risk checks also reconcile,
         // while this poll keeps WebSocket-only clients current.
-        const settlementGenerationSyncJob = cron.schedule('*/15 * * * * *', async () => {
+        const settlementGenerationSyncJob = cron.schedule('*/2 * * * *', async () => {
             try {
                 const metricsEngine = require('./metricsEngine');
                 await metricsEngine.synchronizeSettlementGeneration({ maxAgeMs: 0, broadcast: true });

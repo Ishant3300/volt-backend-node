@@ -78,10 +78,10 @@ const checkUser = async (userId, metrics) => {
   if (_squaringOff.has(userId)) return;
 
   try {
-    const user = await User.findById(userId)
-      .select('margin_square_off margin_square_off_percentage credits master_id server_id username active_status deleted_at')
-      .lean();
-    if (!user || !user.active_status || user.deleted_at) return;
+    // ── Read margin config from metricsEngine in-memory cache (NO DB call) ──
+    const metricsEngine = require('./metricsEngine');
+    const user = metricsEngine.getUserMarginConfig(userId);
+    if (!user || !user.active_status) return;
     if (!user.margin_square_off && !(user.margin_square_off_percentage > 0)) return;
 
     // ── Margin Alert at 80% and 90% — notify user before square-off triggers ──
@@ -140,7 +140,7 @@ const checkUser = async (userId, metrics) => {
 
     _squaringOff.add(userId);
     try {
-      await _squareOffAllPositions(user);
+      await _squareOffAllPositions({ _id: userId, username: user.username });
       // Clear alert flags after square-off completes
       _alertedUsers80.delete(userId);
       _alertedUsers90.delete(userId);
