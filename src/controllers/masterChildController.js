@@ -204,6 +204,43 @@ const createChildMaster = async (req, res) => {
         await copyBrokerageFromGlobal(childMaster._id.toString(), session);
       }
 
+      // This new master's own per-segment base rates (see MasterBaseRate
+      // model — display/autofill only, no effect on real brokerage
+      // calculation). If the creation form submitted explicit values (the
+      // parent's autofilled defaults, possibly edited), save those. If it
+      // submitted nothing, fall back to copying the parent's own base
+      // rates directly server-side, so "whatever the parent's base rate is"
+      // is always the effective default even if the client didn't send it.
+      const MasterBaseRate = require('../models/MasterBaseRate');
+      if (Array.isArray(req.body.base_rates) && req.body.base_rates.length > 0) {
+        const baseRateDocs = req.body.base_rates
+          .filter(r => r.exchange_name && r.type && r.brk_value !== undefined && r.brk_value !== null)
+          .map(r => ({
+            master_id: childMaster._id,
+            exchange_name: String(r.exchange_name).toUpperCase(),
+            script_name: r.script_name || '',
+            type: String(r.type).toUpperCase(),
+            brk_value: Number(r.brk_value),
+          }));
+        if (baseRateDocs.length > 0) {
+          await MasterBaseRate.insertMany(baseRateDocs, { session });
+        }
+      } else if (parentMaster) {
+        const parentRates = await MasterBaseRate.find({ master_id: parentMaster._id, deleted_at: null }).session(session).lean();
+        if (parentRates.length > 0) {
+          await MasterBaseRate.insertMany(
+            parentRates.map(r => ({
+              master_id: childMaster._id,
+              exchange_name: r.exchange_name,
+              script_name: r.script_name,
+              type: r.type,
+              brk_value: r.brk_value,
+            })),
+            { session },
+          );
+        }
+      }
+
       // Task 13 / design §13.3: apply any inline initial wallet funding for the new
       // child master. A MASTER creating the child → TRANSFER (debits the master's
       // own category pool); an ADMIN creating it → GRANT (no debit). It runs inside

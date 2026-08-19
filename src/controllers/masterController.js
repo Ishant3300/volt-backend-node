@@ -111,6 +111,27 @@ const createMaster = async (req, res) => {
       });
       await master.save({ session });
 
+      // Save this master's own per-segment base rates, if the creation form
+      // submitted any (see MasterBaseRate model — display/autofill only,
+      // no effect on real brokerage calculation). A top-level master has no
+      // parent master to autofill from, so this is whatever was manually
+      // entered.
+      if (Array.isArray(req.body.base_rates) && req.body.base_rates.length > 0) {
+        const MasterBaseRate = require('../models/MasterBaseRate');
+        const baseRateDocs = req.body.base_rates
+          .filter(r => r.exchange_name && r.type && r.brk_value !== undefined && r.brk_value !== null)
+          .map(r => ({
+            master_id: master._id,
+            exchange_name: String(r.exchange_name).toUpperCase(),
+            script_name: r.script_name || '',
+            type: String(r.type).toUpperCase(),
+            brk_value: Number(r.brk_value),
+          }));
+        if (baseRateDocs.length > 0) {
+          await MasterBaseRate.insertMany(baseRateDocs, { session });
+        }
+      }
+
       // Create transaction record for initial credits
       const transaction = new Transaction({
         transactionId: `TXN_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`,
@@ -1398,6 +1419,72 @@ const getAccountLimit = async (req, res) => {
   }
 };
 
+// Get a master's own per-segment base rates. Used both to display a
+// master's own configured base rates, and — when the caller is about to
+// create a sub-master under this one — to fetch the values the creation
+// form should autofill (editable before save, per the hierarchy-creation
+// UI requirement).
+const getMasterBaseRates = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const master = await Master.findOne({ _id: id, deleted_at: null }).select('_id');
+    if (!master) {
+      return res.status(404).json({ success: false, message: 'Master not found', data: null });
+    }
+
+    const MasterBaseRate = require('../models/MasterBaseRate');
+    const rates = await MasterBaseRate.find({ master_id: id, deleted_at: null }).lean();
+
+    res.status(200).json({ success: true, data: rates });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message, data: null });
+  }
+};
+
+// Replace a master's own per-segment base rates wholesale (delete existing,
+// insert the given set) — simplest semantics for a form that always submits
+// the full current set of rows, matching how the creation flow submits them.
+const updateMasterBaseRates = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { base_rates } = req.body;
+
+    const master = await Master.findOne({ _id: id, deleted_at: null }).select('_id');
+    if (!master) {
+      return res.status(404).json({ success: false, message: 'Master not found', data: null });
+    }
+    if (!Array.isArray(base_rates)) {
+      return res.status(400).json({ success: false, message: 'base_rates must be an array', data: null });
+    }
+    for (const r of base_rates) {
+      if (!r.exchange_name || !r.type || r.brk_value === undefined || r.brk_value === null) {
+        return res.status(400).json({ success: false, message: 'Each base rate needs exchange_name, type, and brk_value', data: null });
+      }
+      if (!['TURNOVER WISE', 'LOT WISE'].includes(String(r.type).toUpperCase())) {
+        return res.status(400).json({ success: false, message: `Invalid type "${r.type}" — must be TURNOVER WISE or LOT WISE`, data: null });
+      }
+      if (Number(r.brk_value) < 0) {
+        return res.status(400).json({ success: false, message: 'brk_value cannot be negative', data: null });
+      }
+    }
+
+    const MasterBaseRate = require('../models/MasterBaseRate');
+    await MasterBaseRate.deleteMany({ master_id: id });
+    const docs = base_rates.map(r => ({
+      master_id: id,
+      exchange_name: String(r.exchange_name).toUpperCase(),
+      script_name: r.script_name || '',
+      type: String(r.type).toUpperCase(),
+      brk_value: Number(r.brk_value),
+    }));
+    const saved = docs.length > 0 ? await MasterBaseRate.insertMany(docs) : [];
+
+    res.status(200).json({ success: true, message: 'Base rates updated', data: saved });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message, data: null });
+  }
+};
+
 // Update Account Limit for a Master
 const updateAccountLimit = async (req, res) => {
   try {
@@ -1443,5 +1530,7 @@ module.exports = {
   getMasterPosition,
   sendMessageToMaster,
   getAccountLimit,
-  updateAccountLimit
+  updateAccountLimit,
+  getMasterBaseRates,
+  updateMasterBaseRates
 };

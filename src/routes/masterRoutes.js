@@ -18,7 +18,9 @@ const {
   getMasterPosition,
   sendMessageToMaster,
   getAccountLimit,
-  updateAccountLimit
+  updateAccountLimit,
+  getMasterBaseRates,
+  updateMasterBaseRates
 } = require('../controllers/masterController');
 
 
@@ -61,5 +63,11 @@ router.post('/:id/messages', authenticateAdminOrMaster, sendMessageToMaster);
 // Account Limit
 router.get('/:id/account-limit', authenticateAdminOrMaster, getAccountLimit);
 router.put('/:id/account-limit', authenticateAdminOrMaster, updateAccountLimit);
+
+// Base rates — a master's own per-segment reference brokerage rate.
+// Display/autofill only for the hierarchy creation UI; GET is also how the
+// creation form fetches a selected parent's rates to prefill before save.
+router.get('/:id/base-rates', authenticateAdminOrMaster, getMasterBaseRates);
+router.put('/:id/base-rates', authenticateAdminOrMaster, updateMasterBaseRates);
 
 module.exports = router;
