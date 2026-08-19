@@ -58,6 +58,48 @@ describe('_getBrkUnpassedMultiplierForUserBatched — per-tier brokerage_sharing
   });
 });
 
+describe('deep hierarchy (real deployments run 50-60+ tiers) — maxDepth must not truncate the cascade', () => {
+  function buildChain(n, sharingPct) {
+    const masterMap = {};
+    for (let i = 0; i < n; i++) {
+      masterMap['m' + i] = { master_id: i === 0 ? null : 'm' + (i - 1), brokerage_sharing: sharingPct, pnl_sharing: sharingPct };
+    }
+    return masterMap;
+  }
+
+  test('a 60-tier chain cascades through every tier, not just the first 10', () => {
+    const N = 60;
+    const masterMap = buildChain(N, 90);
+    const userDoc = { master_id: 'm' + (N - 1) };
+    const mult = _getBrkUnpassedMultiplierForUserBatched('user', 'ADMIN', userDoc, masterMap);
+    const expected = Math.pow(0.10, N);
+    // Relative comparison — at 1e-60 magnitude, exact equality can differ in the
+    // last few bits of a double, but truncating at 10 tiers (the old bug) would be
+    // off by 50 orders of magnitude (1e-10 vs 1e-60), not a rounding-error's worth.
+    expect(Math.abs(mult - expected) / expected).toBeLessThan(1e-9);
+  });
+
+  test('a 15-tier chain (previously silently truncated at maxDepth=10) now cascades fully', () => {
+    const N = 15;
+    const masterMap = buildChain(N, 50);
+    const userDoc = { master_id: 'm' + (N - 1) };
+    const mult = _getBrkUnpassedMultiplierForUserBatched('user', 'ADMIN', userDoc, masterMap);
+    const truncatedAt10 = Math.pow(0.5, 10);
+    const fullCascade = Math.pow(0.5, N);
+    expect(mult).toBeCloseTo(fullCascade, 10);
+    expect(mult).not.toBeCloseTo(truncatedAt10, 6);
+  });
+
+  test('P&L cascade is equally unaffected by depth', () => {
+    const N = 60;
+    const masterMap = buildChain(N, 90);
+    const userDoc = { master_id: 'm' + (N - 1) };
+    const mult = _getPnlUnpassedMultiplierForUserBatched('user', 'ADMIN', userDoc, masterMap);
+    const expected = Math.pow(0.10, N);
+    expect(Math.abs(mult - expected) / expected).toBeLessThan(1e-9);
+  });
+});
+
 describe('_computeCallerBrkForUserBatched — admin\'s brokerage share for each user', () => {
   test('user1 (3 tiers): cascades through all three intermediate shares', () => {
     const trades = tradesFor(user1.lots, user1.rate);

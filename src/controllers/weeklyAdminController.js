@@ -490,6 +490,14 @@ function _computeCallerBrkForUserBatched(userId, callerId, callerRole, tradesByU
  * For a direct user: compute what fraction of their P&L flows up to the caller. (No DB queries)
  *
  * Same logic as original _getPnlUnpassedMultiplierForUser.
+ *
+ * maxDepth is a corrupted-data safety net (guards against a circular
+ * master_id reference looping forever), not a real ceiling on hierarchy
+ * depth — it was previously 10, which silently truncated the cascade for
+ * any real hierarchy deeper than that, attributing the wrong share to
+ * every tier above the 10th instead of continuing to the real caller.
+ * Real hierarchies here run 50-60+ tiers deep, so this must be well above
+ * any plausible real depth.
  */
 function _getPnlUnpassedMultiplierForUserBatched(userId, callerId, userDoc, masterMap) {
   const userMasterId = userDoc?.master_id?.toString();
@@ -498,7 +506,7 @@ function _getPnlUnpassedMultiplierForUserBatched(userId, callerId, userDoc, mast
   let multiplier = 1;
   let currentMasterId = userMasterId;
 
-  const maxDepth = 10;
+  const maxDepth = 500;
   let depth = 0;
   while (currentMasterId && depth < maxDepth) {
     const master = masterMap[currentMasterId];
@@ -523,6 +531,9 @@ function _getPnlUnpassedMultiplierForUserBatched(userId, callerId, userDoc, mast
  * every intermediate master between the user and the caller, multiplying
  * in each one's own brokerage_sharing%, instead of only looking at a
  * single master along the path.
+ *
+ * maxDepth is a corrupted-data safety net, not a real ceiling — see
+ * _getPnlUnpassedMultiplierForUserBatched's comment on the same constant.
  */
 function _getBrkUnpassedMultiplierForUserBatched(userId, callerId, userDoc, masterMap) {
   const userMasterId = userDoc?.master_id?.toString();
@@ -531,7 +542,7 @@ function _getBrkUnpassedMultiplierForUserBatched(userId, callerId, userDoc, mast
   let multiplier = 1;
   let currentMasterId = userMasterId;
 
-  const maxDepth = 10;
+  const maxDepth = 500;
   let depth = 0;
   while (currentMasterId && depth < maxDepth) {
     const master = masterMap[currentMasterId];
