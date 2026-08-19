@@ -335,7 +335,14 @@ function _getUserEntryBatched(userDoc, metricsEngine, callerMaster, callerId, ca
     brokerage: _r2(totalBrokerage),
     turnover: _r2(turnover),
     caller_brk: _r2(callerBrk),
-    total_pnl: _r2(-grossPnl),
+    // Net of BOTH realised and floating — was previously just -grossPnl,
+    // silently ignoring m2m_pnl entirely, so "total" wasn't actually the
+    // total. caller_profit's own basis is deliberately left as grossPnl
+    // alone (realised only) — that's a separate, already-verified
+    // commission-sharing calculation, not the display total, and
+    // commission shouldn't be paid out on unrealised/floating P&L that
+    // could still reverse before settlement.
+    total_pnl: _r2(-(grossPnl + floatingPnl)),
     caller_profit: callerProfit,
     total_caller: _r2(callerProfit + callerBrk),
   };
@@ -407,7 +414,10 @@ function _getAggregatedEntryBatched(masterId, masterDoc, metricsEngine, callerId
     brokerage: _r2(totalBrokerage),
     turnover: _r2(totalTurnover),
     caller_brk: _r2(callerBrk),
-    total_pnl: _r2(-totalGrossPnl),
+    // Net of BOTH realised and floating — see _getUserEntryBatched's
+    // comment on the same fix. caller_profit stays realised-only
+    // (unchanged), same reasoning.
+    total_pnl: _r2(-(totalGrossPnl + totalFloatingPnl)),
     caller_profit: callerProfit,
     total_caller: _r2(callerProfit + callerBrk),
   };
