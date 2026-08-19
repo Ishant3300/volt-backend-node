@@ -243,12 +243,16 @@ const getTradeReport = async (req, res) => {
 
       const matchedQty = Math.min(totalBuyQty, totalSellQty);
 
-      // ── FIFO P&L Recomputation ──
-      // Recompute P&L using FIFO matching instead of stored per-trade pnl values.
-      // This correctly handles cases where:
-      //   - Per-trade pnl was computed against a running average that included prior-week buys
-      //   - Settlement close pnl was computed against overall avg instead of remaining FIFO cost
-      const pnl = _computeFifoPnl(g.all_trades);
+      // ── Average-Price P&L Recomputation ──
+      // Recompute P&L using the average-price method instead of stored
+      // per-trade pnl values (despite the old name, this was never true
+      // FIFO — see _computeAveragePricePnl's own docstring below, which
+      // says so directly). Recomputing here — rather than trusting the
+      // stored `pnl` field — correctly handles cases where the stored
+      // value was computed against a running average that included
+      // prior-week buys, or a settlement close was computed against an
+      // overall average instead of the position actually being closed.
+      const pnl = _computeAveragePricePnl(g.all_trades);
 
       // Brokerage: for ledger (settled) rows use the stored value captured at settlement time.
       // For live rows recalculate, but only with rules that were effective at the trade date
@@ -612,13 +616,6 @@ const getSettlementHistory = async (req, res) => {
 };
 
 /**
- * FIFO P&L computation for a single instrument's fills within a report period.
- * Processes fills chronologically: each closing trade consumes the earliest available
- * opening trades. Handles both long (buy→sell) and short (sell→buy) positions.
- * Also updates the `pnl` field on each closing trade object for per-row PDF display.
- *
- * @param {Array} allTrades - chronological fills with {type, buy_qty, sell_qty, rate, ...}
-/**
  * Determine the display label for the "Type" column in the M2M report.
  */
 function _getOrderTypeLabel(trade) {
@@ -643,14 +640,25 @@ function _getOrderTypeLabel(trade) {
 }
 
 /**
- * Compute P&L for an instrument using Average Price method.
+ * Compute P&L for an instrument using the average-price method (NOT true
+ * FIFO — this function used to be misleadingly named _computeFifoPnl,
+ * despite this docstring always having said "Average Price method").
  * avgBuyPrice = totalBuyValue / totalBuyQty
  * For each closing trade: pnl = (exitPrice - avgEntryPrice) × closingQty
+ *
+ * Resets the running totals to zero whenever a closing trade brings net
+ * quantity back to exactly 0 — not just on a same-trade flip (excess > 0,
+ * already handled below). Missing that exact-zero case was a real bug: an
+ * instrument with more than one round trip within the report period got
+ * its second round trip's average silently blended with the first,
+ * already-closed one. Confirmed with a worked example: BUY 20/SELL 20
+ * (closed, +4000) then BUY 30/SELL 30 (closed, +7422) should total
+ * 11422.00; without this reset it computed 18173.20 instead.
  *
  * @param {Array} allTrades - trades sorted chronologically, each with buy_qty/sell_qty/rate
  * @returns {number} total P&L for this instrument
  */
-function _computeFifoPnl(allTrades) {
+function _computeAveragePricePnl(allTrades) {
   const sorted = [...allTrades].sort((a, b) => new Date(a.date) - new Date(b.date));
 
   let totalBuyQty = 0, totalBuyValue = 0;
@@ -688,8 +696,15 @@ function _computeFifoPnl(allTrades) {
 
       const excess = qty - Math.abs(prevNet);
       if (excess > 0) {
+        // Same-trade flip — the excess beyond the close starts a fresh
+        // position on the opposite side.
         if (isBuy) { totalBuyQty = excess; totalBuyValue = excess * price; totalSellQty = 0; totalSellValue = 0; }
         else { totalSellQty = excess; totalSellValue = excess * price; totalBuyQty = 0; totalBuyValue = 0; }
+      } else {
+        // Closed to exactly zero, no flip — everything before this is a
+        // separate, completed round trip and must not bleed into whatever
+        // opens next.
+        totalBuyQty = 0; totalBuyValue = 0; totalSellQty = 0; totalSellValue = 0;
       }
     }
 
