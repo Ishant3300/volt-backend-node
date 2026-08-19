@@ -155,37 +155,42 @@ function realisedPnlFor(trade, state) {
   return 0;
 }
 
+/**
+ * Rule matching previously diverged from every other brokerage-calc path in
+ * this codebase (tradeController.js's immediate-fill path, metricsEngine.js,
+ * settlementService.js): it matched on `trade.exchange` (the coarse
+ * exchange, e.g. "NFO") instead of the instrument's real segment (e.g.
+ * "NFO-FUT"), and required an exact non-empty script_name match with NO
+ * fallback to a segment/exchange-wide wildcard rule (script_name empty).
+ * Since this is the PRIMARY live fill path for every LIMIT/SL/SL-M order,
+ * any admin who configured a segment-level default rule instead of one rule
+ * per individual script got ₹0 brokerage silently charged on every such
+ * fill — while the identical instrument filled as a MARKET order (via
+ * tradeController.js) correctly picked up that same rule. Now uses the same
+ * 4-level fallback (script+segment, script-only, segment+wildcard,
+ * bare-exchange+wildcard) as the already-correct paths.
+ */
 async function calculateBrokerage(trade, session) {
   const instrument = await KiteInstrument.findOne({ instrument_token: trade.instrument_token }).session(session).lean();
-  const rawName = instrument?.raw_name || instrument?.name || null;
+  const rawName = instrument?.raw_name || instrument?.name
+    || trade.tradingsymbol.replace(/[0-9]+[A-Z]+$/, '').trim();
+  const seg = instrument?.segment || trade.exchange || '';
   const userId = trade.user_id || null;
 
-  // Helper: find rule for a specific user_id (or null for global)
-  async function findRule(uid) {
-    let r = null;
-    if (rawName) {
-      r = await BrokerageSettings.findOne({
-        user_id: uid,
-        exchange_name: trade.exchange,
-        script_name: rawName,
-        deleted_at: null,
-      }).session(session).lean();
-    }
-    if (!r) {
-      r = await BrokerageSettings.findOne({
-        user_id: uid,
-        exchange_name: trade.exchange,
-        script_name: trade.tradingsymbol,
-        deleted_at: null,
-      }).session(session).lean();
-    }
-    return r;
-  }
+  const userRules = userId
+    ? await BrokerageSettings.find({ user_id: userId, deleted_at: null }).session(session).lean()
+    : [];
+  const globalRules = userRules.length === 0
+    ? await BrokerageSettings.find({ user_id: null, deleted_at: null }).session(session).lean()
+    : [];
+  const rules = userRules.length > 0 ? userRules : globalRules;
 
-  // 1) Try user-specific rule
-  let rule = userId ? await findRule(userId) : null;
-  // 2) Fallback to global rule (user_id: null)
-  if (!rule) rule = await findRule(null);
+  let rule = null;
+  if (rawName && seg) rule = rules.find(r => r.script_name?.toUpperCase() === rawName.toUpperCase() && r.exchange_name === seg.toUpperCase());
+  if (!rule && rawName) rule = rules.find(r => r.script_name?.toUpperCase() === rawName.toUpperCase());
+  if (!rule && seg) rule = rules.find(r => r.exchange_name === seg.toUpperCase() && (!r.script_name || r.script_name.trim() === ''));
+  if (!rule) rule = rules.find(r => r.exchange_name === (seg.split('-')[0] || '').toUpperCase() && (!r.script_name || r.script_name.trim() === ''));
+
   if (!rule) return 0;
   if (rule.type === 'TURNOVER WISE') return (trade.price * trade.quantity) * (rule.brk_value / 10000);
   if (rule.type !== 'LOT WISE') return 0;
@@ -369,9 +374,10 @@ async function executeMatchedOrder(match, livePrice, options = {}) {
   }
 }
 
-function addCleanupId(match, buys, sells) {
-  if (match.side === 'BUY') buys.push(match.id);
-  else sells.push(match.id);
+function addCleanupId(match, limitBuys, limitSells, stopBuys, stopSells) {
+  const isStop = match.orderType === 'SL' || match.orderType === 'SL-M';
+  if (match.side === 'BUY') (isStop ? stopBuys : limitBuys).push(match.id);
+  else (isStop ? stopSells : limitSells).push(match.id);
 }
 
 async function notifyOutcome(outcome, livePrice) {
@@ -393,7 +399,7 @@ async function notifyOutcome(outcome, livePrice) {
   }
 
   if (outcome.kind !== 'completed') return;
-  console.log(`✅ [PriceQueue] Executed ${trade.transaction_type} LIMIT ${trade.tradingsymbol} @ ${trade.price} (live: ${livePrice})`);
+  console.log(`✅ [PriceQueue] Executed ${trade.transaction_type} ${trade.order_type} ${trade.tradingsymbol} @ ${trade.price} (live: ${livePrice})`);
   livePriceService.broadcastToUser(trade.user_id.toString(), {
     type: 'trade_executed',
     trade_id: trade._id.toString(),
@@ -406,8 +412,9 @@ async function notifyOutcome(outcome, livePrice) {
     status: 'completed',
   });
   await metricsEngine.onTradeExecuted(trade.user_id.toString());
+  const isStopOrder = trade.order_type === 'SL' || trade.order_type === 'SL-M';
   firebaseService.sendNotification(trade.user_id.toString(), 'pending_order', {
-    title: 'Limit Order Executed',
+    title: isStopOrder ? 'Stop-Loss Order Executed' : 'Limit Order Executed',
     body: `${trade.transaction_type} ${trade.quantity} ${trade.tradingsymbol} @ ₹${trade.price}`,
     data: { trade_id: trade._id.toString(), tradingsymbol: trade.tradingsymbol },
   });
@@ -417,19 +424,29 @@ const _processJob = async job => {
   const { instrument_token, live_price } = job.data;
   if (LOG_PRICE_QUEUE) console.log(`🔄 [PriceQueue] Processing price update: Token ${instrument_token} @ ${live_price}`);
 
-  const [matchingBuys, matchingSells] = await Promise.all([
+  const [matchingBuys, matchingSells, matchingStopBuys, matchingStopSells] = await Promise.all([
     orderBookService.getMatchingBuyOrders(instrument_token, live_price),
     orderBookService.getMatchingSellOrders(instrument_token, live_price),
+    orderBookService.getMatchingStopBuyOrders(instrument_token, live_price),
+    orderBookService.getMatchingStopSellOrders(instrument_token, live_price),
   ]);
+  // orderType is tagged per match so cleanup below removes each executed
+  // order from the RIGHT Redis set — LIMIT and stop orders live in separate
+  // key pairs (see orderBookService.js) since they trigger on opposite
+  // price directions.
   const matches = [
-    ...matchingBuys.map(id => ({ id, side: 'BUY' })),
-    ...matchingSells.map(id => ({ id, side: 'SELL' })),
+    ...matchingBuys.map(id => ({ id, side: 'BUY', orderType: 'LIMIT' })),
+    ...matchingSells.map(id => ({ id, side: 'SELL', orderType: 'LIMIT' })),
+    ...matchingStopBuys.map(id => ({ id, side: 'BUY', orderType: 'SL' })),
+    ...matchingStopSells.map(id => ({ id, side: 'SELL', orderType: 'SL' })),
   ];
   if (matches.length === 0) return;
 
   console.log(`⚡ [PriceQueue] Token ${instrument_token} @ ${live_price} → ${matches.length} order(s) to execute`);
   const executedBuys = [];
   const executedSells = [];
+  const executedStopBuys = [];
+  const executedStopSells = [];
   let failedCount = 0;
   for (const match of matches) {
     // Each match gets its own try/catch that does NOT re-throw. Previously
@@ -449,7 +466,7 @@ const _processJob = async job => {
     try {
       const outcome = await executeMatchedOrder(match, live_price);
       if (['unchanged', 'cancelled', 'rejected', 'completed'].includes(outcome.kind)) {
-        addCleanupId(match, executedBuys, executedSells);
+        addCleanupId(match, executedBuys, executedSells, executedStopBuys, executedStopSells);
       }
       await notifyOutcome(outcome, live_price);
     } catch (error) {
@@ -463,8 +480,10 @@ const _processJob = async job => {
     console.log(`⚠️  [PriceQueue] Token ${instrument_token} @ ${live_price} → ${failedCount}/${matches.length} order(s) failed this tick, left pending for retry`);
   }
 
-  if (executedBuys.length > 0) await orderBookService.removeMany(instrument_token, 'BUY', executedBuys);
-  if (executedSells.length > 0) await orderBookService.removeMany(instrument_token, 'SELL', executedSells);
+  if (executedBuys.length > 0) await orderBookService.removeMany(instrument_token, 'BUY', executedBuys, 'LIMIT');
+  if (executedSells.length > 0) await orderBookService.removeMany(instrument_token, 'SELL', executedSells, 'LIMIT');
+  if (executedStopBuys.length > 0) await orderBookService.removeMany(instrument_token, 'BUY', executedStopBuys, 'SL');
+  if (executedStopSells.length > 0) await orderBookService.removeMany(instrument_token, 'SELL', executedStopSells, 'SL');
 };
 
 const init = () => {

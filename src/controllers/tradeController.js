@@ -978,10 +978,17 @@ const placeTrade = async (req, res) => {
             });
         }
 
-        // Register pending LIMIT orders before releasing the distributed write
-        // lease. Settlement cannot cancel the Mongo row and clean Redis between
-        // commit and registration. Mongo remains authoritative if Redis is down.
-        if (resultTrade.status === 'pending' && resultTrade.order_type === 'LIMIT') {
+        // Register pending LIMIT and SL/SL-M orders before releasing the
+        // distributed write lease. Settlement cannot cancel the Mongo row and
+        // clean Redis between commit and registration. Mongo remains
+        // authoritative if Redis is down.
+        //
+        // SL/SL-M used to be excluded here entirely — a real bug: they were
+        // accepted at placement (a valid order_type) but never registered
+        // anywhere (Redis order book, DB-fallback query, boot-time sync all
+        // filtered to 'LIMIT' only), so a stop-loss order sat pending with
+        // zero actual protection until the end-of-day cleanup cancelled it.
+        if (resultTrade.status === 'pending' && ['LIMIT', 'SL', 'SL-M'].includes(resultTrade.order_type)) {
             const stillPending = await Trade.exists({
                 _id: resultTrade._id,
                 status: 'pending',
@@ -993,7 +1000,8 @@ const placeTrade = async (req, res) => {
                         resultTrade._id.toString(),
                         resultTrade.instrument_token,
                         resultTrade.price,
-                        resultTrade.transaction_type
+                        resultTrade.transaction_type,
+                        resultTrade.order_type
                     );
                 } catch (redisError) {
                     console.error(`⚠️ [OrderBook] Pending order ${resultTrade._id} will be repaired from MongoDB: ${redisError.message}`);
@@ -1364,7 +1372,8 @@ const cancelTrade = async (req, res) => {
         await orderBookService.removeOrder(
             trade._id.toString(),
             trade.instrument_token,
-            trade.transaction_type
+            trade.transaction_type,
+            trade.order_type
         );
 
         res.status(200).json({
@@ -1463,7 +1472,8 @@ const deleteTrade = async (req, res) => {
                 await orderBookService.removeOrder(
                     trade._id.toString(),
                     trade.instrument_token,
-                    trade.transaction_type
+                    trade.transaction_type,
+                    trade.order_type
                 );
             } catch (_) { }
         }

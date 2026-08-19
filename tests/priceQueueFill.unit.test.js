@@ -15,7 +15,7 @@ jest.mock('bullmq', () => ({ Queue: jest.fn(), Worker: jest.fn() }));
 jest.mock('../src/models/Trade', () => ({ findById: jest.fn(), find: jest.fn(), create: jest.fn() }));
 jest.mock('../src/models/User', () => ({ findById: jest.fn() }));
 jest.mock('../src/models/KiteInstrument', () => ({ findOne: jest.fn() }));
-jest.mock('../src/models/BrokerageSettings', () => ({ findOne: jest.fn() }));
+jest.mock('../src/models/BrokerageSettings', () => ({ findOne: jest.fn(), find: jest.fn() }));
 jest.mock('../src/models/ScriptQuantity', () => ({ findOne: jest.fn() }));
 jest.mock('../src/models/Transaction', () => jest.fn().mockImplementation(() => ({ save: jest.fn().mockResolvedValue(undefined) })));
 jest.mock('../src/services/tradeWriteFenceService', () => ({ beginTradeWrite: jest.fn() }));
@@ -23,7 +23,13 @@ jest.mock('../src/services/marginService', () => ({ calculateMargin: jest.fn() }
 jest.mock('../src/services/walletService', () => ({ getAvailable: jest.fn(), block: jest.fn(), release: jest.fn() }));
 jest.mock('../src/services/firebaseService', () => ({ sendNotification: jest.fn() }));
 jest.mock('../src/services/metricsEngine', () => ({ getFreshMetrics: jest.fn(), onTradeExecuted: jest.fn() }));
-jest.mock('../src/services/orderBookService', () => ({ getMatchingBuyOrders: jest.fn(), getMatchingSellOrders: jest.fn(), removeMany: jest.fn() }));
+jest.mock('../src/services/orderBookService', () => ({
+  getMatchingBuyOrders: jest.fn(),
+  getMatchingSellOrders: jest.fn(),
+  getMatchingStopBuyOrders: jest.fn(),
+  getMatchingStopSellOrders: jest.fn(),
+  removeMany: jest.fn(),
+}));
 jest.mock('../src/services/redisService', () => ({ isAvailable: jest.fn(), getClient: jest.fn() }));
 jest.mock('../src/services/livePriceService', () => ({ broadcastToUser: jest.fn() }));
 
@@ -108,6 +114,10 @@ beforeEach(() => {
   // calculateBrokerage lookup (no raw_name/name → brokerage resolves to 0).
   KiteInstrument.findOne.mockImplementation(() => queryChain({ segment: 'NFO-FUT' }));
   BrokerageSettings.findOne.mockImplementation(() => queryChain(null));
+  // calculateBrokerage now queries BrokerageSettings.find(...) (all rules
+  // for the user, or global) instead of a single findOne — empty array
+  // means no rule matches, same "brokerage resolves to 0" default as before.
+  BrokerageSettings.find.mockImplementation(() => queryChain([]));
 
   calculateMargin.mockResolvedValue(25000); // per-unit notional (doesn't affect wallet asserts)
   walletService.block.mockResolvedValue({ category: 'NSE', amount: 0 });
@@ -116,6 +126,11 @@ beforeEach(() => {
 
   User.findById.mockReturnValue(sessionResolving({ equity: 1000000, save: jest.fn().mockResolvedValue(undefined) }));
   Trade.create.mockResolvedValue([{}]);
+
+  // Default: no stop (SL/SL-M) orders match this tick, unless a test
+  // overrides it — mirrors the existing LIMIT-only defaults above.
+  orderBookService.getMatchingStopBuyOrders.mockResolvedValue([]);
+  orderBookService.getMatchingStopSellOrders.mockResolvedValue([]);
 });
 
 afterEach(() => {
@@ -264,10 +279,64 @@ describe('_processJob — one matched order failing does not abort the rest of t
     // tradeA executed successfully...
     expect(walletService.block).toHaveBeenCalledWith('User', 'userA', 'NSE', 50000, expect.anything());
     // ...and still gets cleaned out of the order book, despite tradeB's failure.
-    expect(orderBookService.removeMany).toHaveBeenCalledWith(111, 'BUY', ['tradeA']);
+    expect(orderBookService.removeMany).toHaveBeenCalledWith(111, 'BUY', ['tradeA'], 'LIMIT');
     // tradeB itself is left OUT of cleanup — it stays pending for a retry
     // on the next tick, not silently dropped or wrongly marked done.
     const removedIds = orderBookService.removeMany.mock.calls.flatMap((call) => call[2]);
     expect(removedIds).not.toContain('tradeB');
+  });
+});
+
+describe('_processJob — SL/SL-M orders are matched and cleaned up separately from LIMIT orders', () => {
+  // Regression test for a real bug: SL/SL-M orders were accepted at
+  // placement but NEVER registered anywhere (Redis order book, DB-fallback
+  // query, boot-time sync all filtered to 'LIMIT' only) — they sat pending
+  // forever with zero actual stop-loss protection until end-of-day cleanup
+  // silently cancelled them. _processJob must now also query the stop
+  // order book and execute matches from it exactly like LIMIT matches.
+  test('a matched stop order executes and is cleaned up via the stop-order removeMany call, not the LIMIT one', async () => {
+    const stopTrade = makeTradeDoc({ _id: 'stopTradeA', transaction_type: 'BUY', quantity: 2, price: 25000, user_id: 'userA', order_type: 'SL' });
+
+    Trade.findById.mockImplementation((id) => {
+      if (id === 'stopTradeA') return sessionResolving(stopTrade);
+      return sessionResolving(null);
+    });
+    Trade.find.mockReturnValue(priorTrades([]));
+    walletService.getAvailable.mockResolvedValue({ NSE: 100000, MCX: 0, GLOBAL: 0 });
+
+    orderBookService.getMatchingBuyOrders.mockResolvedValue([]);
+    orderBookService.getMatchingSellOrders.mockResolvedValue([]);
+    orderBookService.getMatchingStopBuyOrders.mockResolvedValue(['stopTradeA']);
+    orderBookService.getMatchingStopSellOrders.mockResolvedValue([]);
+
+    await expect(_processJob({ data: { instrument_token: 111, live_price: 25010 } })).resolves.toBeUndefined();
+
+    expect(walletService.block).toHaveBeenCalledWith('User', 'userA', 'NSE', 50000, expect.anything());
+    // Cleaned up via the SL-tagged removeMany call (4th arg 'SL'), not the LIMIT one.
+    expect(orderBookService.removeMany).toHaveBeenCalledWith(111, 'BUY', ['stopTradeA'], 'SL');
+    expect(orderBookService.removeMany).not.toHaveBeenCalledWith(111, 'BUY', ['stopTradeA'], 'LIMIT');
+  });
+
+  test('LIMIT and stop matches in the same tick are cleaned up into their own separate removeMany calls', async () => {
+    const limitTrade = makeTradeDoc({ _id: 'limitTradeA', transaction_type: 'BUY', quantity: 1, price: 25000, user_id: 'userA' });
+    const stopTrade = makeTradeDoc({ _id: 'stopTradeB', transaction_type: 'SELL', quantity: 1, price: 25000, user_id: 'userA', order_type: 'SL-M' });
+
+    Trade.findById.mockImplementation((id) => {
+      if (id === 'limitTradeA') return sessionResolving(limitTrade);
+      if (id === 'stopTradeB') return sessionResolving(stopTrade);
+      return sessionResolving(null);
+    });
+    Trade.find.mockReturnValue(priorTrades([]));
+    walletService.getAvailable.mockResolvedValue({ NSE: 100000, MCX: 0, GLOBAL: 0 });
+
+    orderBookService.getMatchingBuyOrders.mockResolvedValue(['limitTradeA']);
+    orderBookService.getMatchingSellOrders.mockResolvedValue([]);
+    orderBookService.getMatchingStopBuyOrders.mockResolvedValue([]);
+    orderBookService.getMatchingStopSellOrders.mockResolvedValue(['stopTradeB']);
+
+    await expect(_processJob({ data: { instrument_token: 111, live_price: 25000 } })).resolves.toBeUndefined();
+
+    expect(orderBookService.removeMany).toHaveBeenCalledWith(111, 'BUY', ['limitTradeA'], 'LIMIT');
+    expect(orderBookService.removeMany).toHaveBeenCalledWith(111, 'SELL', ['stopTradeB'], 'SL');
   });
 });

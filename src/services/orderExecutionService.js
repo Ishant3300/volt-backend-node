@@ -12,6 +12,7 @@ const { categoryForSegment } = require('../utils/walletCategory');
 const { computeWalletSplit } = require('../utils/walletSplit');
 const firebaseService = require('./firebaseService');
 const { beginTradeWrite } = require('./tradeWriteFenceService');
+const { calculateBrokerage } = require('./brokerageService');
 
 /**
  * Fetches live prices from Kite for a list of instrument tokens.
@@ -47,7 +48,12 @@ const processPendingOrders = async () => {
     if (redisService.isAvailable()) return;
 
     try {
-        const pendingTrades = await Trade.find({ status: 'pending', order_type: 'LIMIT' });
+        // Previously 'LIMIT' only — SL/SL-M orders were accepted at
+        // placement but this query (and the matching Redis-path query in
+        // orderBookService.js / registration gate in tradeController.js)
+        // silently excluded them, so the SL/SL-M trigger-matching logic
+        // just below was unreachable dead code. Now all three are aligned.
+        const pendingTrades = await Trade.find({ status: 'pending', order_type: { $in: ['LIMIT', 'SL', 'SL-M'] } });
 
         if (pendingTrades.length === 0) return;
 
@@ -263,13 +269,22 @@ const processPendingOrders = async () => {
                             await walletService.block('User', freshTrade.user_id, walletCategory, walletOpeningNotional, session);
                         }
 
+                        // Brokerage — this DB-fallback path previously never computed or
+                        // charged it at all (freshTrade.brokerage was left unset and
+                        // balanceChange never subtracted it), so every fill that happened
+                        // to go through this path (Redis down) was brokerage-free. Mirrors
+                        // priceQueueService.js's calculateBrokerage call, now via the shared
+                        // brokerageService so both paths use identical rule-matching logic.
+                        const brokerage = await calculateBrokerage(freshTrade, session);
+
                         // Execute the trade
                         freshTrade.status = 'completed';
                         freshTrade.executed_at = new Date();
                         freshTrade.executed_price = freshTrade.price;
                         freshTrade.executed_quantity = freshTrade.quantity;
                         freshTrade.pnl = realisedPnl;
-                        freshTrade.net_amount = realisedPnl;
+                        freshTrade.brokerage = brokerage;
+                        freshTrade.net_amount = realisedPnl - brokerage;
                         await freshTrade.save({ session });
 
                         // Calculate margin impact and update balance
@@ -285,7 +300,7 @@ const processPendingOrders = async () => {
                         // PERSISTED user.equity running balance. Kept byte-for-byte for parity
                         // with placeTrade / priceQueueService; flagged for user review.
                         const marginDelta = newMargin - prevMargin;
-                        const balanceChange = realisedPnl - marginDelta;
+                        const balanceChange = realisedPnl - marginDelta - brokerage;
 
                         const user = await User.findById(freshTrade.user_id).session(session);
                         if (user) {
@@ -313,6 +328,7 @@ const processPendingOrders = async () => {
                                         executedPrice: freshTrade.price,
                                         order_type: freshTrade.order_type,
                                         realisedPnl,
+                                        brokerage,
                                         marginDelta,
                                         balanceChange,
                                         positionClosed: realisedPnl !== 0,
