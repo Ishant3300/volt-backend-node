@@ -203,4 +203,31 @@ describe('executeMatchedOrder — category wallet block/release at fill time', (
     expect(walletService.release).toHaveBeenCalledWith('User', 'user1', 'NSE', 1726878, fakeSession);
     expect(outcome.kind).toBe('completed');
   });
+
+  test('(e) a same-trade flip through zero starts a fresh average on the new side, not a blend', async () => {
+    // This platform allows a single fill larger than the current net
+    // position (closing it AND opening the opposite side in one trade) —
+    // order size is only capped at the current position when an admin has
+    // disabled the instrument, not in general. A plain "reset on exact
+    // zero" check misses this, since quantity can jump straight past zero
+    // without ever equaling it.
+    //
+    // Trade history: BUY 10 @ 100 (long 10) -> SELL 15 @ 110 (flip: closes
+    // the 10 long, opens a short 5). Then THIS fill closes that short:
+    // BUY 5 @ 90. P&L must be computed against the flip's own price (110),
+    // not any blend involving the original long's 100 entry.
+    Trade.find.mockReturnValue(priorTrades([
+      { transaction_type: 'BUY', executed_quantity: 10, executed_price: 100, executed_at: new Date('2026-08-19T09:00:00Z') },
+      { transaction_type: 'SELL', executed_quantity: 15, executed_price: 110, executed_at: new Date('2026-08-19T09:05:00Z') },
+    ]));
+    const trade = makeTradeDoc({ transaction_type: 'BUY', quantity: 5, price: 90 });
+    Trade.findById.mockReturnValue(sessionResolving(trade));
+    walletService.getAvailable.mockResolvedValue({ NSE: 0, MCX: 0, GLOBAL: 0 });
+
+    const outcome = await executeMatchedOrder({ id: 'trade1', side: 'BUY' }, 90);
+
+    expect(trade.pnl).toBeCloseTo((110 - 90) * 5, 2); // avgSell must be 110 (the flip price), not blended with the old long's 100
+    expect(walletService.release).toHaveBeenCalledWith('User', 'user1', 'NSE', 5 * 110, fakeSession);
+    expect(outcome.kind).toBe('completed');
+  });
 });

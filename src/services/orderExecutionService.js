@@ -116,10 +116,15 @@ const processPendingOrders = async () => {
                         // position last returned to flat — same bug and same fix as
                         // priceQueueService.js's positionStateSinceLastFlat: an unbounded sum
                         // since last settlement blends in an already-closed prior round trip's
-                        // prices into "today's" entry basis. Net qty itself (sinceFlat*Qty
+                        // prices into "today's" entry basis. Net qty itself (prevNetQtyCheck
                         // below) doesn't need this treatment — a full round trip's buys and
                         // sells cancel out in a plain qty sum regardless of order, so only the
                         // VALUE-weighted average is at risk, not the position size.
+                        //
+                        // Also handles a same-trade flip (one fill larger than the current net
+                        // position, closing it AND opening the opposite side) — the excess
+                        // beyond the close seeds a fresh average on the new side, since net qty
+                        // can jump straight past zero without ever equaling it exactly.
                         let sinceFlatBuyQty = 0, sinceFlatSellQty = 0, sinceFlatBuyValue = 0, sinceFlatSellValue = 0;
 
                         for (const pt of prevTrades) {
@@ -148,19 +153,26 @@ const processPendingOrders = async () => {
                                 }
                             }
 
-                            netQtyFromPrev += isBuy ? qty : -qty;
+                            const afterNetForFlat = prevNet + (isBuy ? qty : -qty);
+                            const crossedFlat = (prevNet > 0 && afterNetForFlat <= 0) || (prevNet < 0 && afterNetForFlat >= 0);
 
-                            if (isBuy) {
+                            if (crossedFlat) {
+                                sinceFlatBuyQty = 0; sinceFlatSellQty = 0;
+                                sinceFlatBuyValue = 0; sinceFlatSellValue = 0;
+                                if (afterNetForFlat !== 0) {
+                                    const excessQty = Math.abs(afterNetForFlat);
+                                    if (isBuy) { sinceFlatBuyQty = excessQty; sinceFlatBuyValue = excessQty * price; }
+                                    else { sinceFlatSellQty = excessQty; sinceFlatSellValue = excessQty * price; }
+                                }
+                            } else if (isBuy) {
                                 sinceFlatBuyQty += qty;
                                 sinceFlatBuyValue += qty * price;
                             } else {
                                 sinceFlatSellQty += qty;
                                 sinceFlatSellValue += qty * price;
                             }
-                            if (netQtyFromPrev === 0) {
-                                sinceFlatBuyQty = 0; sinceFlatSellQty = 0;
-                                sinceFlatBuyValue = 0; sinceFlatSellValue = 0;
-                            }
+
+                            netQtyFromPrev += isBuy ? qty : -qty;
                         }
 
                         // Compute FIFO P&L for this closing trade

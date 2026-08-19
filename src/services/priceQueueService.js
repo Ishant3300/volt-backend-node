@@ -48,8 +48,8 @@ const publishPriceUpdate = async (instrumentToken, livePrice) => {
 };
 
 /**
- * Average buy/sell state for the CURRENTLY open position only — resets the
- * moment net quantity last returned to exactly 0, rather than summing every
+ * Average buy/sell state for the CURRENTLY open position only — resets
+ * whenever net quantity crosses or lands on 0, rather than summing every
  * completed trade since last settlement.
  *
  * Bug this fixes: the previous plain aggregate (still used by the wallet
@@ -64,10 +64,15 @@ const publishPriceUpdate = async (instrumentToken, livePrice) => {
  * showed P&L +3171.00 — only explainable by an implied avgBuy of 57704.30,
  * meaning at least one other buy fill (not the one shown) was blended in.
  *
- * Walking the trade list chronologically and resetting the running totals
- * every time net quantity hits 0 keeps the average scoped to only the
- * fills that built the position CURRENTLY open (or just being closed),
- * matching what a trader actually sees as "their" entry price.
+ * Handles a same-trade flip (a single fill larger than the current net
+ * position, closing it AND opening the opposite side in one row — this
+ * platform allows that; order size is only capped at the current position
+ * when an admin has disabled the instrument, not in general) by splitting
+ * that trade's quantity: whatever closes the old side is discarded along
+ * with all of that side's prior history, and only the EXCESS beyond the
+ * close seeds the new side's average, at this trade's own price. A plain
+ * `netQty === 0` check alone would miss this — quantity can jump straight
+ * past zero to the opposite sign in one trade without ever equaling it.
  */
 async function positionStateSinceLastFlat(userId, instrumentToken, session) {
   const trades = await Trade.find({
@@ -86,24 +91,33 @@ async function positionStateSinceLastFlat(userId, instrumentToken, session) {
   for (const t of trades) {
     const qty = Number(t.executed_quantity || 0);
     const price = Number(t.executed_price || 0);
-    if (t.transaction_type === 'BUY') {
-      totalBuyQty += qty;
-      totalBuyValue += qty * price;
-      netQty += qty;
-    } else {
-      totalSellQty += qty;
-      totalSellValue += qty * price;
-      netQty -= qty;
-    }
-    // Position fully closed at this fill — everything before it is a
-    // separate, already-completed round trip and must not bleed into the
-    // average for whatever opens next.
-    if (netQty === 0) {
+    const isBuy = t.transaction_type === 'BUY';
+    const prevNetQty = netQty;
+    const afterNetQty = prevNetQty + (isBuy ? qty : -qty);
+    const crossedFlat = (prevNetQty > 0 && afterNetQty <= 0) || (prevNetQty < 0 && afterNetQty >= 0);
+
+    if (crossedFlat) {
       totalBuyQty = 0;
       totalSellQty = 0;
       totalBuyValue = 0;
       totalSellValue = 0;
+      if (afterNetQty !== 0) {
+        // Flipped straight through zero — the excess beyond the close is a
+        // brand new position on the opposite side, priced at this trade's
+        // own execution price.
+        const excessQty = Math.abs(afterNetQty);
+        if (isBuy) { totalBuyQty = excessQty; totalBuyValue = excessQty * price; }
+        else { totalSellQty = excessQty; totalSellValue = excessQty * price; }
+      }
+    } else if (isBuy) {
+      totalBuyQty += qty;
+      totalBuyValue += qty * price;
+    } else {
+      totalSellQty += qty;
+      totalSellValue += qty * price;
     }
+
+    netQty = afterNetQty;
   }
 
   return { totalBuyQty, totalSellQty, totalBuyValue, totalSellValue };
