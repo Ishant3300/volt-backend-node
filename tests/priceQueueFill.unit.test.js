@@ -25,6 +25,7 @@ jest.mock('../src/services/firebaseService', () => ({ sendNotification: jest.fn(
 jest.mock('../src/services/metricsEngine', () => ({ getFreshMetrics: jest.fn(), onTradeExecuted: jest.fn() }));
 jest.mock('../src/services/orderBookService', () => ({ getMatchingBuyOrders: jest.fn(), getMatchingSellOrders: jest.fn(), removeMany: jest.fn() }));
 jest.mock('../src/services/redisService', () => ({ isAvailable: jest.fn(), getClient: jest.fn() }));
+jest.mock('../src/services/livePriceService', () => ({ broadcastToUser: jest.fn() }));
 
 const mongoose = require('mongoose');
 const Trade = require('../src/models/Trade');
@@ -34,9 +35,10 @@ const BrokerageSettings = require('../src/models/BrokerageSettings');
 const walletService = require('../src/services/walletService');
 const { beginTradeWrite } = require('../src/services/tradeWriteFenceService');
 const { calculateMargin } = require('../src/services/marginService');
+const orderBookService = require('../src/services/orderBookService');
 const priceQueueService = require('../src/services/priceQueueService');
 
-const { executeMatchedOrder } = priceQueueService._private;
+const { executeMatchedOrder, _processJob } = priceQueueService._private;
 
 let fakeSession;
 
@@ -229,5 +231,43 @@ describe('executeMatchedOrder — category wallet block/release at fill time', (
     expect(trade.pnl).toBeCloseTo((110 - 90) * 5, 2); // avgSell must be 110 (the flip price), not blended with the old long's 100
     expect(walletService.release).toHaveBeenCalledWith('User', 'user1', 'NSE', 5 * 110, fakeSession);
     expect(outcome.kind).toBe('completed');
+  });
+});
+
+describe('_processJob — one matched order failing does not abort the rest of the batch', () => {
+  test('a failing sibling order does not block cleanup for orders that succeeded in the same price tick', async () => {
+    // Regression test for a real bug: a single price tick can match several
+    // pending orders at once. The old code re-threw on the FIRST failure,
+    // aborting the loop entirely — so any order that had already executed
+    // successfully earlier in that same batch never reached the
+    // removeMany() cleanup below, leaving it stuck in the Redis order book
+    // (re-matched and harmlessly no-op'd on every later tick, but never
+    // actually cleaned up, until the next market-close sweep).
+    const tradeA = makeTradeDoc({ _id: 'tradeA', transaction_type: 'BUY', quantity: 2, price: 25000, user_id: 'userA' });
+
+    Trade.findById.mockImplementation((id) => {
+      if (id === 'tradeA') return sessionResolving(tradeA);
+      // Simulates tradeB failing for any reason (insufficient funds, a data
+      // issue, a transient DB error) partway through its own execution.
+      if (id === 'tradeB') return { session: jest.fn().mockRejectedValue(new Error('Simulated failure for tradeB')) };
+      return sessionResolving(null);
+    });
+    Trade.find.mockReturnValue(priorTrades([])); // flat book for tradeA
+    walletService.getAvailable.mockResolvedValue({ NSE: 100000, MCX: 0, GLOBAL: 0 });
+
+    orderBookService.getMatchingBuyOrders.mockResolvedValue(['tradeA', 'tradeB']);
+    orderBookService.getMatchingSellOrders.mockResolvedValue([]);
+
+    // Must not throw — one bad order in the batch must not crash the whole tick.
+    await expect(_processJob({ data: { instrument_token: 111, live_price: 24990 } })).resolves.toBeUndefined();
+
+    // tradeA executed successfully...
+    expect(walletService.block).toHaveBeenCalledWith('User', 'userA', 'NSE', 50000, expect.anything());
+    // ...and still gets cleaned out of the order book, despite tradeB's failure.
+    expect(orderBookService.removeMany).toHaveBeenCalledWith(111, 'BUY', ['tradeA']);
+    // tradeB itself is left OUT of cleanup — it stays pending for a retry
+    // on the next tick, not silently dropped or wrongly marked done.
+    const removedIds = orderBookService.removeMany.mock.calls.flatMap((call) => call[2]);
+    expect(removedIds).not.toContain('tradeB');
   });
 });

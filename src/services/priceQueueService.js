@@ -411,7 +411,22 @@ const _processJob = async job => {
   console.log(`⚡ [PriceQueue] Token ${instrument_token} @ ${live_price} → ${matches.length} order(s) to execute`);
   const executedBuys = [];
   const executedSells = [];
+  let failedCount = 0;
   for (const match of matches) {
+    // Each match gets its own try/catch that does NOT re-throw. Previously
+    // one order's failure (insufficient funds, a data issue, anything)
+    // threw out of the whole loop — aborting every OTHER match in this same
+    // batch too, including ones that had already executed successfully a
+    // few lines above. Since the throw happened before reaching the
+    // removeMany() cleanup below, those already-executed orders never got
+    // removed from the Redis order book either, leaving them "stuck" —
+    // every later price tick would re-match and re-attempt them
+    // (harmlessly no-op via the idempotency check, since their trade is no
+    // longer 'pending', but never actually cleaned up) until the next
+    // market-close sweep. A failure now only affects the ONE order that
+    // failed — it's simply left out of the cleanup list, so it stays in
+    // the order book and gets a fair retry on the next price tick, same as
+    // the existing per-order retry behavior already documented elsewhere.
     try {
       const outcome = await executeMatchedOrder(match, live_price);
       if (['unchanged', 'cancelled', 'rejected', 'completed'].includes(outcome.kind)) {
@@ -419,11 +434,14 @@ const _processJob = async job => {
       }
       await notifyOutcome(outcome, live_price);
     } catch (error) {
+      failedCount++;
       if (error.code !== 'SETTLEMENT_IN_PROGRESS') {
         console.error(`❌ [PriceQueue] Execution error for trade ${match.id}: ${error.message}`);
       }
-      throw error;
     }
+  }
+  if (failedCount > 0) {
+    console.log(`⚠️  [PriceQueue] Token ${instrument_token} @ ${live_price} → ${failedCount}/${matches.length} order(s) failed this tick, left pending for retry`);
   }
 
   if (executedBuys.length > 0) await orderBookService.removeMany(instrument_token, 'BUY', executedBuys);
@@ -466,5 +484,5 @@ module.exports = {
   init,
   publishPriceUpdate,
   shutdown,
-  _private: { executeMatchedOrder, positionStateSinceLastFlat, realisedPnlFor },
+  _private: { executeMatchedOrder, positionStateSinceLastFlat, realisedPnlFor, _processJob },
 };
