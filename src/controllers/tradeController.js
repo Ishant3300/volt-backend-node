@@ -12,7 +12,7 @@ const orderBookService = require('../services/orderBookService');
 const { calculateMargin } = require('../services/marginService');
 const walletService = require('../services/walletService');
 const { categoryForSegment } = require('../utils/walletCategory');
-const { computeWalletSplit } = require('../utils/walletSplit');
+const { computeWalletSplit, computeFlatResetState } = require('../utils/walletSplit');
 const firebaseService = require('../services/firebaseService');
 const { beginTradeWrite, withTradeWriteLease } = require('../services/tradeWriteFenceService');
 
@@ -37,19 +37,30 @@ const _getLivePricesFromKite = async (instrumentTokens) => {
  */
 const _computeUserFloatingPnl = async (userId, session) => {
     try {
-        const trades = await Trade.aggregate([
-            { $match: { user_id: userId, status: 'completed', deleted_at: null } },
-            { $group: {
-                _id: '$instrument_token',
-                total_buy_qty: { $sum: { $cond: [{ $eq: ['$transaction_type', 'BUY'] }, '$executed_quantity', 0] } },
-                total_sell_qty: { $sum: { $cond: [{ $eq: ['$transaction_type', 'SELL'] }, '$executed_quantity', 0] } },
-                total_buy_value: { $sum: { $cond: [{ $eq: ['$transaction_type', 'BUY'] }, { $multiply: ['$executed_quantity', '$executed_price'] }, 0] } },
-                total_sell_value: { $sum: { $cond: [{ $eq: ['$transaction_type', 'SELL'] }, { $multiply: ['$executed_quantity', '$executed_price'] }, 0] } },
-            }}
-        ]).session(session);
+        // Fetch all completed trades once, chronologically, and derive each
+        // instrument's average-cost state with a flat-reset walk
+        // (computeFlatResetState) instead of a single unbounded aggregate —
+        // an account that closed and reopened the same contract earlier in
+        // the settlement week previously got a contaminated average for the
+        // position that's open right now.
+        const trades = await Trade.find({ user_id: userId, status: 'completed', deleted_at: null })
+            .select('instrument_token transaction_type executed_quantity executed_price executed_at createdAt')
+            .sort({ executed_at: 1, createdAt: 1 })
+            .session(session)
+            .lean();
 
-        // Filter to open positions only
-        const openPositions = trades.filter(t => (t.total_buy_qty - t.total_sell_qty) !== 0);
+        const byInstrument = new Map();
+        for (const t of trades) {
+            const token = t.instrument_token.toString();
+            if (!byInstrument.has(token)) byInstrument.set(token, []);
+            byInstrument.get(token).push(t);
+        }
+
+        const openPositions = [];
+        for (const [token, instrumentTrades] of byInstrument) {
+            const state = computeFlatResetState(instrumentTrades);
+            if (state.netQty !== 0) openPositions.push({ _id: token, ...state });
+        }
         if (openPositions.length === 0) return 0;
 
         // Fetch live prices for open position tokens
@@ -58,9 +69,9 @@ const _computeUserFloatingPnl = async (userId, session) => {
 
         let totalFloating = 0;
         for (const pos of openPositions) {
-            const netQty = pos.total_buy_qty - pos.total_sell_qty;
-            const avgBuy = pos.total_buy_qty > 0 ? pos.total_buy_value / pos.total_buy_qty : 0;
-            const avgSell = pos.total_sell_qty > 0 ? pos.total_sell_value / pos.total_sell_qty : 0;
+            const netQty = pos.netQty;
+            const avgBuy = pos.totalBuyQty > 0 ? pos.totalBuyValue / pos.totalBuyQty : 0;
+            const avgSell = pos.totalSellQty > 0 ? pos.totalSellValue / pos.totalSellQty : 0;
             const ltp = ltpMap.get(parseInt(pos._id)) || ltpMap.get(pos._id.toString()) || (netQty > 0 ? avgBuy : avgSell);
 
             if (netQty > 0) totalFloating += (ltp - avgBuy) * netQty;
@@ -468,18 +479,19 @@ const placeTrade = async (req, res) => {
                     if (order_type === 'MARKET') {
                         console.log(`🔒 [FSL] Checking time restriction: instrument=${instrumentRawName}, segment=${normalizedSeg}, time_minutes=${fslLimit.time_minutes}, cmp=${cmpFSL}`);
                         if (fslLimit.time_minutes > 0) {
-                            const posAggFSL = await Trade.aggregate([
-                                { $match: { user_id: user._id, instrument_token, status: 'completed', deleted_at: null } },
-                                { $group: {
-                                    _id: null,
-                                    total_buy_qty: { $sum: { $cond: [{ $eq: ['$transaction_type', 'BUY'] }, '$executed_quantity', 0] } },
-                                    total_sell_qty: { $sum: { $cond: [{ $eq: ['$transaction_type', 'SELL'] }, '$executed_quantity', 0] } },
-                                    total_buy_value: { $sum: { $cond: [{ $eq: ['$transaction_type', 'BUY'] }, { $multiply: ['$executed_price', '$executed_quantity'] }, 0] } },
-                                    total_sell_value: { $sum: { $cond: [{ $eq: ['$transaction_type', 'SELL'] }, { $multiply: ['$executed_price', '$executed_quantity'] }, 0] } }
-                                }}
-                            ]).session(session);
+                            // Flat-reset average (computeFlatResetState) instead of a plain
+                            // unbounded aggregate — this decides whether a real order gets
+                            // BLOCKED or ALLOWED, so a stale average from an earlier, already-
+                            // closed round trip this week could wrongly gate a live order, not
+                            // just show a wrong number after the fact.
+                            const prevTradesFSL = await Trade.find({ user_id: user._id, instrument_token, status: 'completed', deleted_at: null })
+                                .select('transaction_type executed_quantity executed_price executed_at createdAt')
+                                .sort({ executed_at: 1, createdAt: 1 })
+                                .session(session)
+                                .lean();
+                            const stateFSL = computeFlatResetState(prevTradesFSL);
 
-                            const currentNetQty = posAggFSL.length > 0 ? posAggFSL[0].total_buy_qty - posAggFSL[0].total_sell_qty : 0;
+                            const currentNetQty = stateFSL.netQty;
                             const isClosing = (transaction_type === 'SELL' && currentNetQty > 0) ||
                                               (transaction_type === 'BUY' && currentNetQty < 0);
 
@@ -488,20 +500,18 @@ const placeTrade = async (req, res) => {
                                 // BUY position: profit if bid > avg buy (exit = sell at bid)
                                 // SELL position: profit if ask < avg sell (exit = buy at ask)
                                 let positionInProfit = false;
-                                if (posAggFSL.length > 0) {
-                                    const avgBuy = posAggFSL[0].total_buy_qty > 0 ? posAggFSL[0].total_buy_value / posAggFSL[0].total_buy_qty : 0;
-                                    const avgSell = posAggFSL[0].total_sell_qty > 0 ? posAggFSL[0].total_sell_value / posAggFSL[0].total_sell_qty : 0;
-                                    if (currentNetQty > 0 && bidFSL && bidFSL > 0) {
-                                        // Long position: profit if bid > avg buy
-                                        positionInProfit = bidFSL > avgBuy;
-                                    } else if (currentNetQty < 0 && askFSL && askFSL > 0) {
-                                        // Short position: profit if ask < avg sell
-                                        positionInProfit = askFSL < avgSell;
-                                    }
+                                const avgBuyFSL = stateFSL.totalBuyQty > 0 ? stateFSL.totalBuyValue / stateFSL.totalBuyQty : 0;
+                                const avgSellFSL = stateFSL.totalSellQty > 0 ? stateFSL.totalSellValue / stateFSL.totalSellQty : 0;
+                                if (currentNetQty > 0 && bidFSL && bidFSL > 0) {
+                                    // Long position: profit if bid > avg buy
+                                    positionInProfit = bidFSL > avgBuyFSL;
+                                } else if (currentNetQty < 0 && askFSL && askFSL > 0) {
+                                    // Short position: profit if ask < avg sell
+                                    positionInProfit = askFSL < avgSellFSL;
                                 }
 
                                 // Only apply time restriction if position is in profit
-                                console.log(`🔒 [FSL] netQty=${currentNetQty}, isClosing=${isClosing}, positionInProfit=${positionInProfit}, bid=${bidFSL}, ask=${askFSL}, ltp=${ltpFSL}, avgBuy=${posAggFSL[0]?.total_buy_qty > 0 ? posAggFSL[0].total_buy_value / posAggFSL[0].total_buy_qty : 0}, avgSell=${posAggFSL[0]?.total_sell_qty > 0 ? posAggFSL[0].total_sell_value / posAggFSL[0].total_sell_qty : 0}`);
+                                console.log(`🔒 [FSL] netQty=${currentNetQty}, isClosing=${isClosing}, positionInProfit=${positionInProfit}, bid=${bidFSL}, ask=${askFSL}, ltp=${ltpFSL}, avgBuy=${avgBuyFSL}, avgSell=${avgSellFSL}`);
                                 if (positionInProfit) {
                                     const oppositeType = transaction_type === 'SELL' ? 'BUY' : 'SELL';
                                     const lastOpeningTrade = await Trade.findOne({
@@ -747,54 +757,30 @@ const placeTrade = async (req, res) => {
 
             // 3. Calculate realised P&L if this trade closes (or partially closes) a position
             let tradeRealisedPnl = 0;
-            let existingAgg = [];
+            // Flat-reset average-cost state (computeFlatResetState) — shared below with the
+            // margin/wallet block, since both need the same "position before this trade"
+            // state and there's no trade mutation in between. Was previously a plain
+            // unbounded aggregate with no reset when the position last returned to flat,
+            // which blended an already-closed prior round trip into this trade's average —
+            // confirmed against a real trade (BUY 30 @ 57562.60 -> SELL 30 @ 57810.00 showed
+            // P&L +3171.00 instead of the correct 7422.00).
+            let flatResetState = { netQty: 0, totalBuyQty: 0, totalSellQty: 0, totalBuyValue: 0, totalSellValue: 0 };
             if (shouldExecuteNow) {
-                // Aggregate all previous trades for average price and net position
-                existingAgg = await Trade.aggregate([
-                    {
-                        $match: {
-                            user_id: user._id,
-                            instrument_token: instrument_token,
-                            status: 'completed',
-                            deleted_at: null
-                        }
-                    },
-                    {
-                        $group: {
-                            _id: null,
-                            total_buy_qty: {
-                                $sum: { $cond: [{ $eq: ['$transaction_type', 'BUY'] }, '$executed_quantity', 0] }
-                            },
-                            total_sell_qty: {
-                                $sum: { $cond: [{ $eq: ['$transaction_type', 'SELL'] }, '$executed_quantity', 0] }
-                            },
-                            total_buy_value: {
-                                $sum: {
-                                    $cond: [
-                                        { $eq: ['$transaction_type', 'BUY'] },
-                                        { $multiply: ['$executed_quantity', '$executed_price'] },
-                                        0
-                                    ]
-                                }
-                            },
-                            total_sell_value: {
-                                $sum: {
-                                    $cond: [
-                                        { $eq: ['$transaction_type', 'SELL'] },
-                                        { $multiply: ['$executed_quantity', '$executed_price'] },
-                                        0
-                                    ]
-                                }
-                            }
-                        }
-                    }
-                ]).session(session);
+                const prevTradesForFill = await Trade.find({
+                    user_id: user._id,
+                    instrument_token: instrument_token,
+                    status: 'completed',
+                    deleted_at: null
+                })
+                    .select('transaction_type executed_quantity executed_price executed_at createdAt')
+                    .sort({ executed_at: 1, createdAt: 1 })
+                    .session(session)
+                    .lean();
+                flatResetState = computeFlatResetState(prevTradesForFill);
 
-                // Calculate P&L using Average Price method
-                const agg = existingAgg.length > 0 ? existingAgg[0] : { total_buy_qty: 0, total_sell_qty: 0, total_buy_value: 0, total_sell_value: 0 };
-                const netQtyFromPrev = agg.total_buy_qty - agg.total_sell_qty;
-                const avgBuyPrice = agg.total_buy_qty > 0 ? agg.total_buy_value / agg.total_buy_qty : 0;
-                const avgSellPrice = agg.total_sell_qty > 0 ? agg.total_sell_value / agg.total_sell_qty : 0;
+                const netQtyFromPrev = flatResetState.netQty;
+                const avgBuyPrice = flatResetState.totalBuyQty > 0 ? flatResetState.totalBuyValue / flatResetState.totalBuyQty : 0;
+                const avgSellPrice = flatResetState.totalSellQty > 0 ? flatResetState.totalSellValue / flatResetState.totalSellQty : 0;
 
                 if (transaction_type === 'SELL' && netQtyFromPrev > 0) {
                     // Closing a long: P&L = (sell price - avg buy price) × closing qty
@@ -839,11 +825,8 @@ const placeTrade = async (req, res) => {
 
             // Calculate margin impact and update balance
             if (shouldExecuteNow) {
-                // Determine previous net qty for this instrument
-                let prevNetQtyForMargin = 0;
-                if (existingAgg && existingAgg.length > 0) {
-                    prevNetQtyForMargin = existingAgg[0].total_buy_qty - existingAgg[0].total_sell_qty;
-                }
+                // Same state computed above for the P&L calc — no second query needed.
+                const prevNetQtyForMargin = flatResetState.netQty;
                 const isBuy = transaction_type === 'BUY';
                 const newNetQty = prevNetQtyForMargin + (isBuy ? quantity : -quantity);
 
@@ -858,11 +841,10 @@ const placeTrade = async (req, res) => {
                     // maps GLOBAL→INDICES for the legacy ScriptQuantity lookups).
                     const walletCategory = categoryForSegment(segment || exchange || '');
 
-                    const walletAgg = existingAgg && existingAgg.length > 0 ? existingAgg[0] : null;
-                    const walletAvgBuy = walletAgg && walletAgg.total_buy_qty > 0
-                        ? walletAgg.total_buy_value / walletAgg.total_buy_qty : 0;
-                    const walletAvgSell = walletAgg && walletAgg.total_sell_qty > 0
-                        ? walletAgg.total_sell_value / walletAgg.total_sell_qty : 0;
+                    const walletAvgBuy = flatResetState.totalBuyQty > 0
+                        ? flatResetState.totalBuyValue / flatResetState.totalBuyQty : 0;
+                    const walletAvgSell = flatResetState.totalSellQty > 0
+                        ? flatResetState.totalSellValue / flatResetState.totalSellQty : 0;
 
                     const { closingQty: walletClosingQty, openingQty: walletOpeningQty } =
                         computeWalletSplit(prevNetQtyForMargin, transaction_type, quantity);
@@ -1424,45 +1406,36 @@ const deleteTrade = async (req, res) => {
                 const walletCategory = categoryForSegment(trade.exchange || '');
                 const userId = trade.user_id;
 
-                // Aggregate current position INCLUDING the trade being deleted
-                const currentAgg = await Trade.aggregate([
-                    { $match: { user_id: userId, instrument_token: trade.instrument_token, status: 'completed', deleted_at: null } },
-                    { $group: {
-                        _id: null,
-                        total_buy_qty: { $sum: { $cond: [{ $eq: ['$transaction_type', 'BUY'] }, '$executed_quantity', 0] } },
-                        total_sell_qty: { $sum: { $cond: [{ $eq: ['$transaction_type', 'SELL'] }, '$executed_quantity', 0] } },
-                        total_buy_value: { $sum: { $cond: [{ $eq: ['$transaction_type', 'BUY'] }, { $multiply: ['$executed_quantity', '$executed_price'] }, 0] } },
-                        total_sell_value: { $sum: { $cond: [{ $eq: ['$transaction_type', 'SELL'] }, { $multiply: ['$executed_quantity', '$executed_price'] }, 0] } },
-                    }}
-                ]);
+                // Fetch every completed trade for this (user, instrument) once,
+                // chronologically, and derive both "current" (including the trade
+                // being deleted) and "after" (excluding it) states with the same
+                // flat-reset walk used everywhere else P&L/wallet basis is
+                // computed — a plain unbounded aggregate here had the same
+                // contamination risk as everywhere else: an already-closed prior
+                // round trip blending into the average for whatever's open now.
+                const allInstrumentTrades = await Trade.find({
+                    user_id: userId, instrument_token: trade.instrument_token, status: 'completed', deleted_at: null
+                })
+                    .select('_id transaction_type executed_quantity executed_price executed_at createdAt')
+                    .sort({ executed_at: 1, createdAt: 1 })
+                    .lean();
 
-                // Aggregate AFTER deletion (exclude this trade)
-                const afterAgg = await Trade.aggregate([
-                    { $match: { user_id: userId, instrument_token: trade.instrument_token, status: 'completed', deleted_at: null, _id: { $ne: trade._id } } },
-                    { $group: {
-                        _id: null,
-                        total_buy_qty: { $sum: { $cond: [{ $eq: ['$transaction_type', 'BUY'] }, '$executed_quantity', 0] } },
-                        total_sell_qty: { $sum: { $cond: [{ $eq: ['$transaction_type', 'SELL'] }, '$executed_quantity', 0] } },
-                        total_buy_value: { $sum: { $cond: [{ $eq: ['$transaction_type', 'BUY'] }, { $multiply: ['$executed_quantity', '$executed_price'] }, 0] } },
-                        total_sell_value: { $sum: { $cond: [{ $eq: ['$transaction_type', 'SELL'] }, { $multiply: ['$executed_quantity', '$executed_price'] }, 0] } },
-                    }}
-                ]);
-
-                const cur = currentAgg.length > 0 ? currentAgg[0] : { total_buy_qty: 0, total_sell_qty: 0, total_buy_value: 0, total_sell_value: 0 };
-                const aft = afterAgg.length > 0 ? afterAgg[0] : { total_buy_qty: 0, total_sell_qty: 0, total_buy_value: 0, total_sell_value: 0 };
+                const deletedTradeId = trade._id.toString();
+                const cur = computeFlatResetState(allInstrumentTrades);
+                const aft = computeFlatResetState(allInstrumentTrades.filter(t => t._id.toString() !== deletedTradeId));
 
                 // Current blocked = |currentNetQty| × avgEntryPrice
-                const curNetQty = cur.total_buy_qty - cur.total_sell_qty;
+                const curNetQty = cur.netQty;
                 const curAvgEntry = curNetQty > 0
-                    ? (cur.total_buy_qty > 0 ? cur.total_buy_value / cur.total_buy_qty : 0)
-                    : (cur.total_sell_qty > 0 ? cur.total_sell_value / cur.total_sell_qty : 0);
+                    ? (cur.totalBuyQty > 0 ? cur.totalBuyValue / cur.totalBuyQty : 0)
+                    : (cur.totalSellQty > 0 ? cur.totalSellValue / cur.totalSellQty : 0);
                 const currentBlocked = Math.abs(curNetQty) * curAvgEntry;
 
                 // After blocked = |afterNetQty| × avgEntryPrice (after removing this trade)
-                const aftNetQty = aft.total_buy_qty - aft.total_sell_qty;
+                const aftNetQty = aft.netQty;
                 const aftAvgEntry = aftNetQty > 0
-                    ? (aft.total_buy_qty > 0 ? aft.total_buy_value / aft.total_buy_qty : 0)
-                    : (aft.total_sell_qty > 0 ? aft.total_sell_value / aft.total_sell_qty : 0);
+                    ? (aft.totalBuyQty > 0 ? aft.totalBuyValue / aft.totalBuyQty : 0)
+                    : (aft.totalSellQty > 0 ? aft.totalSellValue / aft.totalSellQty : 0);
                 const afterBlocked = Math.abs(aftNetQty) * aftAvgEntry;
 
                 // Release the difference (if current > after, funds should be freed)

@@ -40,4 +40,71 @@ function computeWalletSplit(prevNetQty, transactionType, quantity) {
   return { closingQty, openingQty };
 }
 
-module.exports = { computeWalletSplit };
+/**
+ * Average-cost position state for the CURRENTLY open position only — walks a
+ * chronologically-sorted trade list and resets the running buy/sell totals
+ * whenever net quantity crosses or lands on 0, instead of summing every
+ * completed trade since last settlement regardless of whether the position
+ * was fully closed and reopened in between.
+ *
+ * Real bug this fixes: an account that closes and reopens the same
+ * contract more than once within a settlement week — completely normal
+ * for an active trader — got its average entry price silently blended
+ * with an earlier, already-closed round trip. Confirmed against a real
+ * trade: BUY 30 @ 57562.60 -> SELL 30 @ 57810.00 showed P&L +3171.00
+ * instead of the correct 7422.00, only explainable by a stale prior
+ * fill leaking into the average.
+ *
+ * Also handles a same-trade flip (one fill larger than the current net
+ * position, closing it AND opening the opposite side in one row — this
+ * platform allows that in general; order size is only capped at the
+ * current position when an admin has disabled the instrument) by seeding
+ * the new side's average from just the excess beyond the close, at that
+ * trade's own price, since net quantity can jump straight past zero
+ * without ever landing on it exactly.
+ *
+ * This is the single shared implementation backing the equivalent logic
+ * already independently verified in priceQueueService.js
+ * (positionStateSinceLastFlat) and orderExecutionService.js — pulled out
+ * here for tradeController.js's four separate call sites (immediate-fill
+ * P&L, floating P&L, the FSL profit check, and deleteTrade's wallet
+ * reversal) rather than re-implementing it a fourth, fifth, sixth and
+ * seventh time inline.
+ *
+ * @param {Array<{transaction_type: 'BUY'|'SELL', executed_quantity: number, executed_price: number}>} trades - chronologically sorted, oldest first
+ * @returns {{netQty: number, totalBuyQty: number, totalSellQty: number, totalBuyValue: number, totalSellValue: number}}
+ */
+function computeFlatResetState(trades) {
+  let netQty = 0;
+  let totalBuyQty = 0, totalSellQty = 0, totalBuyValue = 0, totalSellValue = 0;
+
+  for (const t of trades) {
+    const isBuy = t.transaction_type === 'BUY';
+    const qty = Number(t.executed_quantity) || 0;
+    const price = Number(t.executed_price) || 0;
+    const prevNet = netQty;
+    const afterNet = prevNet + (isBuy ? qty : -qty);
+    const crossedFlat = (prevNet > 0 && afterNet <= 0) || (prevNet < 0 && afterNet >= 0);
+
+    if (crossedFlat) {
+      totalBuyQty = 0; totalSellQty = 0; totalBuyValue = 0; totalSellValue = 0;
+      if (afterNet !== 0) {
+        const excessQty = Math.abs(afterNet);
+        if (isBuy) { totalBuyQty = excessQty; totalBuyValue = excessQty * price; }
+        else { totalSellQty = excessQty; totalSellValue = excessQty * price; }
+      }
+    } else if (isBuy) {
+      totalBuyQty += qty;
+      totalBuyValue += qty * price;
+    } else {
+      totalSellQty += qty;
+      totalSellValue += qty * price;
+    }
+
+    netQty = afterNet;
+  }
+
+  return { netQty, totalBuyQty, totalSellQty, totalBuyValue, totalSellValue };
+}
+
+module.exports = { computeWalletSplit, computeFlatResetState };
