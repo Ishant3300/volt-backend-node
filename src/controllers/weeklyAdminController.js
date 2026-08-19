@@ -13,11 +13,37 @@ const KiteInstrument = require('../models/KiteInstrument');
  * OPTIMIZED: Uses batch queries instead of N+1 per-user queries.
  * ~6 DB queries total regardless of user count.
  */
+/**
+ * Current settlement week boundaries: Monday 00:00 → now. Same Monday-start
+ * logic as weeklySummaryService.js's snapshot job, so "this week" means the
+ * same thing everywhere in the app.
+ */
+function currentWeekStart() {
+  const now = new Date();
+  const dayOfWeek = now.getDay(); // 0 = Sunday
+  const diffToMonday = dayOfWeek === 0 ? 6 : dayOfWeek - 1;
+  const weekStart = new Date(now);
+  weekStart.setDate(now.getDate() - diffToMonday);
+  weekStart.setHours(0, 0, 0, 0);
+  return weekStart;
+}
+
 const getWeeklyAdminReport = async (req, res) => {
   try {
     const role = req.admin ? 'admin' : 'master';
     const callerId = req.admin?.id || req.master?.id;
     const metricsEngine = require('../services/metricsEngine');
+
+    // Was previously unbounded (every completed trade ever, for every user
+    // in scope) despite this being a "weekly" report — the actual cause of
+    // this endpoint timing out as trade history grew. Defaults to the
+    // current settlement week, same as weeklySummaryService.js; callers can
+    // still override with ?date_from=&date_to= like every other trade-list
+    // endpoint in this codebase (masterTradeController.js, userController.js).
+    const { date_from, date_to } = req.query;
+    const executedAtFilter = {};
+    executedAtFilter.$gte = date_from ? new Date(date_from) : currentWeekStart();
+    if (date_to) executedAtFilter.$lte = new Date(date_to);
 
     // ═══════════════════════════════════════════════════════════════════════
     // PHASE 1: Batch-load ALL data upfront (~6 DB queries total)
@@ -90,12 +116,15 @@ const getWeeklyAdminReport = async (req, res) => {
       usersByMaster[mid].push(u);
     }
 
-    // 5. Load ALL trades for all users in scope
+    // 5. Load trades for all users in scope, scoped to the report window —
+    // uses the existing { user_id, status, deleted_at, executed_at } index
+    // (Trade.js line 161), which an unbounded query never hit.
     const allUserIds = allUsers.map(u => u._id);
     const allTrades = await Trade.find({
       user_id: { $in: allUserIds },
       status: 'completed',
-      deleted_at: null
+      deleted_at: null,
+      executed_at: executedAtFilter
     }).select('user_id instrument_token executed_price executed_quantity pnl').lean();
 
     // Group trades by user
