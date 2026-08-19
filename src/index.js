@@ -181,16 +181,24 @@ server.on('upgrade', (request, socket, head) => {
 // Open the HTTP listener only after all startup prerequisites are ready.
 const PORT = process.env.PORT || 5000;
 const startServer = async () => {
-  await connectDatabase();
-  await livePriceService._preloadSettlementPrices();
+  const _t0 = Date.now();
+  const _ts = (label) => console.log(`⏱️  [${((Date.now() - _t0) / 1000).toFixed(2)}s] ${label}`);
 
-  // Pre-warm instrument search cache (await so it's ready before first search)
-  try {
-    const instrumentSearchService = require('./services/instrumentSearchService');
-    await instrumentSearchService.loadInstrumentCache();
-    console.log('🔥 Instrument search cache warmed');
-  } catch (err) {
-    console.error('⚠️  Failed to warm instrument cache:', err.message);
+  _ts('Starting server...');
+
+  await connectDatabase();
+  _ts('Database connected + indexes synced');
+
+  // Run settlement price preload and instrument search cache in PARALLEL —
+  // both load from KiteInstrument independently with no shared state.
+  const instrumentSearchService = require('./services/instrumentSearchService');
+  const [, searchCacheResult] = await Promise.allSettled([
+    livePriceService._preloadSettlementPrices(),
+    instrumentSearchService.loadInstrumentCache(),
+  ]);
+  _ts('Settlement prices + instrument search cache loaded (parallel)');
+  if (searchCacheResult.status === 'rejected') {
+    console.error('⚠️  Failed to warm instrument cache:', searchCacheResult.reason?.message);
   }
 
   // Initialize Redis and wait for readiness before selecting the order engine.
@@ -201,12 +209,13 @@ const startServer = async () => {
       await new Promise(resolve => setTimeout(resolve, 500));
       if (redisService.isAvailable()) break;
     }
+    _ts(`Redis ready: ${redisService.isAvailable()}`);
 
     if (redisService.isAvailable()) {
       // Bootstrap Redis state, but do not start BullMQ consumers until missed
       // settlement recovery has materialized/fenced the latest Friday.
       await orderBookService.syncFromDatabase();
-      console.log('🚀 Redis Order Book reconciled; BullMQ worker deferred until settlement recovery');
+      _ts('Redis Order Book synced from DB');
     } else {
       console.log('⚠️  Redis not available – using DB-polling fallback for limit orders');
     }
@@ -217,9 +226,12 @@ const startServer = async () => {
   // These services are readiness-critical; failures must abort startup.
   const syntheticInstrumentService = require('./services/syntheticInstrumentService');
   await syntheticInstrumentService.init(livePriceService);
+  _ts('Synthetic instrument service ready');
 
   const metricsEngine = require('./services/metricsEngine');
   await metricsEngine.init(livePriceService);
+  _ts('MetricsEngine initialized (all user caches built)');
+
   await metricsEngine.scheduleMidnightAudit();
 
   // Reconcile an interrupted run (or a missed weekend run after a restart)
@@ -233,6 +245,7 @@ const startServer = async () => {
     if (recovery.recovered || recovery.ensuredCurrentPeriod) {
       console.log(`[Settlement] Startup reconciliation: ${recovery.message || recovery.periodKey || 'completed'}`);
     }
+    _ts('Settlement recovery complete');
   } catch (error) {
     console.error(`[Settlement] Startup reconciliation could not establish a durable fence: ${error.message}`);
     throw error;
@@ -244,7 +257,7 @@ const startServer = async () => {
   // run remains visible to beginTradeWrite() and causes jobs to retry safely.
   if (!bgDisabled && redisService.isAvailable()) {
     await priceQueueService.init();
-    console.log('🚀 Redis Order Book + BullMQ Price Queue active');
+    _ts('BullMQ Price Queue initialized');
   }
 
   // Initialize margin square-off monitoring and background jobs.
@@ -252,6 +265,7 @@ const startServer = async () => {
     const marginSquareOffService = require('./services/marginSquareOffService');
     await marginSquareOffService.init(livePriceService);
     await cronService.init();
+    _ts('Margin square-off + cron jobs initialized');
   } else {
     console.log('⏭️  Background services DISABLED (DISABLE_BG_SERVICES=true)');
   }
@@ -281,15 +295,19 @@ const startServer = async () => {
       console.error('❌ Error during Kite authentication:', error.message);
       console.log('💡 You can manually login at: http://localhost:' + PORT + '/api/kite/login');
     }
+    _ts('Kite auth complete');
 
     await livePriceService._connectToKite();
+    _ts('Kite WebSocket connected');
+
     await livePriceService._updateKiteSubscription();
+    _ts('Kite subscriptions updated');
   } else {
     console.log('⏭️  Kite auth & live prices SKIPPED (local dev mode)');
   }
 
   server.listen(PORT, () => {
-    console.log(`Server is running on port ${PORT}`);
+    _ts(`SERVER LISTENING on port ${PORT}`);
     console.log('📡 Live price WebSocket ready at ws://localhost:' + PORT + '/ws/live-prices');
     console.log('\n🚀 Server ready!\n');
   });

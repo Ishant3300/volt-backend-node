@@ -137,7 +137,23 @@ class MetricsEngine {
         this._brokerageRulesMap[key].push(rule);
       }
 
-      const instruments = await KiteInstrument.find({}, 'instrument_token lot_size segment raw_name').lean();
+      // Only load instruments that have active trades (typically 20-100 tokens)
+      // instead of all 180k instruments. Lazy-load on miss for new instruments.
+      const tradeTokens = await Trade.distinct('instrument_token', { status: 'completed', deleted_at: null });
+      const pendingTokens = await Trade.distinct('instrument_token', { status: 'pending', deleted_at: null });
+      const allTokens = [...new Set([...tradeTokens, ...pendingTokens])];
+
+      let instruments;
+      if (allTokens.length > 0 && allTokens.length < 5000) {
+        instruments = await KiteInstrument.find(
+          { instrument_token: { $in: allTokens } },
+          'instrument_token lot_size segment raw_name'
+        ).lean();
+      } else {
+        // Fallback: if somehow there are tons of tokens, load all (same as before)
+        instruments = await KiteInstrument.find({}, 'instrument_token lot_size segment raw_name').lean();
+      }
+
       this._kiteMap = {};
       instruments.forEach(ki => {
         this._kiteMap[ki.instrument_token.toString()] = {
@@ -146,10 +162,33 @@ class MetricsEngine {
           raw_name: ki.raw_name || ''
         };
       });
-      console.log(`📊 [MetricsEngine] Loaded ${this._brokerageRules.length} brokerage rules, ${instruments.length} instruments`);
+      console.log(`📊 [MetricsEngine] Loaded ${this._brokerageRules.length} brokerage rules, ${instruments.length} instruments (from ${allTokens.length} active tokens)`);
     } catch (e) {
       console.error('📊 [MetricsEngine] Error loading rules:', e.message);
     }
+  }
+
+  /**
+   * Lazy-load a single instrument into _kiteMap if not already present.
+   * Called when _rebuildUserCache encounters a token not in the initial load.
+   */
+  async _ensureKiteMapToken(token) {
+    if (this._kiteMap[token]) return this._kiteMap[token];
+    try {
+      const ki = await KiteInstrument.findOne(
+        { instrument_token: token },
+        'instrument_token lot_size segment raw_name'
+      ).lean();
+      if (ki) {
+        this._kiteMap[token] = {
+          lot_size: ki.lot_size || 1,
+          segment: ki.segment || '',
+          raw_name: ki.raw_name || ''
+        };
+        return this._kiteMap[token];
+      }
+    } catch (_) {}
+    return { lot_size: 1, segment: '', raw_name: '' };
   }
 
   /**
@@ -790,6 +829,23 @@ class MetricsEngine {
       }
       
       // Rebuild this single user's cache and recompute
+      // Ensure any new instrument tokens from this user's trades are in _kiteMap
+      const userTrades = await Trade.distinct('instrument_token', { user_id: userId, status: 'completed', deleted_at: null });
+      const missingTokens = userTrades.filter(t => !this._kiteMap[t.toString()]);
+      if (missingTokens.length > 0) {
+        const newInstruments = await KiteInstrument.find(
+          { instrument_token: { $in: missingTokens } },
+          'instrument_token lot_size segment raw_name'
+        ).lean();
+        for (const ki of newInstruments) {
+          this._kiteMap[ki.instrument_token.toString()] = {
+            lot_size: ki.lot_size || 1,
+            segment: ki.segment || '',
+            raw_name: ki.raw_name || ''
+          };
+        }
+      }
+
       await this._rebuildUserCache(userId, user.credits || 0, user.settled_pnl || 0, user.master_id?.toString(), user.wallet, user.exchanges_allowed, {
         margin_square_off: user.margin_square_off,
         margin_square_off_percentage: user.margin_square_off_percentage,

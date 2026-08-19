@@ -12,6 +12,14 @@ const connectDatabase = async () => {
     console.log(`MongoDB Connected: ${conn.connection.host}`);
     console.log(`Database: ${conn.connection.name}`);
     
+    // Skip index sync in production for faster startup (~3s saved).
+    // Indexes only change during code deploys — run once manually after deploy
+    // or set SYNC_INDEXES=true for that single restart.
+    if (process.env.NODE_ENV === 'production' && process.env.SYNC_INDEXES !== 'true') {
+      console.log('⏭️  Index sync skipped (production). Set SYNC_INDEXES=true to force.');
+      return;
+    }
+
     // Sync all models - ensures collections and indexes exist
     console.log('🔄 Syncing database models...');
     
