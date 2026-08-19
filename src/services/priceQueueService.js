@@ -47,14 +47,66 @@ const publishPriceUpdate = async (instrumentToken, livePrice) => {
   }
 };
 
-function positionState(rows) {
-  const row = rows[0] || {};
-  return {
-    totalBuyQty: Number(row.total_buy_qty || 0),
-    totalSellQty: Number(row.total_sell_qty || 0),
-    totalBuyValue: Number(row.total_buy_value || 0),
-    totalSellValue: Number(row.total_sell_value || 0),
-  };
+/**
+ * Average buy/sell state for the CURRENTLY open position only — resets the
+ * moment net quantity last returned to exactly 0, rather than summing every
+ * completed trade since last settlement.
+ *
+ * Bug this fixes: the previous plain aggregate (still used by the wallet
+ * release-basis calc a few lines below — same bug, same fix) summed EVERY
+ * completed trade for this (user, instrument) since last settlement with no
+ * regard for whether the position had been fully closed and reopened in
+ * between. An account that round-trips the same contract more than once in
+ * a week — completely normal for an active trader — got its average cost
+ * silently contaminated by the PRIOR, already-closed round-trip, producing
+ * a realised P&L that didn't match either fill actually shown to the user.
+ * Confirmed against a real trade: BUY 30 @ 57562.60, SELL 30 @ 57810.00
+ * showed P&L +3171.00 — only explainable by an implied avgBuy of 57704.30,
+ * meaning at least one other buy fill (not the one shown) was blended in.
+ *
+ * Walking the trade list chronologically and resetting the running totals
+ * every time net quantity hits 0 keeps the average scoped to only the
+ * fills that built the position CURRENTLY open (or just being closed),
+ * matching what a trader actually sees as "their" entry price.
+ */
+async function positionStateSinceLastFlat(userId, instrumentToken, session) {
+  const trades = await Trade.find({
+    user_id: userId,
+    instrument_token: instrumentToken,
+    status: 'completed',
+    deleted_at: null,
+  })
+    .select('transaction_type executed_quantity executed_price executed_at createdAt')
+    .sort({ executed_at: 1, createdAt: 1 })
+    .session(session)
+    .lean();
+
+  let netQty = 0;
+  let totalBuyQty = 0, totalSellQty = 0, totalBuyValue = 0, totalSellValue = 0;
+  for (const t of trades) {
+    const qty = Number(t.executed_quantity || 0);
+    const price = Number(t.executed_price || 0);
+    if (t.transaction_type === 'BUY') {
+      totalBuyQty += qty;
+      totalBuyValue += qty * price;
+      netQty += qty;
+    } else {
+      totalSellQty += qty;
+      totalSellValue += qty * price;
+      netQty -= qty;
+    }
+    // Position fully closed at this fill — everything before it is a
+    // separate, already-completed round trip and must not bleed into the
+    // average for whatever opens next.
+    if (netQty === 0) {
+      totalBuyQty = 0;
+      totalSellQty = 0;
+      totalBuyValue = 0;
+      totalSellValue = 0;
+    }
+  }
+
+  return { totalBuyQty, totalSellQty, totalBuyValue, totalSellValue };
 }
 
 function realisedPnlFor(trade, state) {
@@ -131,26 +183,7 @@ async function executeMatchedOrder(match, livePrice, options = {}) {
       const trade = await Trade.findById(match.id).session(session);
       if (!trade || trade.status !== 'pending') return;
 
-      const aggregate = await Trade.aggregate([
-        {
-          $match: {
-            user_id: trade.user_id,
-            instrument_token: trade.instrument_token,
-            status: 'completed',
-            deleted_at: null,
-          },
-        },
-        {
-          $group: {
-            _id: null,
-            total_buy_qty: { $sum: { $cond: [{ $eq: ['$transaction_type', 'BUY'] }, '$executed_quantity', 0] } },
-            total_sell_qty: { $sum: { $cond: [{ $eq: ['$transaction_type', 'SELL'] }, '$executed_quantity', 0] } },
-            total_buy_value: { $sum: { $cond: [{ $eq: ['$transaction_type', 'BUY'] }, { $multiply: ['$executed_quantity', '$executed_price'] }, 0] } },
-            total_sell_value: { $sum: { $cond: [{ $eq: ['$transaction_type', 'SELL'] }, { $multiply: ['$executed_quantity', '$executed_price'] }, 0] } },
-          },
-        },
-      ]).session(session);
-      const state = positionState(aggregate);
+      const state = await positionStateSinceLastFlat(trade.user_id, trade.instrument_token, session);
       const previousNetQty = state.totalBuyQty - state.totalSellQty;
       const afterNetQty = trade.transaction_type === 'BUY'
         ? previousNetQty + trade.quantity
@@ -419,5 +452,5 @@ module.exports = {
   init,
   publishPriceUpdate,
   shutdown,
-  _private: { executeMatchedOrder, positionState, realisedPnlFor },
+  _private: { executeMatchedOrder, positionStateSinceLastFlat, realisedPnlFor },
 };
