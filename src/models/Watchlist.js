@@ -48,8 +48,15 @@ watchlistSchema.set('toJSON', {
 });
 
 // Indexes
-watchlistSchema.index({ owner_id: 1, owner_type: 1 });
 watchlistSchema.index({ kite_instrument_id: 1 });
-watchlistSchema.index({ owner_id: 1, order: 1 });
+
+// ─── NEW: Covers watchlist listing with soft-delete + sort by order ───
+watchlistSchema.index({ owner_id: 1, owner_type: 1, deleted_at: 1, order: 1 });
+
+// ─── NEW: Duplicate check when adding to watchlist ───
+watchlistSchema.index({ owner_id: 1, owner_type: 1, instrument_token: 1, deleted_at: 1 });
+
+// ─── NEW: livePriceService distinct('instrument_token', { deleted_at: null }) ───
+watchlistSchema.index({ deleted_at: 1 });
 
 module.exports = mongoose.model('Watchlist', watchlistSchema);

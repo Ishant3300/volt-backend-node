@@ -58,9 +58,9 @@ creditTransactionSchema.set('toJSON', {
   }
 });
 
-// Indexes
-creditTransactionSchema.index({ master_id: 1, created_at: -1 });
-creditTransactionSchema.index({ admin_id: 1, created_at: -1 });
+// Indexes — Fixed: was `created_at` which doesn't exist (Mongoose timestamps = `createdAt`)
+creditTransactionSchema.index({ master_id: 1, createdAt: -1 });
+creditTransactionSchema.index({ admin_id: 1, createdAt: -1 });
 creditTransactionSchema.index({ transaction_type: 1 });
 
 module.exports = mongoose.model('CreditTransaction', creditTransactionSchema);

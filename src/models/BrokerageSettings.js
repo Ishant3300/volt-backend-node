@@ -69,6 +69,9 @@ brokerageSettingsSchema.index({ deleted_at: 1 });
 brokerageSettingsSchema.index({ user_id: 1, deleted_at: 1 });
 brokerageSettingsSchema.index({ user_id: 1, exchange_name: 1, deleted_at: 1 });
 
+// ─── NEW: Full compound for per-trade brokerage lookup (eliminates doc examination) ───
+brokerageSettingsSchema.index({ user_id: 1, exchange_name: 1, script_name: 1, deleted_at: 1 });
+
 const BrokerageSettings = mongoose.model('BrokerageSettings', brokerageSettingsSchema);
 
 module.exports = BrokerageSettings;

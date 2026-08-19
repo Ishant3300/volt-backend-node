@@ -245,7 +245,12 @@ userSchema.set('toJSON', {
 // Indexes
 userSchema.index({ username: 1 }, { unique: true });
 userSchema.index({ server_id: 1 });
-userSchema.index({ master_id: 1 });
 userSchema.index({ status: 1 });
+
+// ─── NEW: Replaces { master_id: 1 } — covers all hierarchy lookups with soft-delete filter ───
+userSchema.index({ master_id: 1, deleted_at: 1 });
+
+// ─── NEW: Intraday square-off cron job lookup ───
+userSchema.index({ deleted_at: 1, 'intraday_squareoff.enabled': 1 });
 
 module.exports = mongoose.model('User', userSchema);

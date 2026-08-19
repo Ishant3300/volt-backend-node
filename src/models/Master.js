@@ -240,7 +240,12 @@ masterSchema.set('toJSON', {
 masterSchema.index({ username: 1 }, { unique: true });
 masterSchema.index({ server_id: 1 });
 masterSchema.index({ admin_id: 1 });
-masterSchema.index({ master_id: 1 });
 masterSchema.index({ status: 1 });
+
+// ─── NEW: Replaces { master_id: 1 } — covers hierarchy traversal with soft-delete filter ───
+masterSchema.index({ master_id: 1, deleted_at: 1 });
+
+// ─── NEW: Bulk load of all non-deleted masters (metricsEngine, weeklySummaryService) ───
+masterSchema.index({ deleted_at: 1 });
 
 module.exports = mongoose.model('Master', masterSchema);

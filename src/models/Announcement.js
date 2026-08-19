@@ -19,4 +19,7 @@ announcementSchema.set('toJSON', {
   }
 });
 
+// ─── NEW: Active announcement lookup ───
+announcementSchema.index({ is_active: 1, createdAt: -1 });
+
 module.exports = mongoose.model('Announcement', announcementSchema);

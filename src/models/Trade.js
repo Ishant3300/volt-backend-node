@@ -134,12 +134,42 @@ tradeSchema.set('toJSON', {
 });
 
 // Indexes
-tradeSchema.index({ user_id: 1, created_at: -1 });
-tradeSchema.index({ master_id: 1, created_at: -1 });
-tradeSchema.index({ admin_id: 1, created_at: -1 });
+
+// ─── Fixed: was `created_at` which doesn't exist (Mongoose timestamps = `createdAt`) ───
+tradeSchema.index({ user_id: 1, createdAt: -1 });
+tradeSchema.index({ master_id: 1, createdAt: -1 });
+tradeSchema.index({ admin_id: 1, createdAt: -1 });
+
+// ─── Single-field indexes ───
 tradeSchema.index({ status: 1 });
 tradeSchema.index({ instrument_token: 1 });
 tradeSchema.index({ executed_at: -1 });
+
+// ─── Existing compound ───
 tradeSchema.index({ settlement_period_key: 1, status: 1, deleted_at: 1 });
+
+// ─── NEW: Covers the #1 most-queried pattern (position aggregation per user per instrument) ───
+tradeSchema.index({ user_id: 1, instrument_token: 1, status: 1, deleted_at: 1 });
+
+// ─── NEW: metricsEngine per-user trade rebuild (sorted by createdAt ascending) ───
+tradeSchema.index({ user_id: 1, status: 1, deleted_at: 1, createdAt: 1 });
+
+// ─── NEW: Pending limit order scans (orderBookService, orderExecutionService) ───
+tradeSchema.index({ status: 1, order_type: 1, deleted_at: 1 });
+
+// ─── NEW: Positions & account summary queries (sorted by executed_at) ───
+tradeSchema.index({ user_id: 1, status: 1, deleted_at: 1, executed_at: -1 });
+
+// ─── NEW: Master trade listing with pagination ───
+tradeSchema.index({ master_id: 1, status: 1, deleted_at: 1, createdAt: -1 });
+
+// ─── NEW: Cancel pending orders by segment (cronService) ───
+tradeSchema.index({ status: 1, instrument_token: 1, deleted_at: 1 });
+
+// ─── NEW: Trade.distinct('user_id', { status, deleted_at }) in metricsEngine ───
+tradeSchema.index({ status: 1, deleted_at: 1 });
+
+// ─── NEW: Deleted trades listing ───
+tradeSchema.index({ deleted_at: 1, updatedAt: -1 });
 
 module.exports = mongoose.model('Trade', tradeSchema);

@@ -63,6 +63,9 @@ transactionSchema.index({ userId: 1, type: 1 });
 transactionSchema.index({ createdAt: -1 });
 transactionSchema.index({ status: 1 });
 
+// ─── NEW: Transaction history listing with status filter + sort ───
+transactionSchema.index({ userId: 1, status: 1, createdAt: -1 });
+
 const Transaction = mongoose.model('Transaction', transactionSchema);
 
 module.exports = Transaction;

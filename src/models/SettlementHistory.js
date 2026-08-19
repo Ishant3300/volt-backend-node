@@ -80,4 +80,7 @@ settlementHistorySchema.index(
 settlementHistorySchema.index({ user_id: 1, instrument_token: 1, period_to: -1 });
 settlementHistorySchema.index({ master_id: 1, period_to: -1 });
 
+// ─── NEW: Period overlap queries in accountSummaryController & tradeReportController ───
+settlementHistorySchema.index({ user_id: 1, period_from: 1, period_to: 1 });
+
 module.exports = mongoose.model('SettlementHistory', settlementHistorySchema);

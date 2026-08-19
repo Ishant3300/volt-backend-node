@@ -51,4 +51,7 @@ const settlementRunSchema = new mongoose.Schema({
 settlementRunSchema.index({ status: 1, lease_expires_at: 1 });
 settlementRunSchema.index({ trading_date: -1 });
 
+// ─── NEW: metricsEngine sync poll every 15s: findOne({ status: $in [...] }).sort({ trading_date: -1 }) ───
+settlementRunSchema.index({ status: 1, trading_date: -1 });
+
 module.exports = mongoose.model('SettlementRun', settlementRunSchema);

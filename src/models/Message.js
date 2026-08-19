@@ -60,8 +60,13 @@ messageSchema.set('toJSON', {
 });
 
 // Indexes
-messageSchema.index({ recipient_id: 1, read: 1 });
 messageSchema.index({ sender_id: 1 });
-messageSchema.index({ created_at: -1 });
+
+// ─── NEW: Replaces { recipient_id: 1, read: 1 } and broken { created_at: -1 } ───
+// Covers inbox listing: find({ recipient_id, recipient_type, deleted_at: null }).sort({ createdAt: -1 })
+messageSchema.index({ recipient_id: 1, recipient_type: 1, deleted_at: 1, createdAt: -1 });
+
+// ─── NEW: Unread count: countDocuments({ recipient_id, recipient_type, read: false, deleted_at: null }) ───
+messageSchema.index({ recipient_id: 1, recipient_type: 1, read: 1, deleted_at: 1 });
 
 module.exports = mongoose.model('Message', messageSchema);
