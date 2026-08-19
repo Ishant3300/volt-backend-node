@@ -208,15 +208,104 @@ const getTradeReport = async (req, res) => {
       });
     }
 
-    // Load brokerage rules and instrument info for recalculation
-    // Try user-specific rules first, fall back to global
-    let brkRules;
+    // Load brokerage rules and instrument info for recalculation.
+    // Fetch BOTH user-specific and global rules — per-trade lookup below tries
+    // the user-specific rule for that trade's own script/exchange first, then
+    // falls back to the global rule for that SAME script/exchange. Previously
+    // this picked user rules XOR global rules for the whole account: if the
+    // user had a rule for even one script, global rules were never consulted
+    // for any other script/exchange the user's own rule set didn't cover,
+    // silently producing 0 brokerage on those trades.
+    let userBrkRules = [];
     if (targetUserId) {
-      brkRules = await BrokerageSettings.find({ user_id: targetUserId, deleted_at: null }).lean();
+      userBrkRules = await BrokerageSettings.find({ user_id: targetUserId, deleted_at: null }).lean();
     }
-    if (!brkRules || brkRules.length === 0) {
-      brkRules = await BrokerageSettings.find({ user_id: null, deleted_at: null }).lean();
+    const globalBrkRules = await BrokerageSettings.find({ user_id: null, deleted_at: null }).lean();
+
+    const _findBrokerageRule = (rawName, seg, tradeDate) => {
+      const pickFrom = (rules) => {
+        const effectiveRules = rules.filter(r =>
+          !r.effective_from || new Date(r.effective_from) <= tradeDate
+        );
+        const pickRule = (candidates) => candidates.sort(
+          (a, b) => new Date(b.effective_from || 0) - new Date(a.effective_from || 0)
+        )[0] || null;
+
+        let rule = null;
+        if (rawName && seg) rule = pickRule(effectiveRules.filter(r => r.script_name?.toUpperCase() === rawName.toUpperCase() && r.exchange_name === seg.toUpperCase()));
+        if (!rule && rawName) rule = pickRule(effectiveRules.filter(r => r.script_name?.toUpperCase() === rawName.toUpperCase()));
+        if (!rule && seg) rule = pickRule(effectiveRules.filter(r => r.exchange_name === seg.toUpperCase() && !r.script_name));
+        if (!rule) rule = pickRule(effectiveRules.filter(r => r.exchange_name === (seg.split('-')[0] || '').toUpperCase() && !r.script_name));
+        return rule;
+      };
+      return pickFrom(userBrkRules) || pickFrom(globalBrkRules);
+    };
+
+    // Fetch carry-forward marker records once, used both to seed each
+    // instrument's starting P&L position (records dated on/before fromDate)
+    // and to populate the output Carry Forward table (records dated up to
+    // toDate) further below.
+    let cfTrades = [];
+    const carryForwardSeeds = {}; // key: `${exchange}::${tradingsymbol}` -> {totalBuyQty, totalBuyValue, totalSellQty, totalSellValue}
+    if (targetUserId) {
+      const cfUserFilter = userScope.user_id ? { user_id: userScope.user_id } : { user_id: targetUserId };
+      cfTrades = await Trade.find({
+        ...cfUserFilter,
+        status: 'completed',
+        trade_type: 'carry_forward',
+        executed_at: { $lte: toDate },
+        $and: [
+          {
+            $or: [
+              {
+                settlement_run_id: { $ne: null },
+                settlement_period_key: { $type: 'string' },
+              },
+              // Read-only compatibility for pre-migration rows.
+              { remarks: 'Settlement: position carried forward at close price' },
+            ],
+          },
+          {
+            $or: [
+              { deleted_at: null },
+              { deleted_at: { $gt: fromDate } },
+            ],
+          },
+        ],
+      }).lean();
+
+      // The carry_forward record embodies the WHOLE position carried into the
+      // new period (not an incremental delta), so per user+instrument we only
+      // want the latest one dated on/before fromDate. When target is a master
+      // (multiple child users), sum each user's seed for the same instrument —
+      // the report groups all of them together under one instrument row.
+      const latestPerUserInstrument = {};
+      for (const t of cfTrades) {
+        if (new Date(t.executed_at) > fromDate) continue;
+        const k = `${t.user_id}::${t.exchange}::${t.tradingsymbol}`;
+        const existing = latestPerUserInstrument[k];
+        if (!existing || new Date(t.executed_at) > new Date(existing.executed_at)) {
+          latestPerUserInstrument[k] = t;
+        }
+      }
+      for (const t of Object.values(latestPerUserInstrument)) {
+        const qty = t.executed_quantity || 0;
+        if (qty <= 0) continue;
+        const key = `${t.exchange}::${t.tradingsymbol}`;
+        if (!carryForwardSeeds[key]) {
+          carryForwardSeeds[key] = { totalBuyQty: 0, totalBuyValue: 0, totalSellQty: 0, totalSellValue: 0 };
+        }
+        const price = t.executed_price || 0;
+        if (t.transaction_type === 'BUY') {
+          carryForwardSeeds[key].totalBuyQty += qty;
+          carryForwardSeeds[key].totalBuyValue += qty * price;
+        } else {
+          carryForwardSeeds[key].totalSellQty += qty;
+          carryForwardSeeds[key].totalSellValue += qty * price;
+        }
+      }
     }
+
     const allTokens = [...new Set(trades.map(t => t.instrument_token))];
     const kiteInstruments = await KiteInstrument.find(
       { instrument_token: { $in: allTokens } },
@@ -252,7 +341,7 @@ const getTradeReport = async (req, res) => {
       // value was computed against a running average that included
       // prior-week buys, or a settlement close was computed against an
       // overall average instead of the position actually being closed.
-      const pnl = _computeAveragePricePnl(g.all_trades);
+      const pnl = _computeAveragePricePnl(g.all_trades, carryForwardSeeds[key]);
 
       // Brokerage: for ledger (settled) rows use the stored value captured at settlement time.
       // For live rows recalculate, but only with rules that were effective at the trade date
@@ -275,20 +364,7 @@ const getTradeReport = async (req, res) => {
         const rawName = ki.raw_name || '';
         const lotSize = ki.lot_size || 1;
 
-        // Filter to rules effective at tradeDate, then pick the most recently effective one.
-        const effectiveRules = brkRules.filter(r =>
-          !r.effective_from || new Date(r.effective_from) <= tradeDate
-        );
-
-        const pickRule = (candidates) => candidates.sort(
-          (a, b) => new Date(b.effective_from || 0) - new Date(a.effective_from || 0)
-        )[0] || null;
-
-        let rule = null;
-        if (rawName && seg) rule = pickRule(effectiveRules.filter(r => r.script_name?.toUpperCase() === rawName.toUpperCase() && r.exchange_name === seg.toUpperCase()));
-        if (!rule && rawName) rule = pickRule(effectiveRules.filter(r => r.script_name?.toUpperCase() === rawName.toUpperCase()));
-        if (!rule && seg) rule = pickRule(effectiveRules.filter(r => r.exchange_name === seg.toUpperCase() && !r.script_name));
-        if (!rule) rule = pickRule(effectiveRules.filter(r => r.exchange_name === (seg.split('-')[0] || '').toUpperCase() && !r.script_name));
+        const rule = _findBrokerageRule(rawName, seg, tradeDate);
 
         if (rule) {
           if (rule.type === 'TURNOVER WISE') {
@@ -326,18 +402,7 @@ const getTradeReport = async (req, res) => {
 
         if (at.rate && (at.buy_qty || at.sell_qty)) {
           const tradeDate = new Date(at.date);
-          const effectiveRules = brkRules.filter(r =>
-            !r.effective_from || new Date(r.effective_from) <= tradeDate
-          );
-          const pickRule2 = (candidates) => candidates.sort(
-            (a, b) => new Date(b.effective_from || 0) - new Date(a.effective_from || 0)
-          )[0] || null;
-
-          let atRule = null;
-          if (rawName && seg) atRule = pickRule2(effectiveRules.filter(r => r.script_name?.toUpperCase() === rawName.toUpperCase() && r.exchange_name === seg.toUpperCase()));
-          if (!atRule && rawName) atRule = pickRule2(effectiveRules.filter(r => r.script_name?.toUpperCase() === rawName.toUpperCase()));
-          if (!atRule && seg) atRule = pickRule2(effectiveRules.filter(r => r.exchange_name === seg.toUpperCase() && !r.script_name));
-          if (!atRule) atRule = pickRule2(effectiveRules.filter(r => r.exchange_name === (seg.split('-')[0] || '').toUpperCase() && !r.script_name));
+          const atRule = _findBrokerageRule(rawName, seg, tradeDate);
 
           if (atRule) {
             const qty = (at.buy_qty || 0) + (at.sell_qty || 0);
@@ -411,33 +476,9 @@ const getTradeReport = async (req, res) => {
     // This ensures positions that existed during the report window always show in Carry Forward,
     // even if they were subsequently settled by a later settlement run.
     if (targetUserId) {
-      // Use the same user scope as the main query (handles master → direct child users)
-      const cfUserFilter = userScope.user_id ? { user_id: userScope.user_id } : { user_id: targetUserId };
-      const cfTrades = await Trade.find({
-        ...cfUserFilter,
-        status: 'completed',
-        trade_type: 'carry_forward',
-        executed_at: { $lte: toDate },
-        $and: [
-          {
-            $or: [
-              {
-                settlement_run_id: { $ne: null },
-                settlement_period_key: { $type: 'string' },
-              },
-              // Read-only compatibility for pre-migration rows.
-              { remarks: 'Settlement: position carried forward at close price' },
-            ],
-          },
-          {
-            $or: [
-              { deleted_at: null },
-              { deleted_at: { $gt: fromDate } },
-            ],
-          },
-        ],
-      }).lean();
-
+      // Reuses the cfTrades already fetched above (same filter — active
+      // carry-forward positions dated up to toDate) to populate the output
+      // Carry Forward table.
       for (const t of cfTrades) {
         const ki = kiteMap[t.instrument_token] || {};
         let displayName = t.tradingsymbol;
@@ -646,24 +687,33 @@ function _getOrderTypeLabel(trade) {
  * avgBuyPrice = totalBuyValue / totalBuyQty
  * For each closing trade: pnl = (exitPrice - avgEntryPrice) × closingQty
  *
- * Resets the running totals to zero whenever a closing trade brings net
- * quantity back to exactly 0 — not just on a same-trade flip (excess > 0,
- * already handled below). Missing that exact-zero case was a real bug: an
- * instrument with more than one round trip within the report period got
- * its second round trip's average silently blended with the first,
- * already-closed one. Confirmed with a worked example: BUY 20/SELL 20
- * (closed, +4000) then BUY 30/SELL 30 (closed, +7422) should total
- * 11422.00; without this reset it computed 18173.20 instead.
+ * A closing trade decrements only the closed side's running totals by the
+ * qty actually matched (closingQty), not a blanket reset — a PARTIAL close
+ * (qty < abs(prevNet)) must leave the remainder of the position open at its
+ * existing average, otherwise the next trade prices against a wiped-out
+ * average of zero. A full close (closingQty === abs(prevNet), no flip)
+ * naturally decrements the closed side down to exactly zero via the same
+ * arithmetic, so the position starts the next round trip clean — this also
+ * fixes the separate case of more than one round trip within the report
+ * period getting silently blended together. Confirmed with a worked
+ * example: BUY 20/SELL 20 (closed, +4000) then BUY 30/SELL 30 (closed,
+ * +7422) should total 11422.00.
  *
  * @param {Array} allTrades - trades sorted chronologically, each with buy_qty/sell_qty/rate
+ * @param {Object} [seed] - starting position carried in from before the report
+ *   window (from the settlement `trade_type: 'carry_forward'` marker record),
+ *   as {totalBuyQty, totalBuyValue, totalSellQty, totalSellValue}. Without
+ *   this, every report window is treated as starting flat, so a carried-in
+ *   position's real closing trades get misclassified as opening trades and
+ *   priced against nothing, understating P&L (often to exactly 0.00).
  * @returns {number} total P&L for this instrument
  */
-function _computeAveragePricePnl(allTrades) {
+function _computeAveragePricePnl(allTrades, seed) {
   const sorted = [...allTrades].sort((a, b) => new Date(a.date) - new Date(b.date));
 
-  let totalBuyQty = 0, totalBuyValue = 0;
-  let totalSellQty = 0, totalSellValue = 0;
-  let runningNet = 0;
+  let totalBuyQty = seed?.totalBuyQty || 0, totalBuyValue = seed?.totalBuyValue || 0;
+  let totalSellQty = seed?.totalSellQty || 0, totalSellValue = seed?.totalSellValue || 0;
+  let runningNet = totalBuyQty - totalSellQty;
   let totalPnl = 0;
 
   for (const trade of sorted) {
@@ -686,9 +736,13 @@ function _computeAveragePricePnl(allTrades) {
       if (!isBuy && prevNet > 0) {
         const avgBuy = totalBuyQty > 0 ? totalBuyValue / totalBuyQty : 0;
         tradePnl = (price - avgBuy) * closingQty;
+        totalBuyQty -= closingQty;
+        totalBuyValue -= closingQty * avgBuy;
       } else if (isBuy && prevNet < 0) {
         const avgSell = totalSellQty > 0 ? totalSellValue / totalSellQty : 0;
         tradePnl = (avgSell - price) * closingQty;
+        totalSellQty -= closingQty;
+        totalSellValue -= closingQty * avgSell;
       }
 
       trade.pnl = Math.round(tradePnl * 100) / 100;
@@ -697,15 +751,15 @@ function _computeAveragePricePnl(allTrades) {
       const excess = qty - Math.abs(prevNet);
       if (excess > 0) {
         // Same-trade flip — the excess beyond the close starts a fresh
-        // position on the opposite side.
-        if (isBuy) { totalBuyQty = excess; totalBuyValue = excess * price; totalSellQty = 0; totalSellValue = 0; }
-        else { totalSellQty = excess; totalSellValue = excess * price; totalBuyQty = 0; totalBuyValue = 0; }
-      } else {
-        // Closed to exactly zero, no flip — everything before this is a
-        // separate, completed round trip and must not bleed into whatever
-        // opens next.
-        totalBuyQty = 0; totalBuyValue = 0; totalSellQty = 0; totalSellValue = 0;
+        // position on the opposite side. The closed side is already at
+        // zero from the decrement above.
+        if (isBuy) { totalBuyQty = excess; totalBuyValue = excess * price; }
+        else { totalSellQty = excess; totalSellValue = excess * price; }
       }
+      // excess <= 0: either an exact full close (closed side already at
+      // zero from the decrement above) or a partial close (remainder of
+      // the position stays open at its existing average) — nothing more
+      // to do in either case.
     }
 
     runningNet = isBuy ? runningNet + qty : runningNet - qty;
