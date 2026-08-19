@@ -55,6 +55,18 @@ function computeWalletSplit(prevNetQty, transactionType, quantity) {
  * instead of the correct 7422.00, only explainable by a stale prior
  * fill leaking into the average.
  *
+ * A PARTIAL close (order smaller than the open position, so net qty
+ * changes sign-preserving without crossing/landing on zero) must
+ * decrement the closed side's own totals by the qty actually matched —
+ * not accumulate the closing trade into the opposite side's totals, and
+ * not leave the closed side's totals untouched either, since further
+ * opens on the same side after a partial close would then average
+ * against the ORIGINAL (pre-partial-close) qty instead of what's truly
+ * still open. Confirmed with a worked example: BUY 50@100, partial SELL
+ * 20 (still long 30), BUY 30@120 (now long 60) should average to
+ * (30*100 + 30*120)/60 = 110; without decrementing on the partial close
+ * it computed 107.5 against a phantom 80-qty position.
+ *
  * Also handles a same-trade flip (one fill larger than the current net
  * position, closing it AND opening the opposite side in one row — this
  * platform allows that in general; order size is only capped at the
@@ -84,14 +96,29 @@ function computeFlatResetState(trades) {
     const price = Number(t.executed_price) || 0;
     const prevNet = netQty;
     const afterNet = prevNet + (isBuy ? qty : -qty);
-    const crossedFlat = (prevNet > 0 && afterNet <= 0) || (prevNet < 0 && afterNet >= 0);
+    const isClosing = (isBuy && prevNet < 0) || (!isBuy && prevNet > 0);
 
-    if (crossedFlat) {
-      totalBuyQty = 0; totalSellQty = 0; totalBuyValue = 0; totalSellValue = 0;
-      if (afterNet !== 0) {
-        const excessQty = Math.abs(afterNet);
-        if (isBuy) { totalBuyQty = excessQty; totalBuyValue = excessQty * price; }
-        else { totalSellQty = excessQty; totalSellValue = excessQty * price; }
+    if (isClosing) {
+      const closingQty = Math.min(qty, Math.abs(prevNet));
+      if (isBuy) {
+        // BUY closes/reduces a short — decrement the short side by the qty matched.
+        const avgSell = totalSellQty > 0 ? totalSellValue / totalSellQty : 0;
+        totalSellQty -= closingQty;
+        totalSellValue -= closingQty * avgSell;
+      } else {
+        // SELL closes/reduces a long — decrement the long side by the qty matched.
+        const avgBuy = totalBuyQty > 0 ? totalBuyValue / totalBuyQty : 0;
+        totalBuyQty -= closingQty;
+        totalBuyValue -= closingQty * avgBuy;
+      }
+
+      const excessQty = qty - closingQty;
+      if (excessQty > 0) {
+        // Same-trade flip — the excess beyond the close opens a fresh
+        // position on this trade's own side, at this trade's own price.
+        // The closed side is already at zero from the decrement above.
+        if (isBuy) { totalBuyQty += excessQty; totalBuyValue += excessQty * price; }
+        else { totalSellQty += excessQty; totalSellValue += excessQty * price; }
       }
     } else if (isBuy) {
       totalBuyQty += qty;

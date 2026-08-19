@@ -131,6 +131,14 @@ const processPendingOrders = async () => {
                         // an admin has disabled the instrument, not in general) — the excess
                         // beyond the close seeds a fresh average on the new side, since net qty
                         // can jump straight past zero without ever equaling it exactly.
+                        //
+                        // A PARTIAL close (order smaller than the open position) must decrement
+                        // the closed side's own totals by the qty matched — folding it into the
+                        // opposite side's totals (or leaving the closed side untouched) makes a
+                        // later same-side open average against the position's pre-partial-close
+                        // qty instead of what's truly still open. Worked example: BUY 50@100,
+                        // partial SELL 20 (still long 30), BUY 30@120 (now long 60) must average
+                        // to (30*100 + 30*120)/60 = 110, not 107.5 against a phantom 80-qty long.
                         let sinceFlatBuyQty = 0, sinceFlatSellQty = 0, sinceFlatBuyValue = 0, sinceFlatSellValue = 0;
 
                         for (const pt of prevTrades) {
@@ -139,15 +147,24 @@ const processPendingOrders = async () => {
                             const price = pt.executed_price;
                             const prevNet = netQtyFromPrev;
                             const afterNet = prevNet + (isBuy ? qty : -qty);
-                            const crossedFlat = (prevNet > 0 && afterNet <= 0) || (prevNet < 0 && afterNet >= 0);
+                            const isClosing = (isBuy && prevNet < 0) || (!isBuy && prevNet > 0);
 
-                            if (crossedFlat) {
-                                sinceFlatBuyQty = 0; sinceFlatSellQty = 0;
-                                sinceFlatBuyValue = 0; sinceFlatSellValue = 0;
-                                if (afterNet !== 0) {
-                                    const excessQty = Math.abs(afterNet);
-                                    if (isBuy) { sinceFlatBuyQty = excessQty; sinceFlatBuyValue = excessQty * price; }
-                                    else { sinceFlatSellQty = excessQty; sinceFlatSellValue = excessQty * price; }
+                            if (isClosing) {
+                                const closingQty = Math.min(qty, Math.abs(prevNet));
+                                if (isBuy) {
+                                    const avgSellNow = sinceFlatSellQty > 0 ? sinceFlatSellValue / sinceFlatSellQty : 0;
+                                    sinceFlatSellQty -= closingQty;
+                                    sinceFlatSellValue -= closingQty * avgSellNow;
+                                } else {
+                                    const avgBuyNow = sinceFlatBuyQty > 0 ? sinceFlatBuyValue / sinceFlatBuyQty : 0;
+                                    sinceFlatBuyQty -= closingQty;
+                                    sinceFlatBuyValue -= closingQty * avgBuyNow;
+                                }
+
+                                const excessQty = qty - closingQty;
+                                if (excessQty > 0) {
+                                    if (isBuy) { sinceFlatBuyQty += excessQty; sinceFlatBuyValue += excessQty * price; }
+                                    else { sinceFlatSellQty += excessQty; sinceFlatSellValue += excessQty * price; }
                                 }
                             } else if (isBuy) {
                                 sinceFlatBuyQty += qty;

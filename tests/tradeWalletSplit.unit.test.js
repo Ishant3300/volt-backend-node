@@ -11,6 +11,7 @@
 // isolate and exhaustively test the split maths, which is the core decision logic.
 
 const { computeWalletSplit } = require('../src/controllers/tradeController');
+const { computeFlatResetState } = require('../src/utils/walletSplit');
 
 describe('computeWalletSplit — open/close split vs current net position', () => {
   describe('pure open (flat book, prevNet = 0)', () => {
@@ -85,5 +86,64 @@ describe('computeWalletSplit — open/close split vs current net position', () =
         expect(openingQty).toBeGreaterThanOrEqual(0);
       }
     });
+  });
+});
+
+// Regression coverage for computeFlatResetState — previously untested, which is how a
+// real bug (partial closes folding into the WRONG side's totals instead of decrementing
+// the closed side) shipped to production undetected. Confirmed against a real trade
+// history (chitra56, Aug 2026): a script closed across several fills, then reopened,
+// showed a materially wrong average entry price because the partial closes were never
+// subtracted from the open side's running totals.
+const t = (type, qty, price) => ({ transaction_type: type, executed_quantity: qty, executed_price: price });
+
+describe('computeFlatResetState — average-cost position tracking for the open position', () => {
+  test('a single opening buy', () => {
+    expect(computeFlatResetState([t('BUY', 50, 100)])).toEqual({
+      netQty: 50, totalBuyQty: 50, totalSellQty: 0, totalBuyValue: 5000, totalSellValue: 0,
+    });
+  });
+
+  test('partial close (SELL smaller than the open long) decrements the buy side, not the sell side', () => {
+    const state = computeFlatResetState([t('BUY', 50, 100), t('SELL', 20, 105)]);
+    // Remaining 30 units still carry the original avg entry of 100 — a proportional
+    // partial reduction doesn't change the average of what's left.
+    expect(state).toEqual({ netQty: 30, totalBuyQty: 30, totalSellQty: 0, totalBuyValue: 3000, totalSellValue: 0 });
+  });
+
+  test('partial close followed by a further same-side open averages against the TRUE remaining qty, not the original', () => {
+    // BUY 50@100, partial SELL 20 (still long 30 @ avg 100), BUY 30@120 (now long 60).
+    // True average: (30*100 + 30*120) / 60 = 110. Buggy version folded the partial
+    // close into totalSellQty and left totalBuyQty at 80, giving avg 107.5.
+    const state = computeFlatResetState([t('BUY', 50, 100), t('SELL', 20, 105), t('BUY', 30, 120)]);
+    expect(state.netQty).toBe(60);
+    expect(state.totalBuyQty).toBe(60);
+    expect(state.totalBuyValue / state.totalBuyQty).toBeCloseTo(110, 6);
+  });
+
+  test('multiple partial closes on a short, then reopening long, keep totals consistent with netQty', () => {
+    // SELL 100@500 (short 100), BUY 40@480 (partial close, short 60), BUY 60@490 (exact close, flat),
+    // BUY 20@495 SELL 20@498 (fresh round trip).
+    const state = computeFlatResetState([
+      t('SELL', 100, 500), t('BUY', 40, 480), t('BUY', 60, 490), t('BUY', 20, 495), t('SELL', 20, 498),
+    ]);
+    expect(state.netQty).toBe(0);
+    expect(state.totalBuyQty - state.totalSellQty).toBe(state.netQty);
+    expect(state.totalBuyQty).toBe(0);
+    expect(state.totalSellQty).toBe(0);
+  });
+
+  test('same-trade flip (one fill both closes the old side and opens the opposite side)', () => {
+    // Long 50 @100, then SELL 80 in one fill: closes the 50 long, flips to short 30 @ this trade's price.
+    const state = computeFlatResetState([t('BUY', 50, 100), t('SELL', 80, 110)]);
+    expect(state).toEqual({ netQty: -30, totalBuyQty: 0, totalSellQty: 30, totalBuyValue: 0, totalSellValue: 30 * 110 });
+  });
+
+  test('totalBuyQty - totalSellQty always equals netQty, across a mixed random-ish sequence', () => {
+    const state = computeFlatResetState([
+      t('BUY', 30, 100), t('BUY', 20, 105), t('SELL', 15, 110), t('SELL', 25, 108),
+      t('BUY', 40, 95), t('SELL', 10, 120), t('BUY', 5, 130),
+    ]);
+    expect(state.totalBuyQty - state.totalSellQty).toBe(state.netQty);
   });
 });
