@@ -7,7 +7,8 @@
     "start": "node src/index.js",
     "dev": "bash scripts/dev.sh",
     "test": "jest --runInBand",
-    "fetch-instruments": "node scripts/fetchInstruments.js"
+    "fetch-instruments": "node scripts/fetchInstruments.js",
+    "warm-weekly-report-cache": "node scripts/warm_weekly_report_cache.js"
   },
   "dependencies": {
     "adm-zip": "^0.5.17",

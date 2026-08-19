@@ -97,10 +97,16 @@ const processPendingOrders = async () => {
                         const freshTrade = await Trade.findById(trade._id).session(session);
                         if (!freshTrade || freshTrade.status !== 'pending') return;
 
-                        // Calculate realised P&L using FIFO (matches /trade/report PDF logic)
+                        // Calculate realised P&L using the average-price method — aligned with
+                        // the primary live path (priceQueueService.js's realisedPnlFor /
+                        // positionStateSinceLastFlat) and the /trade/report PDF
+                        // (tradeReportController.js's _computeAveragePricePnl). This was
+                        // previously true FIFO — the one outlier among all three — so a
+                        // trade's P&L could differ depending on whether Redis happened to be
+                        // up or down at the moment it filled. Aligned so it can't.
                         let realisedPnl = 0;
 
-                        // Fetch all previous completed trades chronologically for FIFO queue
+                        // Fetch all previous completed trades chronologically.
                         const prevTrades = await Trade.find({
                             user_id: freshTrade.user_id,
                             instrument_token: freshTrade.instrument_token,
@@ -108,97 +114,67 @@ const processPendingOrders = async () => {
                             deleted_at: null
                         }).sort({ executed_at: 1 }).session(session);
 
-                        // Build FIFO queue of open lots (supports both long and short)
-                        const fifoQueue = [];
                         let netQtyFromPrev = 0; // positive = long, negative = short
+
+                        // Average buy/sell state for the CURRENTLY open position only — resets
+                        // whenever net quantity crosses or lands on 0, exactly like
+                        // priceQueueService.js's positionStateSinceLastFlat: an unbounded sum
+                        // since last settlement blends an already-closed prior round trip's
+                        // prices into "today's" entry basis. Net qty itself doesn't need this
+                        // treatment — a full round trip's buys and sells cancel out in a plain
+                        // qty sum regardless of order, so only the VALUE-weighted average is
+                        // at risk, not the position size.
+                        //
+                        // Also handles a same-trade flip (one fill larger than the current net
+                        // position, closing it AND opening the opposite side — this platform
+                        // allows that; order size is only capped at the current position when
+                        // an admin has disabled the instrument, not in general) — the excess
+                        // beyond the close seeds a fresh average on the new side, since net qty
+                        // can jump straight past zero without ever equaling it exactly.
+                        let sinceFlatBuyQty = 0, sinceFlatSellQty = 0, sinceFlatBuyValue = 0, sinceFlatSellValue = 0;
 
                         for (const pt of prevTrades) {
                             const isBuy = pt.transaction_type === 'BUY';
                             const qty = pt.executed_quantity;
                             const price = pt.executed_price;
                             const prevNet = netQtyFromPrev;
+                            const afterNet = prevNet + (isBuy ? qty : -qty);
+                            const crossedFlat = (prevNet > 0 && afterNet <= 0) || (prevNet < 0 && afterNet >= 0);
 
-                            const isOpening = (isBuy && prevNet >= 0) || (!isBuy && prevNet <= 0);
-                            const isClosing = (isBuy && prevNet < 0) || (!isBuy && prevNet > 0);
-
-                            if (isOpening && !isClosing) {
-                                fifoQueue.push({ qty, price, side: isBuy ? 'BUY' : 'SELL' });
-                            } else if (isClosing) {
-                                let remaining = Math.min(qty, Math.abs(prevNet));
-                                while (remaining > 0 && fifoQueue.length > 0) {
-                                    const front = fifoQueue[0];
-                                    const matched = Math.min(remaining, front.qty);
-                                    front.qty -= matched;
-                                    remaining -= matched;
-                                    if (front.qty <= 0) fifoQueue.shift();
+                            if (crossedFlat) {
+                                sinceFlatBuyQty = 0; sinceFlatSellQty = 0;
+                                sinceFlatBuyValue = 0; sinceFlatSellValue = 0;
+                                if (afterNet !== 0) {
+                                    const excessQty = Math.abs(afterNet);
+                                    if (isBuy) { sinceFlatBuyQty = excessQty; sinceFlatBuyValue = excessQty * price; }
+                                    else { sinceFlatSellQty = excessQty; sinceFlatSellValue = excessQty * price; }
                                 }
-                                const excess = qty - Math.abs(prevNet);
-                                if (excess > 0) {
-                                    fifoQueue.push({ qty: excess, price, side: isBuy ? 'BUY' : 'SELL' });
-                                }
+                            } else if (isBuy) {
+                                sinceFlatBuyQty += qty;
+                                sinceFlatBuyValue += qty * price;
+                            } else {
+                                sinceFlatSellQty += qty;
+                                sinceFlatSellValue += qty * price;
                             }
 
-                            netQtyFromPrev += isBuy ? qty : -qty;
+                            netQtyFromPrev = afterNet;
                         }
 
-                        // Compute FIFO P&L for this closing trade
+                        // Shared by the P&L calc below and the wallet release basis further
+                        // down — same average, computed once.
+                        const avgBuy = sinceFlatBuyQty > 0 ? sinceFlatBuyValue / sinceFlatBuyQty : 0;
+                        const avgSell = sinceFlatSellQty > 0 ? sinceFlatSellValue / sinceFlatSellQty : 0;
+
                         if (freshTrade.transaction_type === 'SELL' && netQtyFromPrev > 0) {
-                            const closingQty = Math.min(freshTrade.quantity, netQtyFromPrev);
-                            let remaining = closingQty;
-                            while (remaining > 0 && fifoQueue.length > 0) {
-                                const front = fifoQueue[0];
-                                const matched = Math.min(remaining, front.qty);
-                                realisedPnl += (freshTrade.price - front.price) * matched;
-                                front.qty -= matched;
-                                remaining -= matched;
-                                if (front.qty <= 0) fifoQueue.shift();
-                            }
+                            realisedPnl = (freshTrade.price - avgBuy) * Math.min(freshTrade.quantity, netQtyFromPrev);
                         } else if (freshTrade.transaction_type === 'BUY' && netQtyFromPrev < 0) {
-                            const closingQty = Math.min(freshTrade.quantity, Math.abs(netQtyFromPrev));
-                            let remaining = closingQty;
-                            while (remaining > 0 && fifoQueue.length > 0) {
-                                const front = fifoQueue[0];
-                                const matched = Math.min(remaining, front.qty);
-                                realisedPnl += (front.price - freshTrade.price) * matched;
-                                front.qty -= matched;
-                                remaining -= matched;
-                                if (front.qty <= 0) fifoQueue.shift();
-                            }
+                            realisedPnl = (avgSell - freshTrade.price) * Math.min(freshTrade.quantity, Math.abs(netQtyFromPrev));
                         }
                         realisedPnl = Math.round(realisedPnl * 100) / 100;
 
-                        // Aggregate still needed for margin calculation and free margin check
-                        const existingAgg = await Trade.aggregate([
-                            {
-                                $match: {
-                                    user_id: freshTrade.user_id,
-                                    instrument_token: freshTrade.instrument_token,
-                                    status: 'completed',
-                                    deleted_at: null
-                                }
-                            },
-                            {
-                                $group: {
-                                    _id: null,
-                                    total_buy_qty: {
-                                        $sum: { $cond: [{ $eq: ['$transaction_type', 'BUY'] }, '$executed_quantity', 0] }
-                                    },
-                                    total_sell_qty: {
-                                        $sum: { $cond: [{ $eq: ['$transaction_type', 'SELL'] }, '$executed_quantity', 0] }
-                                    },
-                                    // Buy/sell VALUE added for Task 6: needed to derive the
-                                    // average entry price for the wallet release basis.
-                                    total_buy_value: {
-                                        $sum: { $cond: [{ $eq: ['$transaction_type', 'BUY'] }, { $multiply: ['$executed_quantity', '$executed_price'] }, 0] }
-                                    },
-                                    total_sell_value: {
-                                        $sum: { $cond: [{ $eq: ['$transaction_type', 'SELL'] }, { $multiply: ['$executed_quantity', '$executed_price'] }, 0] }
-                                    }
-                                }
-                            }
-                        ]).session(session);
-
-                        const prevNetQtyCheck = existingAgg.length > 0 ? existingAgg[0].total_buy_qty - existingAgg[0].total_sell_qty : 0;
+                        // Net position and wallet-release basis both derive from prevTrades,
+                        // already walked above — no second query needed.
+                        const prevNetQtyCheck = netQtyFromPrev;
 
                         // ── Category trade-wallet gate at FILL time (Task 6 / Requirements
                         //    3.1, 4.1; design §6.2 / §13.2). Mirrors priceQueueService (the
@@ -216,13 +192,9 @@ const processPendingOrders = async () => {
 
                         const { closingQty: walletClosingQty, openingQty: walletOpeningQty } =
                             computeWalletSplit(prevNetQtyCheck, freshTrade.transaction_type, freshTrade.quantity);
-                        const walletAgg = existingAgg.length > 0 ? existingAgg[0] : null;
-                        const walletAvgBuy = walletAgg && walletAgg.total_buy_qty > 0
-                            ? walletAgg.total_buy_value / walletAgg.total_buy_qty : 0;
-                        const walletAvgSell = walletAgg && walletAgg.total_sell_qty > 0
-                            ? walletAgg.total_sell_value / walletAgg.total_sell_qty : 0;
-                        // Closed long lots release at avgBuy; closed short lots at avgSell.
-                        const walletReleaseBasis = prevNetQtyCheck > 0 ? walletAvgBuy : walletAvgSell;
+                        // Closed long lots release at avgBuy; closed short lots at avgSell —
+                        // same avgBuy/avgSell already computed above for the P&L calc.
+                        const walletReleaseBasis = prevNetQtyCheck > 0 ? avgBuy : avgSell;
                         const walletReleaseAmount = walletClosingQty * walletReleaseBasis;
                         // LIMIT/SL fills at the limit price: executed_price = freshTrade.price.
                         const walletOpeningNotional = walletOpeningQty * freshTrade.price;
@@ -284,10 +256,7 @@ const processPendingOrders = async () => {
                         await freshTrade.save({ session });
 
                         // Calculate margin impact and update balance
-                        let prevNetQtyForMargin = 0;
-                        if (existingAgg.length > 0) {
-                            prevNetQtyForMargin = existingAgg[0].total_buy_qty - existingAgg[0].total_sell_qty;
-                        }
+                        const prevNetQtyForMargin = prevNetQtyCheck;
                         const isBuy = freshTrade.transaction_type === 'BUY';
                         const newNetQty = prevNetQtyForMargin + (isBuy ? freshTrade.quantity : -freshTrade.quantity);
                         const marginPerUnit = await calculateMargin(freshTrade.exchange, 1, freshTrade.price);

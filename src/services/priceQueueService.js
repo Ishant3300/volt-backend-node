@@ -47,14 +47,80 @@ const publishPriceUpdate = async (instrumentToken, livePrice) => {
   }
 };
 
-function positionState(rows) {
-  const row = rows[0] || {};
-  return {
-    totalBuyQty: Number(row.total_buy_qty || 0),
-    totalSellQty: Number(row.total_sell_qty || 0),
-    totalBuyValue: Number(row.total_buy_value || 0),
-    totalSellValue: Number(row.total_sell_value || 0),
-  };
+/**
+ * Average buy/sell state for the CURRENTLY open position only — resets
+ * whenever net quantity crosses or lands on 0, rather than summing every
+ * completed trade since last settlement.
+ *
+ * Bug this fixes: the previous plain aggregate (still used by the wallet
+ * release-basis calc a few lines below — same bug, same fix) summed EVERY
+ * completed trade for this (user, instrument) since last settlement with no
+ * regard for whether the position had been fully closed and reopened in
+ * between. An account that round-trips the same contract more than once in
+ * a week — completely normal for an active trader — got its average cost
+ * silently contaminated by the PRIOR, already-closed round-trip, producing
+ * a realised P&L that didn't match either fill actually shown to the user.
+ * Confirmed against a real trade: BUY 30 @ 57562.60, SELL 30 @ 57810.00
+ * showed P&L +3171.00 — only explainable by an implied avgBuy of 57704.30,
+ * meaning at least one other buy fill (not the one shown) was blended in.
+ *
+ * Handles a same-trade flip (a single fill larger than the current net
+ * position, closing it AND opening the opposite side in one row — this
+ * platform allows that; order size is only capped at the current position
+ * when an admin has disabled the instrument, not in general) by splitting
+ * that trade's quantity: whatever closes the old side is discarded along
+ * with all of that side's prior history, and only the EXCESS beyond the
+ * close seeds the new side's average, at this trade's own price. A plain
+ * `netQty === 0` check alone would miss this — quantity can jump straight
+ * past zero to the opposite sign in one trade without ever equaling it.
+ */
+async function positionStateSinceLastFlat(userId, instrumentToken, session) {
+  const trades = await Trade.find({
+    user_id: userId,
+    instrument_token: instrumentToken,
+    status: 'completed',
+    deleted_at: null,
+  })
+    .select('transaction_type executed_quantity executed_price executed_at createdAt')
+    .sort({ executed_at: 1, createdAt: 1 })
+    .session(session)
+    .lean();
+
+  let netQty = 0;
+  let totalBuyQty = 0, totalSellQty = 0, totalBuyValue = 0, totalSellValue = 0;
+  for (const t of trades) {
+    const qty = Number(t.executed_quantity || 0);
+    const price = Number(t.executed_price || 0);
+    const isBuy = t.transaction_type === 'BUY';
+    const prevNetQty = netQty;
+    const afterNetQty = prevNetQty + (isBuy ? qty : -qty);
+    const crossedFlat = (prevNetQty > 0 && afterNetQty <= 0) || (prevNetQty < 0 && afterNetQty >= 0);
+
+    if (crossedFlat) {
+      totalBuyQty = 0;
+      totalSellQty = 0;
+      totalBuyValue = 0;
+      totalSellValue = 0;
+      if (afterNetQty !== 0) {
+        // Flipped straight through zero — the excess beyond the close is a
+        // brand new position on the opposite side, priced at this trade's
+        // own execution price.
+        const excessQty = Math.abs(afterNetQty);
+        if (isBuy) { totalBuyQty = excessQty; totalBuyValue = excessQty * price; }
+        else { totalSellQty = excessQty; totalSellValue = excessQty * price; }
+      }
+    } else if (isBuy) {
+      totalBuyQty += qty;
+      totalBuyValue += qty * price;
+    } else {
+      totalSellQty += qty;
+      totalSellValue += qty * price;
+    }
+
+    netQty = afterNetQty;
+  }
+
+  return { totalBuyQty, totalSellQty, totalBuyValue, totalSellValue };
 }
 
 function realisedPnlFor(trade, state) {
@@ -131,26 +197,7 @@ async function executeMatchedOrder(match, livePrice, options = {}) {
       const trade = await Trade.findById(match.id).session(session);
       if (!trade || trade.status !== 'pending') return;
 
-      const aggregate = await Trade.aggregate([
-        {
-          $match: {
-            user_id: trade.user_id,
-            instrument_token: trade.instrument_token,
-            status: 'completed',
-            deleted_at: null,
-          },
-        },
-        {
-          $group: {
-            _id: null,
-            total_buy_qty: { $sum: { $cond: [{ $eq: ['$transaction_type', 'BUY'] }, '$executed_quantity', 0] } },
-            total_sell_qty: { $sum: { $cond: [{ $eq: ['$transaction_type', 'SELL'] }, '$executed_quantity', 0] } },
-            total_buy_value: { $sum: { $cond: [{ $eq: ['$transaction_type', 'BUY'] }, { $multiply: ['$executed_quantity', '$executed_price'] }, 0] } },
-            total_sell_value: { $sum: { $cond: [{ $eq: ['$transaction_type', 'SELL'] }, { $multiply: ['$executed_quantity', '$executed_price'] }, 0] } },
-          },
-        },
-      ]).session(session);
-      const state = positionState(aggregate);
+      const state = await positionStateSinceLastFlat(trade.user_id, trade.instrument_token, session);
       const previousNetQty = state.totalBuyQty - state.totalSellQty;
       const afterNetQty = trade.transaction_type === 'BUY'
         ? previousNetQty + trade.quantity
@@ -364,7 +411,22 @@ const _processJob = async job => {
   console.log(`⚡ [PriceQueue] Token ${instrument_token} @ ${live_price} → ${matches.length} order(s) to execute`);
   const executedBuys = [];
   const executedSells = [];
+  let failedCount = 0;
   for (const match of matches) {
+    // Each match gets its own try/catch that does NOT re-throw. Previously
+    // one order's failure (insufficient funds, a data issue, anything)
+    // threw out of the whole loop — aborting every OTHER match in this same
+    // batch too, including ones that had already executed successfully a
+    // few lines above. Since the throw happened before reaching the
+    // removeMany() cleanup below, those already-executed orders never got
+    // removed from the Redis order book either, leaving them "stuck" —
+    // every later price tick would re-match and re-attempt them
+    // (harmlessly no-op via the idempotency check, since their trade is no
+    // longer 'pending', but never actually cleaned up) until the next
+    // market-close sweep. A failure now only affects the ONE order that
+    // failed — it's simply left out of the cleanup list, so it stays in
+    // the order book and gets a fair retry on the next price tick, same as
+    // the existing per-order retry behavior already documented elsewhere.
     try {
       const outcome = await executeMatchedOrder(match, live_price);
       if (['unchanged', 'cancelled', 'rejected', 'completed'].includes(outcome.kind)) {
@@ -372,11 +434,14 @@ const _processJob = async job => {
       }
       await notifyOutcome(outcome, live_price);
     } catch (error) {
+      failedCount++;
       if (error.code !== 'SETTLEMENT_IN_PROGRESS') {
         console.error(`❌ [PriceQueue] Execution error for trade ${match.id}: ${error.message}`);
       }
-      throw error;
     }
+  }
+  if (failedCount > 0) {
+    console.log(`⚠️  [PriceQueue] Token ${instrument_token} @ ${live_price} → ${failedCount}/${matches.length} order(s) failed this tick, left pending for retry`);
   }
 
   if (executedBuys.length > 0) await orderBookService.removeMany(instrument_token, 'BUY', executedBuys);
@@ -419,5 +484,5 @@ module.exports = {
   init,
   publishPriceUpdate,
   shutdown,
-  _private: { executeMatchedOrder, positionState, realisedPnlFor },
+  _private: { executeMatchedOrder, positionStateSinceLastFlat, realisedPnlFor, _processJob },
 };
