@@ -1396,11 +1396,16 @@ const cancelTrade = async (req, res) => {
  */
 const deleteTrade = async (req, res) => {
     try {
-        const callerId = req.admin?.id || req.master?.id;
+        // Admin-only. Masters were previously allowed here too, but they have
+        // no ownership/hierarchy check against the trade's user — any master
+        // could delete any user's trade system-wide. The web portal already
+        // hides this action for masters (AccountPanels.tsx's canDelete=false
+        // on MasterClientDetail); this closes the same door on the API itself.
+        const callerId = req.admin?.id;
         const { tradeId } = req.params;
 
         if (!callerId) {
-            return res.status(403).json({ success: false, message: 'Only admin/master can delete trades' });
+            return res.status(403).json({ success: false, message: 'Only admin can delete trades' });
         }
 
         const trade = await Trade.findById(tradeId);
