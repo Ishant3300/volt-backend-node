@@ -489,9 +489,9 @@ class CronService {
                         const netQty = Number(freshPosition[0]?.net_qty || 0);
                         if (netQty === 0) return;
 
-                        // Requirement 3.2 / 7.5: this path closes at LTP with pnl:0 and does
-                        // not carry an avg entry price, so derive it from the trade legs to
-                        // release the ENTRY notional (independent of the exit/LTP price).
+                        // Derive avg entry price from the trade legs — needed both to
+                        // release the ENTRY notional (independent of the exit/LTP price)
+                        // and to compute the real realised P&L this close produces.
                         const buyQty = Number(freshPosition[0]?.total_buy_qty || 0);
                         const sellQty = Number(freshPosition[0]?.total_sell_qty || 0);
                         const buyVal = Number(freshPosition[0]?.total_buy_value || 0);
@@ -501,11 +501,21 @@ class CronService {
                         const avgEntry = netQty > 0 ? avgBuy : avgSell;
                         const releaseCategory = categoryForSegment(instData.segment || instData.exchange || '');
 
-                        const user = await User.findById(userId).select('master_id admin_id').session(session).lean();
+                        const user = await User.findById(userId).session(session);
                         if (!user) throw new Error(`User ${userId} not found`);
                         const absQty = Math.abs(netQty);
                         const closeSide = netQty > 0 ? 'SELL' : 'BUY';
-                        await Trade.create([{
+
+                        // Real realised P&L, closing at the expiring instrument's LTP —
+                        // this was previously hardcoded to 0, silently dropping every
+                        // gain/loss on a position still open at expiry instead of settling
+                        // it (matches marginSquareOffService.js's pnl formula, the
+                        // already-correct pattern for every other forced-square-off path).
+                        const pnl = netQty > 0
+                            ? (instData.price - avgBuy) * absQty
+                            : (avgSell - instData.price) * absQty;
+
+                        const newTrade = new Trade({
                             user_id: userId,
                             master_id: user.master_id,
                             admin_id: user.admin_id || null,
@@ -522,16 +532,56 @@ class CronService {
                             executed_at: new Date(),
                             executed_price: instData.price,
                             executed_quantity: absQty,
-                            pnl: 0,
+                            pnl,
                             remarks: `Auto square-off: instrument expired (${instData.symbol})`,
-                        }], { session });
+                        });
+
+                        const { calculateBrokerage } = require('./brokerageService');
+                        const brokerage = await calculateBrokerage(newTrade, session);
+                        newTrade.brokerage = brokerage;
+                        newTrade.net_amount = pnl - brokerage;
+                        await newTrade.save({ session });
 
                         // Requirement 3.2 / 7.5: release the closed position's ENTRY notional
                         // back to its category wallet inside this same transaction, so the
-                        // release commits atomically with the close trade (keeps pnl:0).
+                        // release commits atomically with the close trade.
                         if (absQty > 0 && avgEntry > 0) {
                             await walletService.release('User', userId, releaseCategory, absQty * avgEntry, session);
                         }
+
+                        // Credit the real P&L (net of brokerage) to equity and record a
+                        // Transaction audit row — every other forced-close path
+                        // (marginSquareOffService.js) does this; this path silently
+                        // skipped it since pnl was always 0 before.
+                        const balanceBefore = Number(user.equity || 0);
+                        const pnlNetBrokerage = pnl - brokerage;
+                        user.equity = balanceBefore + pnlNetBrokerage;
+                        await user.save({ session });
+
+                        const Transaction = require('../models/Transaction');
+                        const expiryTx = new Transaction({
+                            transactionId: `TXN_${Date.now()}_${Math.random().toString(36).slice(2, 8)}_EXP`,
+                            userId,
+                            userModel: 'User',
+                            type: closeSide,
+                            status: 'SUCCESS',
+                            amount: instData.price * absQty,
+                            referenceId: newTrade._id,
+                            referenceModel: 'Trade',
+                            balanceBefore,
+                            balanceAfter: user.equity,
+                            metadata: {
+                                tradingsymbol: instData.symbol,
+                                quantity: absQty,
+                                executedPrice: instData.price,
+                                order_type: 'MARKET',
+                                realisedPnl: pnl,
+                                brokerage,
+                                reason: 'EXPIRY_SQUARE_OFF',
+                                positionClosed: true,
+                            },
+                        });
+                        await expiryTx.save({ session });
 
                         if (options.faultInjector) {
                             await options.faultInjector({
@@ -543,13 +593,13 @@ class CronService {
                             });
                         }
                         await lease.assertActive({ session });
-                        committed = { absQty, closeSide };
+                        committed = { absQty, closeSide, pnl };
                     });
 
                     if (!committed) continue;
                     await metricsEngine.onTradeExecuted(userId.toString());
                     squared++;
-                    console.log(`   ✅ Squared off ${instData.symbol}: ${committed.closeSide} ${committed.absQty} @ ${instData.price} for user ${userId}`);
+                    console.log(`   ✅ Squared off ${instData.symbol}: ${committed.closeSide} ${committed.absQty} @ ${instData.price} for user ${userId}, P&L: ₹${committed.pnl.toFixed(2)}`);
                 } catch (error) {
                     if (error.code === 'TRADE_WRITE_LEASE_LOST') throw error;
                     console.error(`   ❌ Failed to square off ${instData.symbol} for user ${userId}: ${error.message}`);
