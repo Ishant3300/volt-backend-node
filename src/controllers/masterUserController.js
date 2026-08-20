@@ -306,9 +306,13 @@ const createUser = async (req, res) => {
       });
       await userTx.save({ session });
 
-      // Copy master's ScriptQuantity data to the new user
-      const { copyFromMasterToUser } = require('../services/scriptQuantityCopyService');
-      await copyFromMasterToUser(parentMaster._id.toString(), user._id.toString(), session);
+      // Seed the new user's ScriptQuantity from the per-exchange Group
+      // actually selected on the creation form (exchanges_allowed[].group_name)
+      // — previously this was validated as required and stored, but never
+      // read again; every user got the master's current blanket values
+      // regardless of which group was picked.
+      const { seedUserScriptQuantityFromGroups } = require('../services/scriptQuantityCopyService');
+      await seedUserScriptQuantityFromGroups(user._id.toString(), normalizedExchangesAllowed, session);
 
       // Copy master's brokerage rates to the new user
       const { copyBrokerageFromParent } = require('../services/brokerageCopyService');
@@ -522,6 +526,7 @@ const updateUserDetails = async (req, res) => {
     }
 
     // Validate and normalize exchanges_allowed if provided
+    let groupChanges = [];
     if (exchanges_allowed) {
       if (!Array.isArray(exchanges_allowed)) {
         return res.status(400).json({
@@ -541,6 +546,14 @@ const updateUserDetails = async (req, res) => {
         }
       }
 
+      // Snapshot the CURRENT group per exchange before overwriting, so we
+      // can tell afterward which exchanges actually got switched to a
+      // different group — group_name is optional here (only required at
+      // creation), and only a real change should trigger re-seeding.
+      const oldGroupByExchange = new Map(
+        (user.exchanges_allowed || []).map(ex => [ex.exchange_name, ex.group_name])
+      );
+
       // Normalize exchange names to uppercase and map GLOBAL to INDICES
       user.exchanges_allowed = exchanges_allowed.map(ex => {
         let name = ex.exchange_name.toUpperCase();
@@ -550,6 +563,15 @@ const updateUserDetails = async (req, res) => {
           exchange_name: name
         };
       });
+
+      // A user's assigned Group is the ceiling any later per-script edit
+      // for that user must respect — switching them to a different group
+      // must re-seed their ScriptQuantity for that exchange from the new
+      // group's values (previously group_name changed on the record but
+      // nothing ever re-read it, so switching groups had no real effect).
+      groupChanges = user.exchanges_allowed.filter(ex =>
+        ex.group_name && ex.group_name !== oldGroupByExchange.get(ex.exchange_name)
+      );
     }
 
     // Normalize trade_limit to uppercase and map GLOBAL to INDICES if provided
@@ -572,6 +594,13 @@ const updateUserDetails = async (req, res) => {
     if (fresh_stoploss !== undefined) user.fresh_stoploss = fresh_stoploss;
 
     await user.save();
+
+    if (groupChanges.length > 0) {
+      const { reseedUserScriptQuantityForExchange } = require('../services/scriptQuantityCopyService');
+      for (const ex of groupChanges) {
+        await reseedUserScriptQuantityForExchange(user._id.toString(), ex.exchange_name, ex.group_name);
+      }
+    }
 
     // Task 13 / design §13.3: inline wallet on EDIT is an ADDITIVE top-up applied
     // via walletService.assign (master transfer / admin grant). REDUCTIONS use the

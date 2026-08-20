@@ -387,12 +387,13 @@ const bulkCreateScriptQuantity = async (req, res) => {
     const effectiveOwnerType = owner_id ? (owner_type || 'User') : (req.admin ? 'Admin' : 'Master');
 
     if (req.master) {
+      let targetUser = null;
       if (effectiveOwnerId !== req.master.id) {
         if (effectiveOwnerType !== 'User') {
           return res.status(403).json({ success: false, message: 'Not authorized to create for this owner type' });
         }
-        const user = await User.findById(effectiveOwnerId);
-        if (!user || user.master_id.toString() !== req.master.id) {
+        targetUser = await User.findById(effectiveOwnerId);
+        if (!targetUser || targetUser.master_id.toString() !== req.master.id) {
           return res.status(403).json({ success: false, message: 'Not authorized to create for this user' });
         }
       }
@@ -407,11 +408,18 @@ const bulkCreateScriptQuantity = async (req, res) => {
         }
         ceilingLimit = adminGlobal.max_qty;
       } else {
-        const masterLimit = await ScriptQuantity.findOne({ owner_id: req.master.id, owner_type: 'Master', exchange_name: normalizedExchange, script_name: sampleScript, deleted_at: null }).lean();
-        if (!masterLimit) {
-          return res.status(400).json({ success: false, message: 'You do not have a limit set for this exchange' });
+        // Ceiling is the TARGET USER's own assigned Group for this
+        // exchange — not the master's own ScriptQuantity value. See the
+        // matching fix in adminController.js's createScriptQuantity.
+        const userExchange = targetUser.exchanges_allowed.find(e => e.exchange_name === normalizedExchange);
+        if (!userExchange || !userExchange.group_name) {
+          return res.status(400).json({ success: false, message: 'This user has no group assigned for this exchange' });
         }
-        ceilingLimit = masterLimit.max_qty;
+        const groupLimit = await GroupedQuantity.findOne({ exchange_name: normalizedExchange, lot_name: userExchange.group_name, raw_name: sampleScript, deleted_at: null }).lean();
+        if (!groupLimit) {
+          return res.status(400).json({ success: false, message: `No limit found in group "${userExchange.group_name}" for this script` });
+        }
+        ceilingLimit = groupLimit.max_qty;
       }
 
       if (default_max_qty > ceilingLimit) {
