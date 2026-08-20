@@ -8,7 +8,18 @@ const Master = require('../models/Master');
  */
 const getAggregatedPositions = async (req, res) => {
   try {
-    const masterId = req.master.id;
+    // Admin has no req.master (authenticateAdminOrMaster sets it null) and
+    // must pass ?master_id= to scope the aggregate, matching getUserMetrics'
+    // convention below. Previously this unconditionally read req.master.id,
+    // throwing a TypeError (surfaced as a generic 500) for every Admin call.
+    const masterId = req.master?.id ?? req.query.master_id;
+    if (!masterId) {
+      return res.status(400).json({
+        success: false,
+        message: 'master_id is required',
+        data: null
+      });
+    }
 
     // Get all child user IDs for this master (full hierarchy including sub-masters' users)
     const { getAllSubMasterIds } = require('../services/masterHierarchyService');
@@ -145,8 +156,17 @@ const getAggregatedPositions = async (req, res) => {
  */
 const getInstrumentUserBreakdown = async (req, res) => {
   try {
-    const masterId = req.master.id;
+    // See getAggregatedPositions — Admin has no req.master and must pass
+    // ?master_id= instead.
+    const masterId = req.master?.id ?? req.query.master_id;
     const { instrumentToken } = req.params;
+    if (!masterId) {
+      return res.status(400).json({
+        success: false,
+        message: 'master_id is required',
+        data: null
+      });
+    }
 
     // Get all child user IDs (full hierarchy including sub-masters' users)
     const { getAllSubMasterIds } = require('../services/masterHierarchyService');
