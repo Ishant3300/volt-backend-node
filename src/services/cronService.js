@@ -40,7 +40,7 @@ class CronService {
                     console.error(`❌ [CRON] Instrument fetch exited with code ${code}.`);
                 }
             });
-        });
+        }, { timezone: 'Asia/Kolkata' });
         this.jobs.push(fetchInstrumentsJob);
 
         // Snapshot weekly P&L every Sunday at 23:55 (before midnight balance reset)
@@ -52,7 +52,7 @@ class CronService {
             } catch (error) {
                 console.error('❌ [CRON] Error during Weekly Summary Snapshot:', error);
             }
-        });
+        }, { timezone: 'Asia/Kolkata' });
         this.jobs.push(weeklySummarySnapshot);
 
         // Schedule Weekly Balance Reset at Sunday 00:00 AM
@@ -64,7 +64,7 @@ class CronService {
             } catch (error) {
                 console.error('❌ [CRON] Error during Weekly Balance Reset:', error);
             }
-        });
+        }, { timezone: 'Asia/Kolkata' });
 
         this.jobs.push(weeklyBalanceReset);
 
