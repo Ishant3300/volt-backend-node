@@ -1344,17 +1344,37 @@ getPositions = async (req, res) => {
  */
 const cancelTrade = async (req, res) => {
     try {
-        const userId = req.user?.id || req.master?.id || req.admin?.id;
         const { tradeId } = req.params;
 
-        if (!userId) {
+        if (!req.user && !req.master && !req.admin) {
             return res.status(401).json({ success: false, message: 'Unauthorized' });
         }
 
-        const trade = await Trade.findOne({ _id: tradeId, user_id: userId, deleted_at: null });
+        const trade = await Trade.findOne({ _id: tradeId, deleted_at: null });
 
         if (!trade) {
             return res.status(404).json({ success: false, message: 'Trade not found' });
+        }
+
+        // Ownership check. A trade's user_id is always the CLIENT it belongs
+        // to, even when placed by a master/admin on that client's behalf —
+        // req.user/master/admin.id can never equal it for those callers, so
+        // this previously matched user_id against the CALLER's own id
+        // unconditionally, meaning a master/admin could never cancel a
+        // client's pending order at all. A User may only cancel their own
+        // order; a Master may cancel any order belonging to a user anywhere
+        // in their subtree (trade.master_id is that user's DIRECT master,
+        // which may be several tiers below the caller); Admin may cancel any.
+        if (req.user) {
+            if (trade.user_id.toString() !== req.user.id) {
+                return res.status(403).json({ success: false, message: 'Not authorized to cancel this trade' });
+            }
+        } else if (req.master && !req.admin) {
+            const { getAllSubMasterIds } = require('../services/masterHierarchyService');
+            const allowedMasterIds = await getAllSubMasterIds(req.master.id);
+            if (!trade.master_id || !allowedMasterIds.includes(trade.master_id.toString())) {
+                return res.status(403).json({ success: false, message: 'Not authorized to cancel this trade' });
+            }
         }
 
         if (trade.status !== 'pending') {
