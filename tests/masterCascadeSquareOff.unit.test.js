@@ -19,6 +19,9 @@
 jest.mock('../src/models/Trade', () => jest.fn());
 jest.mock('../src/models/Transaction', () => jest.fn());
 jest.mock('../src/models/User', () => ({ findById: jest.fn() }));
+jest.mock('../src/models/KiteInstrument', () => ({ findOne: jest.fn() }));
+jest.mock('../src/models/BrokerageSettings', () => ({ findOne: jest.fn(), find: jest.fn() }));
+jest.mock('../src/models/ScriptQuantity', () => ({ findOne: jest.fn() }));
 jest.mock('../src/services/tradeWriteFenceService', () => ({ beginTradeWrite: jest.fn() }));
 jest.mock('../src/services/walletService', () => ({ release: jest.fn(), block: jest.fn() }));
 jest.mock('../src/services/metricsEngine', () => ({ getFreshMetrics: jest.fn(), onTradeExecuted: jest.fn() }));
@@ -29,6 +32,9 @@ const service = require('../src/services/marginSquareOffService');
 const User = require('../src/models/User');
 const Trade = require('../src/models/Trade');
 const Transaction = require('../src/models/Transaction');
+const KiteInstrument = require('../src/models/KiteInstrument');
+const BrokerageSettings = require('../src/models/BrokerageSettings');
+const ScriptQuantity = require('../src/models/ScriptQuantity');
 const walletService = require('../src/services/walletService');
 const metricsEngine = require('../src/services/metricsEngine');
 const { beginTradeWrite } = require('../src/services/tradeWriteFenceService');
@@ -131,6 +137,15 @@ describe('_squareOffAllPositions — `force` bypasses ONLY the shouldSquareOff s
   function sessionChain(doc) {
     return { session: jest.fn(() => Promise.resolve(doc)) };
   }
+  // `Model.findOne(...).session(session).lean()` / `Model.find(...).session(session).lean()`
+  // chain used by calculateBrokerage's KiteInstrument/BrokerageSettings/ScriptQuantity lookups.
+  function queryChain(result) {
+    const chain = {};
+    chain.select = jest.fn(() => chain);
+    chain.session = jest.fn(() => chain);
+    chain.lean = jest.fn(() => Promise.resolve(result));
+    return chain;
+  }
 
   // A user whose OWN threshold does NOT breach (toggle OFF, pct 0). shouldSquareOff
   // is therefore false, so only `force` can drive a close for this user.
@@ -198,6 +213,12 @@ describe('_squareOffAllPositions — `force` bypasses ONLY the shouldSquareOff s
 
     walletService.release.mockResolvedValue({ category: 'NSE', amount: 0 });
     metricsEngine.onTradeExecuted.mockResolvedValue(undefined);
+
+    // calculateBrokerage's collaborators — no matching rule, so brokerage resolves to 0.
+    KiteInstrument.findOne.mockImplementation(() => queryChain({ segment: 'NFO-FUT' }));
+    BrokerageSettings.findOne.mockImplementation(() => queryChain(null));
+    BrokerageSettings.find.mockImplementation(() => queryChain([]));
+    ScriptQuantity.findOne.mockImplementation(() => queryChain(null));
   });
 
   afterEach(() => {

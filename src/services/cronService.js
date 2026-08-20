@@ -306,8 +306,9 @@ class CronService {
         // Find all users who have intraday_squareoff enabled for any of these segments
         const users = await User.find({
             deleted_at: null,
-            'intraday_squareoff.enabled': true,
-            'intraday_squareoff.exchange_name': { $in: segments.map(s => s.toUpperCase()) },
+            intraday_squareoff: {
+                $elemMatch: { enabled: true, exchange_name: { $in: segments.map(s => s.toUpperCase()) } },
+            },
         }).select('_id username intraday_squareoff').lean();
 
         if (users.length === 0) {

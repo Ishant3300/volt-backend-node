@@ -105,14 +105,52 @@ async function _squareOffUserSegments(userId, segments, options = {}) {
     if (tradesToCreate.length === 0) return 0;
     await session.withTransaction(async () => {
       await lease.assertActive({ session });
-      await Trade.insertMany(tradesToCreate, { session, ordered: true });
+      const freshUser = await User.findById(userId).session(session);
+      if (!freshUser) throw new Error(`Intraday square-off user ${userId} no longer exists`);
+
+      const insertedTrades = await Trade.insertMany(tradesToCreate, { session, ordered: true });
       // Requirement 3.2 / 7.5: release each closed position's ENTRY notional
       // back to its category wallet inside the same transaction as the close
       // writes, so the releases commit atomically with the square-off trades.
       for (const r of releasesToApply) {
         await walletService.release('User', userId, r.category, r.amount, session);
       }
+
+      // Credit the realised P&L to the user's equity and record a Transaction
+      // per closed position, mirroring marginSquareOffService.js's pattern —
+      // without this, positions were closed but the P&L never reached the
+      // user's actual balance.
+      for (const trade of insertedTrades) {
+        const balanceBefore = Number(freshUser.equity || 0);
+        const pnlNetBrokerage = (trade.pnl || 0) - (trade.brokerage || 0);
+        freshUser.equity = balanceBefore + pnlNetBrokerage;
+        const transaction = new Transaction({
+          transactionId: `TXN_${Date.now()}_${Math.random().toString(36).slice(2, 8)}_ISO`,
+          userId: freshUser._id,
+          userModel: 'User',
+          type: trade.transaction_type,
+          status: 'SUCCESS',
+          amount: trade.price * trade.quantity,
+          referenceId: trade._id,
+          referenceModel: 'Trade',
+          balanceBefore,
+          balanceAfter: freshUser.equity,
+          metadata: {
+            tradingsymbol: trade.tradingsymbol,
+            quantity: trade.quantity,
+            executedPrice: trade.price,
+            order_type: 'MARKET',
+            realisedPnl: trade.pnl,
+            brokerage: trade.brokerage,
+            reason: 'INTRADAY_SQUARE_OFF',
+            positionClosed: true,
+          },
+        });
+        await transaction.save({ session });
+      }
+
       await lease.assertActive({ session });
+      await freshUser.save({ session });
     });
     squaredOff = tradesToCreate.length;
   } finally {
