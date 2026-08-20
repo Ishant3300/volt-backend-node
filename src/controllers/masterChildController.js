@@ -564,11 +564,12 @@ const updateChildMasterDetails = async (req, res) => {
 
 // Credit Child Master
 const creditChildMaster = async (req, res) => {
+  const session = await mongoose.startSession();
   try {
     const { id } = req.params;
     const { amount, note } = req.body;
 
-    if (!amount || amount <= 0) {
+    if (!Number.isFinite(amount) || amount <= 0) {
       return res.status(400).json({
         success: false,
         message: 'Valid amount is required',
@@ -576,68 +577,81 @@ const creditChildMaster = async (req, res) => {
       });
     }
 
-    // Admin can credit any master; master can only credit their children in the hierarchy
-    const query = { _id: id, deleted_at: null };
-    let parentMaster = null;
+    let resultData;
 
-    if (req.master) {
-      const allowedSubMasters = await getAllSubMasterIds(req.master.id);
-      if (!allowedSubMasters.includes(id)) {
-        return res.status(403).json({
-          success: false,
-          message: 'Not authorized to credit this master',
-          data: null
-        });
-      }
-      
-      parentMaster = await Master.findById(req.master.id);
-      if (!parentMaster) {
-        return res.status(404).json({ success: false, message: 'Parent master not found' });
-      }
-      if (parentMaster.equity < amount) {
-        return res.status(400).json({ success: false, message: 'Insufficient parent balance to credit' });
-      }
-    }
+    await session.withTransaction(async () => {
+      // Admin can credit any master; master can only credit their DIRECT
+      // child (matches walletController's assertAuthorizedTarget rule).
+      // Previously scoped by getAllSubMasterIds (the whole subtree) while
+      // always debiting req.master.id — a top-level master could fund a
+      // grandchild straight from their own balance, skipping the
+      // intermediate master's books. Also previously ran as two independent
+      // non-transactional saves — a crash/error between them could debit the
+      // parent without ever crediting the child.
+      const query = { _id: id, deleted_at: null };
+      const childMaster = await Master.findOne(query).session(session);
 
-    const childMaster = await Master.findOne(query);
+      if (!childMaster) {
+        throw new Error('Child master not found');
+      }
 
-    if (!childMaster) {
-      return res.status(404).json({
-        success: false,
-        message: 'Child master not found',
-        data: null
+      let parentMaster = null;
+
+      if (req.master) {
+        if (!childMaster.master_id || childMaster.master_id.toString() !== req.master.id) {
+          throw new Error('Not authorized to credit this master');
+        }
+
+        parentMaster = await Master.findById(req.master.id).session(session);
+        if (!parentMaster) throw new Error('Parent master not found');
+        if (parentMaster.equity < amount) {
+          throw new Error('Insufficient parent balance to credit');
+        }
+      }
+
+      const previousCredits = childMaster.credits;
+      const previousBalance = childMaster.equity;
+
+      // Deduct from parent if caller is a master
+      if (parentMaster) {
+        parentMaster.equity -= amount;
+        await parentMaster.save({ session });
+      }
+
+      // Balance increases; credits only rises if balance exceeds it
+      childMaster.equity += amount;
+      childMaster.credits = Math.max(childMaster.credits, childMaster.equity);
+      await childMaster.save({ session });
+
+      const refId = req.admin ? req.admin.id : req.master.id;
+      const refModel = req.admin ? 'Admin' : 'Master';
+
+      const transaction = new Transaction({
+        transactionId: `TXN_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`,
+        userId: childMaster._id,
+        userModel: 'Master',
+        type: 'CREDIT',
+        status: 'SUCCESS',
+        amount,
+        referenceId: refId,
+        referenceModel: refModel,
+        balanceBefore: previousBalance,
+        balanceAfter: childMaster.equity,
+        metadata: { note: note || '', previousCredits, newCredits: childMaster.credits }
       });
-    }
+      await transaction.save({ session });
 
-    const previousCredits = childMaster.credits;
-    const previousBalance = childMaster.equity;
+      await CreditTransaction.create([{
+        master_id: childMaster._id,
+        admin_id: childMaster.admin_id,
+        transaction_type: 'CREDIT',
+        amount,
+        previous_balance: previousCredits,
+        new_balance: childMaster.credits,
+        note: note || ''
+      }], { session, ordered: true });
 
-    // Deduct from parent if caller is a master
-    if (parentMaster) {
-      console.log('Deducting from parent: ' + parentMaster._id + ', amount: ' + amount + ', before: ' + parentMaster.equity); parentMaster.equity -= amount; console.log('After: ' + parentMaster.equity);
-      await parentMaster.save();
-    }
-
-    // Balance increases; credits only rises if balance exceeds it
-    childMaster.equity += amount;
-    childMaster.credits = Math.max(childMaster.credits, childMaster.equity);
-    await childMaster.save();
-
-    // Create transaction record
-    const transaction = await CreditTransaction.create({
-      master_id: childMaster._id,
-      admin_id: childMaster.admin_id,
-      transaction_type: 'CREDIT',
-      amount,
-      previous_balance: previousCredits,
-      new_balance: childMaster.credits,
-      note: note || ''
-    });
-
-    res.status(200).json({
-      success: true,
-      message: 'Credit added successfully',
-      data: {
+      resultData = {
         id: childMaster._id,
         username: childMaster.username,
         previous_credits: previousCredits,
@@ -645,10 +659,25 @@ const creditChildMaster = async (req, res) => {
         current_credits: childMaster.credits,
         transaction_id: transaction._id,
         updated_at: childMaster.updatedAt
-      }
+      };
+    });
+
+    session.endSession();
+
+    res.status(200).json({
+      success: true,
+      message: 'Credit added successfully',
+      data: resultData
     });
   } catch (error) {
-    res.status(500).json({
+    session.endSession();
+
+    let statusCode = 500;
+    if (error.message === 'Child master not found' || error.message === 'Parent master not found') statusCode = 404;
+    else if (error.message === 'Not authorized to credit this master') statusCode = 403;
+    else if (error.message.includes('Insufficient')) statusCode = 400;
+
+    res.status(statusCode).json({
       success: false,
       message: error.message,
       data: null
@@ -658,11 +687,12 @@ const creditChildMaster = async (req, res) => {
 
 // Debit Child Master
 const debitChildMaster = async (req, res) => {
+  const session = await mongoose.startSession();
   try {
     const { id } = req.params;
     const { amount, note } = req.body;
 
-    if (!amount || amount <= 0) {
+    if (!Number.isFinite(amount) || amount <= 0) {
       return res.status(400).json({
         success: false,
         message: 'Valid amount is required',
@@ -670,72 +700,75 @@ const debitChildMaster = async (req, res) => {
       });
     }
 
-    // Admin can debit any master; master can only debit their children in the hierarchy
-    const query = { _id: id, deleted_at: null };
-    let parentMaster = null;
+    let resultData;
 
-    if (req.master) {
-      const allowedSubMasters = await getAllSubMasterIds(req.master.id);
-      if (!allowedSubMasters.includes(id)) {
-        return res.status(403).json({
-          success: false,
-          message: 'Not authorized to debit this master',
-          data: null
-        });
+    await session.withTransaction(async () => {
+      // See creditChildMaster for why: direct-child-only scoping, and a
+      // single atomic transaction instead of two independent saves.
+      const query = { _id: id, deleted_at: null };
+      const childMaster = await Master.findOne(query).session(session);
+
+      if (!childMaster) {
+        throw new Error('Child master not found');
       }
-      
-      parentMaster = await Master.findById(req.master.id);
-      if (!parentMaster) {
-        return res.status(404).json({ success: false, message: 'Parent master not found' });
+
+      let parentMaster = null;
+
+      if (req.master) {
+        if (!childMaster.master_id || childMaster.master_id.toString() !== req.master.id) {
+          throw new Error('Not authorized to debit this master');
+        }
+
+        parentMaster = await Master.findById(req.master.id).session(session);
+        if (!parentMaster) throw new Error('Parent master not found');
       }
-    }
 
-    const childMaster = await Master.findOne(query);
+      if (childMaster.equity < amount) {
+        throw new Error('Insufficient balance');
+      }
 
-    if (!childMaster) {
-      return res.status(404).json({
-        success: false,
-        message: 'Child master not found',
-        data: null
+      const previousCredits = childMaster.credits;
+      const previousBalance = childMaster.equity;
+
+      // Refund to parent if caller is a master
+      if (parentMaster) {
+        parentMaster.equity += amount;
+        await parentMaster.save({ session });
+      }
+
+      // Deduct from balance only; credits stay unchanged
+      childMaster.equity -= amount;
+      await childMaster.save({ session });
+
+      const refId = req.admin ? req.admin.id : req.master.id;
+      const refModel = req.admin ? 'Admin' : 'Master';
+
+      const transaction = new Transaction({
+        transactionId: `TXN_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`,
+        userId: childMaster._id,
+        userModel: 'Master',
+        type: 'DEBIT',
+        status: 'SUCCESS',
+        amount,
+        referenceId: refId,
+        referenceModel: refModel,
+        balanceBefore: previousBalance,
+        balanceAfter: childMaster.equity,
+        metadata: { note: note || '', previousCredits, newCredits: childMaster.credits }
       });
-    }
+      await transaction.save({ session });
 
-    if (childMaster.equity < amount) {
-      return res.status(400).json({
-        success: false,
-        message: 'Insufficient balance',
-        data: null
-      });
-    }
+      await CreditTransaction.create([{
+        master_id: childMaster._id,
+        admin_id: childMaster.admin_id,
+        transaction_type: 'DEBIT',
+        amount,
+        previous_balance: previousCredits,
+        new_balance: childMaster.credits,
+        note: note || ''
+      }], { session, ordered: true });
 
-    const previousCredits = childMaster.credits;
-    const previousBalance = childMaster.equity;
-
-    // Refund to parent if caller is a master
-    if (parentMaster) {
-      parentMaster.equity += amount;
-      await parentMaster.save();
-    }
-
-    // Deduct from balance only; credits stay unchanged
-    childMaster.equity -= amount;
-    await childMaster.save();
-
-    // Create transaction record
-    const transaction = await CreditTransaction.create({
-      master_id: childMaster._id,
-      admin_id: childMaster.admin_id,
-      transaction_type: 'DEBIT',
-      amount,
-      previous_balance: previousCredits,
-      new_balance: childMaster.credits,
-      note: note || ''
-    });
-
-    res.status(200).json({
-      success: true,
-      message: 'Amount debited successfully',
-      data: {
+      resultData = {
         id: childMaster._id,
         username: childMaster.username,
         previous_credits: previousCredits,
@@ -743,10 +776,25 @@ const debitChildMaster = async (req, res) => {
         current_credits: childMaster.credits,
         transaction_id: transaction._id,
         updated_at: childMaster.updatedAt
-      }
+      };
+    });
+
+    session.endSession();
+
+    res.status(200).json({
+      success: true,
+      message: 'Amount debited successfully',
+      data: resultData
     });
   } catch (error) {
-    res.status(500).json({
+    session.endSession();
+
+    let statusCode = 500;
+    if (error.message === 'Child master not found' || error.message === 'Parent master not found') statusCode = 404;
+    else if (error.message === 'Not authorized to debit this master') statusCode = 403;
+    else if (error.message === 'Insufficient balance') statusCode = 400;
+
+    res.status(statusCode).json({
       success: false,
       message: error.message,
       data: null

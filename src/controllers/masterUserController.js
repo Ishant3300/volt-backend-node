@@ -494,7 +494,6 @@ const updateUserDetails = async (req, res) => {
       name,
       username,
       password,
-      credits,
       note,
       pnl_sharing,
       brokerage_sharing,
@@ -622,7 +621,12 @@ const updateUserDetails = async (req, res) => {
     }
 
     if (name) user.name = name;
-    if (credits !== undefined) user.credits = credits;
+    // credits is intentionally NOT settable here — it was a direct overwrite
+    // with no balance check, no parent debit, and no audit record (the same
+    // bug already fixed on updateChildMasterDetails/updateMaster). credits
+    // is what metricsEngine reads as the live trading balance, so this was a
+    // way to fabricate/destroy a user's real margin unaudited. Use the
+    // dedicated creditUser/debitUser endpoints instead.
     if (note !== undefined) user.note = note;
     if (margin_square_off !== undefined) user.margin_square_off = margin_square_off;
     if (change_pass_on_first_login !== undefined) user.change_pass_on_first_login = change_pass_on_first_login;
@@ -729,7 +733,7 @@ const creditUser = async (req, res) => {
     const { id } = req.params;
     const { amount, note } = req.body;
 
-    if (!amount || amount <= 0) {
+    if (!Number.isFinite(amount) || amount <= 0) {
       return res.status(400).json({
         success: false,
         message: 'Valid amount is required',
@@ -758,14 +762,17 @@ const creditUser = async (req, res) => {
       }
 
       const previousUserCredits = user.credits;
-      const previousUserBalance = user.equity;
       const previousMasterCredits = master.credits;
       const previousMasterBalance = master.equity;
 
       // Master pays from balance
       master.equity -= amount;
 
-      // User receives in credits
+      // User receives in credits — this is the field metricsEngine reads as
+      // the user's live trading balance. user.equity is intentionally left
+      // untouched here (it's a separate, square-off-only field — see
+      // _squareOffUserSegments); the audit records below log credits, the
+      // field actually mutated, not equity (which never changes here).
       user.credits += amount;
 
       await master.save({ session });
@@ -787,7 +794,8 @@ const creditUser = async (req, res) => {
       });
       await masterTx.save({ session });
 
-      // Create credit transaction record for user (gaining balance & credit)
+      // Create credit transaction record for user (gaining credits) — logs
+      // the credits field, not equity, since that's what actually changed.
       const userTx = new Transaction({
         transactionId: `TXN_${Date.now()}_${Math.random().toString(36).substr(2, 6)}_U`,
         userId: user._id,
@@ -797,16 +805,21 @@ const creditUser = async (req, res) => {
         amount,
         referenceId: master._id,
         referenceModel: 'Master',
-        balanceBefore: previousUserBalance,
-        balanceAfter: user.equity,
+        balanceBefore: previousUserCredits,
+        balanceAfter: user.credits,
         metadata: { note: note || 'Credit from master' }
       });
       await userTx.save({ session });
 
-      // Legacy tracking for backwards compatibility
+      // Legacy tracking for backwards compatibility. admin_id/actor_model
+      // record the ACTING master's own owning admin (master.admin_id),
+      // matching the convention in masterController/masterChildController —
+      // previously stored req.master.id (a Master id) against a field typed
+      // ref: 'Admin', which resolved to the wrong collection on populate.
       await CreditTransaction.create([{
         master_id: master._id,
-        admin_id: req.master.id,
+        admin_id: master.admin_id,
+        actor_model: 'Admin',
         transaction_type: 'DEBIT',
         amount,
         previous_balance: previousMasterCredits,
@@ -814,7 +827,8 @@ const creditUser = async (req, res) => {
         note: note || 'Credit to user'
       }, {
         master_id: user.master_id,
-        admin_id: req.master.id,
+        admin_id: master.admin_id,
+        actor_model: 'Admin',
         transaction_type: 'CREDIT',
         amount,
         previous_balance: previousUserCredits,
@@ -880,7 +894,7 @@ const debitUser = async (req, res) => {
     const { id } = req.params;
     const { amount, note } = req.body;
 
-    if (!amount || amount <= 0) {
+    if (!Number.isFinite(amount) || amount <= 0) {
       return res.status(400).json({
         success: false,
         message: 'Valid amount is required',
@@ -909,7 +923,6 @@ const debitUser = async (req, res) => {
       if (!master) throw new Error('Master not found');
 
       const previousUserCredits = user.credits;
-      const previousUserBalance = user.equity;
       const previousMasterCredits = master.credits;
       const previousMasterBalance = master.equity;
 
@@ -938,7 +951,8 @@ const debitUser = async (req, res) => {
       });
       await masterTx.save({ session });
 
-      // Create universal transaction record for user (losing credit tracking)
+      // Create universal transaction record for user (losing credits) — logs
+      // the credits field, not equity, since that's what actually changed.
       const userTx = new Transaction({
         transactionId: `TXN_${Date.now()}_${Math.random().toString(36).substr(2, 6)}_U`,
         userId: user._id,
@@ -948,16 +962,18 @@ const debitUser = async (req, res) => {
         amount,
         referenceId: master._id,
         referenceModel: 'Master',
-        balanceBefore: previousUserBalance,
-        balanceAfter: user.equity, // Note: user balance unchanged
+        balanceBefore: previousUserCredits,
+        balanceAfter: user.credits,
         metadata: { note: note || 'Debit to master' }
       });
       await userTx.save({ session });
 
-      // Legacy tracking
+      // Legacy tracking. admin_id/actor_model record the acting master's own
+      // owning admin (master.admin_id) — see creditUser for why.
       await CreditTransaction.create([{
         master_id: master._id,
-        admin_id: req.master.id,
+        admin_id: master.admin_id,
+        actor_model: 'Admin',
         transaction_type: 'CREDIT',
         amount,
         previous_balance: previousMasterCredits,
@@ -965,7 +981,8 @@ const debitUser = async (req, res) => {
         note: note || 'Debit from user'
       }, {
         master_id: user.master_id,
-        admin_id: req.master.id,
+        admin_id: master.admin_id,
+        actor_model: 'Admin',
         transaction_type: 'DEBIT',
         amount,
         previous_balance: previousUserCredits,

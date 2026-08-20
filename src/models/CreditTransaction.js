@@ -6,10 +6,21 @@ const creditTransactionSchema = new mongoose.Schema({
     ref: 'Master',
     required: true
   },
+  // The actor who performed this credit/debit — an Admin OR a Master
+  // (a master crediting/debiting their own direct child/user). `ref: 'Admin'`
+  // was hardcoded here while several call sites actually stored a Master's
+  // id in this field, making `.populate('admin_id')` resolve against the
+  // wrong collection. `refPath` lets each document declare its own actor
+  // type via `actor_model`.
   admin_id: {
     type: mongoose.Schema.Types.ObjectId,
-    ref: 'Admin',
+    refPath: 'actor_model',
     required: true
+  },
+  actor_model: {
+    type: String,
+    enum: ['Admin', 'Master'],
+    default: 'Admin'
   },
   transaction_type: {
     type: String,

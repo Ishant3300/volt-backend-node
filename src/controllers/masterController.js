@@ -693,7 +693,7 @@ const creditMaster = async (req, res) => {
     const { id } = req.params;
     const { amount, note } = req.body;
 
-    if (!amount || amount <= 0) {
+    if (!Number.isFinite(amount) || amount <= 0) {
       return res.status(400).json({
         success: false,
         message: 'Valid amount is required',
@@ -704,28 +704,31 @@ const creditMaster = async (req, res) => {
     let resultData;
 
     await session.withTransaction(async () => {
-      // Admin can manage any master; master scopes by hierarchy
+      // Admin can manage any master; master can only credit their DIRECT
+      // child (matches walletController's assertAuthorizedTarget rule).
+      // Previously scoped by getAllSubMasterIds (the whole subtree) while
+      // always debiting req.master.id — a top-level master could fund a
+      // grandchild straight from their own balance, skipping the
+      // intermediate master's books entirely.
       const query = { _id: id, deleted_at: null };
+      const master = await Master.findOne(query).session(session);
+
+      if (!master) {
+        throw new Error('Master not found');
+      }
+
       let parentMaster = null;
 
       if (req.master) {
-        const { getAllSubMasterIds } = require('../services/masterHierarchyService');
-        const allowedSubMasters = await getAllSubMasterIds(req.master.id);
-        if (!allowedSubMasters.includes(id)) {
+        if (!master.master_id || master.master_id.toString() !== req.master.id) {
           throw new Error('Not authorized to credit this master');
         }
-        
+
         parentMaster = await Master.findById(req.master.id).session(session);
         if (!parentMaster) throw new Error('Parent master not found');
         if (parentMaster.equity < amount) {
           throw new Error('Insufficient parent balance to credit');
         }
-      }
-
-      const master = await Master.findOne(query).session(session);
-
-      if (!master) {
-        throw new Error('Master not found');
       }
 
       const previousCredits = master.credits;
@@ -817,7 +820,7 @@ const debitMaster = async (req, res) => {
     const { id } = req.params;
     const { amount, note } = req.body;
 
-    if (!amount || amount <= 0) {
+    if (!Number.isFinite(amount) || amount <= 0) {
       return res.status(400).json({
         success: false,
         message: 'Valid amount is required',
@@ -828,25 +831,24 @@ const debitMaster = async (req, res) => {
     let resultData;
 
     await session.withTransaction(async () => {
-      // Admin can manage any master; master scopes by hierarchy
+      // Admin can manage any master; master can only debit their DIRECT
+      // child (see creditMaster for why — matches walletController's rule).
       const query = { _id: id, deleted_at: null };
-      let parentMaster = null;
-
-      if (req.master) {
-        const { getAllSubMasterIds } = require('../services/masterHierarchyService');
-        const allowedSubMasters = await getAllSubMasterIds(req.master.id);
-        if (!allowedSubMasters.includes(id)) {
-          throw new Error('Not authorized to debit this master');
-        }
-        
-        parentMaster = await Master.findById(req.master.id).session(session);
-        if (!parentMaster) throw new Error('Parent master not found');
-      }
-
       const master = await Master.findOne(query).session(session);
 
       if (!master) {
         throw new Error('Master not found');
+      }
+
+      let parentMaster = null;
+
+      if (req.master) {
+        if (!master.master_id || master.master_id.toString() !== req.master.id) {
+          throw new Error('Not authorized to debit this master');
+        }
+
+        parentMaster = await Master.findById(req.master.id).session(session);
+        if (!parentMaster) throw new Error('Parent master not found');
       }
 
       if (master.equity < amount) {
@@ -1085,7 +1087,6 @@ const updateMasterDetails = async (req, res) => {
     const {
       name,
       username,
-      credits,
       note,
       exchanges_allowed,
       trade_limit
@@ -1118,7 +1119,9 @@ const updateMasterDetails = async (req, res) => {
     }
 
     if (name) master.name = name;
-    if (credits !== undefined) master.credits = credits;
+    // credits is intentionally NOT settable here — direct overwrite with no
+    // balance check, no parent debit, and no audit record. Use the
+    // dedicated creditMaster/debitMaster endpoints instead.
     if (note) master.note = note;
     if (exchanges_allowed) {
       master.exchanges_allowed = exchanges_allowed.map(ex => {
