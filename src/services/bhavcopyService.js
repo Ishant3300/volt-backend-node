@@ -104,16 +104,21 @@ function buildNseSettlementOperations(
     }
 
     const token = instrument.instrument_token.toString();
-    closePriceMap[token] = bhav.close;
+    // Use the exchange's OFFICIAL settlement price (bhav.settle_pr), not the
+    // raw closing price (bhav.close) — they legitimately differ, and every
+    // downstream carry-forward/M2M consumer of settlement_price/ohlc_close
+    // expects the authoritative settlement value. parseNseDatFile already
+    // requires settle_pr > 0 for a row to be included, so no fallback needed.
+    closePriceMap[token] = bhav.settle_pr;
     const settlementFields = {
-      settlement_price: bhav.close,
+      settlement_price: bhav.settle_pr,
       settlement_price_date: new Date(nseDate),
-      settlement_price_source: 'NSE_OFFICIAL_BHAVCOPY_CLOSE',
+      settlement_price_source: 'NSE_OFFICIAL_BHAVCOPY_SETTLEMENT',
       settlement_price_updated_at: updatedAt,
       ohlc_open: bhav.open,
       ohlc_high: bhav.high,
       ohlc_low: bhav.low,
-      ohlc_close: bhav.close,
+      ohlc_close: bhav.settle_pr,
     };
     bulkOps.push({
       updateOne: {

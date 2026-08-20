@@ -14,6 +14,9 @@
 
 jest.mock('../src/models/Trade', () => ({ insertMany: jest.fn() }));
 jest.mock('../src/models/User', () => ({ findById: jest.fn() }));
+jest.mock('../src/models/KiteInstrument', () => ({ findOne: jest.fn() }));
+jest.mock('../src/models/BrokerageSettings', () => ({ findOne: jest.fn(), find: jest.fn() }));
+jest.mock('../src/models/ScriptQuantity', () => ({ findOne: jest.fn() }));
 jest.mock('../src/services/tradeWriteFenceService', () => ({ beginTradeWrite: jest.fn() }));
 jest.mock('../src/services/walletService', () => ({ release: jest.fn(), block: jest.fn() }));
 jest.mock('../src/services/metricsEngine', () => ({
@@ -25,6 +28,9 @@ jest.mock('../src/services/metricsEngine', () => ({
 
 const Trade = require('../src/models/Trade');
 const User = require('../src/models/User');
+const KiteInstrument = require('../src/models/KiteInstrument');
+const BrokerageSettings = require('../src/models/BrokerageSettings');
+const ScriptQuantity = require('../src/models/ScriptQuantity');
 const walletService = require('../src/services/walletService');
 const metricsEngine = require('../src/services/metricsEngine');
 const { beginTradeWrite } = require('../src/services/tradeWriteFenceService');
@@ -32,11 +38,29 @@ const { _squareOffUserSegments } = require('../src/controllers/masterUserControl
 
 let fakeSession;
 
-// `Model.findById(id).select(...).lean()` chain.
+// `Model.findOne(...).session(session).lean()` / `Model.find(...).session(session).lean()`
+// chain used by calculateBrokerage's KiteInstrument/BrokerageSettings/ScriptQuantity lookups.
+function brokerageQueryChain(result) {
+  const chain = {};
+  chain.select = jest.fn(() => chain);
+  chain.session = jest.fn(() => chain);
+  chain.lean = jest.fn(() => Promise.resolve(result));
+  return chain;
+}
+
+// `Model.findById(id).select(...).lean()` chain — used for the pre-transaction
+// user lookup. Also supports `.session(session)`, used by the SECOND
+// User.findById call inside the transaction (fetches the mutable doc that
+// gets equity credited and saved).
 function queryChain(result) {
   const chain = {};
   chain.select = jest.fn(() => chain);
   chain.lean = jest.fn(() => Promise.resolve(result));
+  chain.session = jest.fn(() => Promise.resolve({
+    _id: 'user1',
+    equity: 0,
+    save: jest.fn().mockResolvedValue(undefined),
+  }));
   return chain;
 }
 
@@ -60,6 +84,12 @@ beforeEach(() => {
   User.findById.mockReturnValue(queryChain({ master_id: 'master1', admin_id: 'admin1' }));
   Trade.insertMany.mockResolvedValue([]);
   walletService.release.mockResolvedValue({ category: 'NSE', amount: 0 });
+
+  // calculateBrokerage's collaborators — no matching rule, so brokerage resolves to 0.
+  KiteInstrument.findOne.mockImplementation(() => brokerageQueryChain({ segment: 'NFO-FUT' }));
+  BrokerageSettings.findOne.mockImplementation(() => brokerageQueryChain(null));
+  BrokerageSettings.find.mockImplementation(() => brokerageQueryChain([]));
+  ScriptQuantity.findOne.mockImplementation(() => brokerageQueryChain(null));
 });
 
 afterEach(() => {
