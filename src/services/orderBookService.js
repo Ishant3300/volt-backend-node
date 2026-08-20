@@ -206,7 +206,14 @@ const syncFromDatabase = async () => {
 
   try {
     const Trade = require('../models/Trade');
-    const pendingTrades = await Trade.find({ status: 'pending', order_type: { $in: ['LIMIT', 'SL', 'SL-M'] } });
+    // deleted_at: null — a trade admin-soft-deleted while still 'pending'
+    // (deleteTrade only sets deleted_at, never touches status) must not be
+    // revived into the live order book by this boot-time resync.
+    const pendingTrades = await Trade.find({
+      status: 'pending',
+      order_type: { $in: ['LIMIT', 'SL', 'SL-M'] },
+      deleted_at: null,
+    });
 
     if (pendingTrades.length === 0) {
       console.log('📗 [OrderBook] No pending orders to sync');

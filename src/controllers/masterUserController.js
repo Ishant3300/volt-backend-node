@@ -626,12 +626,46 @@ const updateUserDetails = async (req, res) => {
     if (note !== undefined) user.note = note;
     if (margin_square_off !== undefined) user.margin_square_off = margin_square_off;
     if (change_pass_on_first_login !== undefined) user.change_pass_on_first_login = change_pass_on_first_login;
+    const wasActive = user.active_status;
     if (active_status !== undefined) user.active_status = active_status;
     if (close_only !== undefined) user.close_only = close_only;
     if (bet !== undefined) user.bet = bet;
     if (fresh_stoploss !== undefined) user.fresh_stoploss = fresh_stoploss;
 
     await user.save();
+
+    // Deactivating a user previously left their pending LIMIT/SL/SL-M orders
+    // live — neither priceQueueService.js's fill path nor the DB-fallback in
+    // orderExecutionService.js checks the owning user's active_status before
+    // matching, so a deactivated user's stacked pending orders could still
+    // open new positions and move their equity. Cancel them the same way the
+    // EOD auto-cancel cron does (cronService.js:cancelPendingOrdersBySegment):
+    // flip status, then best-effort clear the Redis order book.
+    if (wasActive !== false && user.active_status === false) {
+      const cancelledOrders = await Trade.find({
+        user_id: user._id,
+        status: 'pending',
+        deleted_at: null,
+      }).select('_id instrument_token transaction_type order_type').lean();
+
+      if (cancelledOrders.length > 0) {
+        await Trade.updateMany(
+          { _id: { $in: cancelledOrders.map(o => o._id) }, status: 'pending', deleted_at: null },
+          { $set: { status: 'cancelled', remarks: 'Auto-cancelled: account deactivated' } }
+        );
+        const orderBookService = require('../services/orderBookService');
+        for (const order of cancelledOrders) {
+          try {
+            await orderBookService.removeOrder(
+              order._id.toString(),
+              order.instrument_token.toString(),
+              order.transaction_type,
+              order.order_type
+            );
+          } catch (_) { /* best-effort — DB status is authoritative */ }
+        }
+      }
+    }
 
     if (groupChanges.length > 0) {
       const { reseedUserScriptQuantityForExchange } = require('../services/scriptQuantityCopyService');

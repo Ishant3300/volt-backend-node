@@ -53,7 +53,14 @@ const processPendingOrders = async () => {
         // orderBookService.js / registration gate in tradeController.js)
         // silently excluded them, so the SL/SL-M trigger-matching logic
         // just below was unreachable dead code. Now all three are aligned.
-        const pendingTrades = await Trade.find({ status: 'pending', order_type: { $in: ['LIMIT', 'SL', 'SL-M'] } });
+        // deleted_at: null — a trade admin-soft-deleted while still 'pending'
+        // (deleteTrade only sets deleted_at, never touches status) must not be
+        // matched/executed by this DB-fallback path.
+        const pendingTrades = await Trade.find({
+            status: 'pending',
+            order_type: { $in: ['LIMIT', 'SL', 'SL-M'] },
+            deleted_at: null,
+        });
 
         if (pendingTrades.length === 0) return;
 
@@ -101,7 +108,7 @@ const processPendingOrders = async () => {
                         await tradeWriteLease.assertActive({ session });
                         // Idempotency: re-check status before executing
                         const freshTrade = await Trade.findById(trade._id).session(session);
-                        if (!freshTrade || freshTrade.status !== 'pending') return;
+                        if (!freshTrade || freshTrade.status !== 'pending' || freshTrade.deleted_at) return;
 
                         // Calculate realised P&L using the average-price method — aligned with
                         // the primary live path (priceQueueService.js's realisedPnlFor /

@@ -219,7 +219,7 @@ async function executeMatchedOrder(match, livePrice, options = {}) {
       outcome = { kind: 'unchanged', trade: null };
       await lease.assertActive({ session });
       const trade = await Trade.findById(match.id).session(session);
-      if (!trade || trade.status !== 'pending') return;
+      if (!trade || trade.status !== 'pending' || trade.deleted_at) return;
 
       const state = await positionStateSinceLastFlat(trade.user_id, trade.instrument_token, session);
       const previousNetQty = state.totalBuyQty - state.totalSellQty;
