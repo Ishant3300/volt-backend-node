@@ -237,11 +237,48 @@ async function executeMatchedOrder(match, livePrice, options = {}) {
       //    segment, so categoryForSegment('NFO')→GLOBAL / ('MCX')→GLOBAL would be
       //    wrong. Resolving from segment maps 'NFO-FUT'→NSE, 'MCX-FUT'→MCX, etc.
       const walletInstrument = await KiteInstrument.findOne({ instrument_token: trade.instrument_token })
-        .select('segment').session(session).lean();
+        .select('segment enabled deleted_at').session(session).lean();
       const walletCategory = categoryForSegment(walletInstrument?.segment || trade.exchange || '');
 
       const { closingQty: walletClosingQty, openingQty: walletOpeningQty } =
         computeWalletSplit(previousNetQty, trade.transaction_type, trade.quantity);
+
+      // Instrument enabled/deleted gate at FILL time — mirrors placeTrade's
+      // placement-time check (tradeController.js). Disabling/deleting an
+      // instrument previously only blocked NEW order placement; an already-
+      // pending LIMIT/SL order sitting in the book would still fill and open
+      // a fresh position once the price crossed, bypassing the admin's
+      // intent entirely. Deleted blocks unconditionally (even a close);
+      // disabled-only still allows closing/reducing, same as placeTrade.
+      const instrumentBlocked = walletInstrument?.deleted_at
+        || (walletInstrument?.enabled === false && walletOpeningQty > 0);
+      if (instrumentBlocked) {
+        const instrumentRejectRemark = walletInstrument?.deleted_at
+          ? 'Admin has deactivated this script. Trading is not allowed.'
+          : 'This instrument has been disabled by admin. You cannot open new positions on this script.';
+        trade.status = 'rejected';
+        trade.pnl = 0;
+        trade.net_amount = 0;
+        trade.remarks = instrumentRejectRemark;
+        await trade.save({ session });
+        await Trade.create([{
+          user_id: trade.user_id,
+          master_id: trade.master_id,
+          admin_id: trade.admin_id || null,
+          instrument_token: trade.instrument_token,
+          tradingsymbol: trade.tradingsymbol,
+          exchange: trade.exchange,
+          transaction_type: trade.transaction_type,
+          quantity: trade.quantity,
+          price: trade.price,
+          order_type: trade.order_type,
+          status: 'rejected',
+          remarks: instrumentRejectRemark,
+        }], { session });
+        await lease.assertActive({ session });
+        outcome = { kind: 'rejected', trade: trade.toObject(), message: instrumentRejectRemark };
+        return;
+      }
       const walletAvgBuy = state.totalBuyQty > 0 ? state.totalBuyValue / state.totalBuyQty : 0;
       const walletAvgSell = state.totalSellQty > 0 ? state.totalSellValue / state.totalSellQty : 0;
       // Closed long lots release at avgBuy; closed short lots at avgSell (entry basis).

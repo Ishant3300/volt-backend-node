@@ -243,6 +243,66 @@ router.post('/totp/reset', authenticateAdmin, async (req, res) => {
 // ==================== INSTRUMENT MANAGEMENT ROUTES ====================
 const KiteInstrument = require('../models/KiteInstrument');
 
+/**
+ * Cancel pending LIMIT/SL/SL-M orders on an instrument being disabled or
+ * deleted. Without this, a pending order placed before the toggle would
+ * still sit in the book and could fill later, opening a fresh position on
+ * a script the admin just disabled — placeTrade only guarded NEW placement,
+ * not orders already pending (the fill-time gate in priceQueueService.js /
+ * orderExecutionService.js now also blocks this, but cancelling proactively
+ * avoids relying solely on that backstop).
+ *
+ * `blockAll: true` (used for a full delete, matching placeTrade's blanket
+ * block on deleted instruments) cancels every pending order regardless of
+ * direction. Otherwise (a plain disable, which still allows closing an
+ * existing position) only orders that would OPEN or exceed the closeable
+ * quantity are cancelled — a protective stop-loss on an already-open
+ * position is left alone, same as placeTrade's own closing allowance.
+ */
+async function cancelPendingOrdersForInstrument(instrumentToken, { blockAll = false } = {}) {
+  const Trade = require('../models/Trade');
+  const orderBookService = require('../services/orderBookService');
+
+  const pendingOrders = await Trade.find({
+    status: 'pending',
+    instrument_token: instrumentToken,
+    deleted_at: null,
+  }).select('_id user_id instrument_token transaction_type quantity order_type').lean();
+  if (pendingOrders.length === 0) return 0;
+
+  let toCancel = pendingOrders;
+  if (!blockAll) {
+    const posAgg = await Trade.aggregate([
+      { $match: { user_id: { $in: pendingOrders.map(o => o.user_id) }, instrument_token: instrumentToken, status: 'completed', deleted_at: null } },
+      { $group: {
+        _id: '$user_id',
+        buy_qty: { $sum: { $cond: [{ $eq: ['$transaction_type', 'BUY'] }, '$executed_quantity', 0] } },
+        sell_qty: { $sum: { $cond: [{ $eq: ['$transaction_type', 'SELL'] }, '$executed_quantity', 0] } },
+      } },
+    ]);
+    const netQtyByUser = new Map(posAgg.map(p => [p._id.toString(), p.buy_qty - p.sell_qty]));
+
+    toCancel = pendingOrders.filter(order => {
+      const netQty = netQtyByUser.get(order.user_id.toString()) || 0;
+      const isClosing = (order.transaction_type === 'SELL' && netQty > 0) || (order.transaction_type === 'BUY' && netQty < 0);
+      const staysWithinPosition = isClosing && order.quantity <= Math.abs(netQty);
+      return !staysWithinPosition;
+    });
+  }
+  if (toCancel.length === 0) return 0;
+
+  await Trade.updateMany(
+    { _id: { $in: toCancel.map(o => o._id) }, status: 'pending', deleted_at: null },
+    { $set: { status: 'cancelled', remarks: blockAll ? 'Auto-cancelled: instrument deleted by admin' : 'Auto-cancelled: instrument disabled by admin' } }
+  );
+  for (const order of toCancel) {
+    try {
+      await orderBookService.removeOrder(order._id.toString(), order.instrument_token.toString(), order.transaction_type, order.order_type);
+    } catch (_) { /* best-effort — DB status is authoritative */ }
+  }
+  return toCancel.length;
+}
+
 // GET /admin/instruments/segments — get unique segments for filter dropdown
 router.get('/instruments/segments', authenticateAdmin, async (req, res) => {
   try {
@@ -261,6 +321,13 @@ router.put('/instruments/bulk-toggle', authenticateAdmin, async (req, res) => {
       return res.status(400).json({ success: false, message: 'ids array and enabled field required', data: null });
     }
     const result = await KiteInstrument.updateMany({ _id: { $in: ids } }, { $set: { enabled } });
+
+    if (enabled === false) {
+      const disabledInstruments = await KiteInstrument.find({ _id: { $in: ids } }).select('instrument_token').lean();
+      for (const inst of disabledInstruments) {
+        try { await cancelPendingOrdersForInstrument(inst.instrument_token); } catch (_) {}
+      }
+    }
 
     try {
       const searchService = require('../services/instrumentSearchService');
@@ -350,6 +417,10 @@ router.put('/instruments/:id/toggle', authenticateAdmin, async (req, res) => {
     const inst = await KiteInstrument.findByIdAndUpdate(req.params.id, { enabled }, { new: true });
     if (!inst) return res.status(404).json({ success: false, message: 'Instrument not found', data: null });
 
+    if (enabled === false) {
+      try { await cancelPendingOrdersForInstrument(inst.instrument_token); } catch (_) {}
+    }
+
     // Refresh search cache so disabled instruments stop appearing
     try {
       const searchService = require('../services/instrumentSearchService');
@@ -367,6 +438,8 @@ router.delete('/instruments/:id', authenticateAdmin, async (req, res) => {
   try {
     const inst = await KiteInstrument.findByIdAndUpdate(req.params.id, { deleted_at: new Date(), enabled: false }, { new: true });
     if (!inst) return res.status(404).json({ success: false, message: 'Instrument not found', data: null });
+
+    try { await cancelPendingOrdersForInstrument(inst.instrument_token, { blockAll: true }); } catch (_) {}
 
     try {
       const searchService = require('../services/instrumentSearchService');
