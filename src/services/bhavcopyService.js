@@ -731,11 +731,24 @@ async function fetchAndApplyBhavcopy(targetDate, options = {}) {
       if (livePriceService && livePriceService._broadcastToClients) {
         if (!livePriceService._settlementPrices) livePriceService._settlementPrices = new Map();
 
+        // metricsEngine keeps its OWN price cache (_ltpMap/_bidMap/_askMap),
+        // independent of livePriceService.latestPrices — it's what drives the
+        // mobile app's live Position tab (getFreshMetrics/getCachedMetrics),
+        // fed only by real Kite ticks via onTick(). Without this call, this
+        // job updated the client's own tick cache (and therefore the Live
+        // M2M PDF's "LIVE" row, reconstructed client-side from that cache)
+        // with the official settlement price, but left metricsEngine frozen
+        // on whatever the last live tick was before market close — the
+        // Position tab and the PDF would silently show two different CMPs
+        // for the same instrument after every close.
+        const metricsEngine = require('./metricsEngine');
+
         const ticks = [];
         for (const [tokenStr, closePrice] of Object.entries(closePriceMap)) {
           livePriceService._settlementPrices.set(tokenStr, closePrice);
           livePriceService.latestPrices.set(tokenStr, closePrice);
           livePriceService.latestPrices.set(Number(tokenStr), closePrice);
+          metricsEngine.onTick(tokenStr, closePrice, closePrice, closePrice);
           ticks.push({
             instrument_token: tokenStr,
             last_price: closePrice,
