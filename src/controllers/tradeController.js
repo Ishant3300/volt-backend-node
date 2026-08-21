@@ -154,6 +154,20 @@ const placeTrade = async (req, res) => {
                 throw new Error('User not found');
             }
 
+            // A master must only be able to place trades for users in their
+            // own subtree (any depth — sub-masters' users included), never
+            // an arbitrary user_id. Previously unchecked: any master could
+            // pass any user_id and this would place a real trade against
+            // that account. Admin remains unrestricted by design.
+            if (req.master) {
+                const { getAllSubMasterIds } = require('../services/masterHierarchyService');
+                const allowedMasterIds = await getAllSubMasterIds(req.master.id);
+                const userMasterId = (user.master_id?._id || user.master_id)?.toString();
+                if (!userMasterId || !allowedMasterIds.includes(userMasterId)) {
+                    throw new Error('Not authorized to place a trade for this user');
+                }
+            }
+
             // NOTE: The old live free-margin gate (metricsEngine equity/free_margin) is
             // replaced by the category-wallet gate applied at execution time below
             // (walletService.block). LIMIT orders no longer warn on free margin at
@@ -1145,6 +1159,7 @@ const placeTrade = async (req, res) => {
 
         let statusCode = error.status || 500;
         if (error.message === 'User not found') statusCode = 404;
+        else if (error.message === 'Not authorized to place a trade for this user') statusCode = 403;
         else if (error.message.includes('Option selling is not allowed') || error.message.includes('would create a short position')) statusCode = 403;
         else if (error.message.includes('Trading is currently disabled')) statusCode = 403;
         else if (error.message.includes('close-only mode')) statusCode = 403;
