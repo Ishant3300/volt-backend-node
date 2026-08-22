@@ -99,7 +99,7 @@ const createMaster = async (req, res) => {
         exchanges_allowed: finalExchangesAllowed,
         trade_limit: finalTradeLimit,
         add_master: add_master !== undefined ? add_master : false,
-        change_pass_on_first_login: change_pass_on_first_login !== undefined ? change_pass_on_first_login : false,
+        change_pass_on_first_login: change_pass_on_first_login !== undefined ? change_pass_on_first_login : true,
         server_id,
         admin_id: req.admin.id,
         max_credit: max_credit || 0,

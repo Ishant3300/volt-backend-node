@@ -22,7 +22,8 @@ const createUser = async (req, res) => {
       current_credit,
       balance,
       exchanges_support,
-      status
+      status,
+      change_pass_on_first_login
     } = req.body;
 
     if (!username || !password || !server_id || !master_id) {
@@ -62,7 +63,8 @@ const createUser = async (req, res) => {
         current_credit: current_credit || 0,
         equity: balance !== undefined ? balance : initialCredit,
         exchanges_support: exchanges_support || [],
-        status: status || 'active'
+        status: status || 'active',
+        change_pass_on_first_login: change_pass_on_first_login !== undefined ? change_pass_on_first_login : true
       });
       await user.save({ session });
 

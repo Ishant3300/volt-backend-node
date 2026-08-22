@@ -301,7 +301,7 @@ const createUser = async (req, res) => {
         exchanges_allowed: normalizedExchangesAllowed,
         trade_limit: normalizedTradeLimit,
         margin_square_off: margin_square_off || false,
-        change_pass_on_first_login: change_pass_on_first_login || false,
+        change_pass_on_first_login: change_pass_on_first_login !== undefined ? change_pass_on_first_login : true,
         server_id,
         master_id: parentMaster._id,
         status: status || 'active'

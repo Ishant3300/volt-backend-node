@@ -495,13 +495,17 @@ const universalLogin = async (req, res) => {
     const modelName = roleType.charAt(0).toUpperCase() + roleType.slice(1); // 'user' -> 'User'
     await _logLogin(req, userAccount._id, modelName, userAccount.username, userAccount.name || userAccount.username);
 
+    // Check if password reset is required on first login (users/masters only)
+    const requiresPasswordChange = (roleType === 'user' || roleType === 'master') && userAccount.change_pass_on_first_login === true;
+
     res.status(200).json({
       success: true,
-      message: 'Login successful',
+      message: requiresPasswordChange ? 'Password change required' : 'Login successful',
       data: {
         token,
         [roleType]: userAccount.toJSON(),
-        role: roleType.toUpperCase()
+        role: roleType.toUpperCase(),
+        requires_password_change: requiresPasswordChange,
       }
     });
   } catch (error) {
@@ -546,6 +550,12 @@ const changePassword = async (req, res) => {
     }
 
     account.password = await bcrypt.hash(new_password, 10);
+
+    // Clear force-password-reset flag if it was set (first login reset complete)
+    if (account.change_pass_on_first_login === true) {
+      account.change_pass_on_first_login = false;
+    }
+
     await account.save();
 
     return res.status(200).json({ success: true, message: 'Password changed successfully' });
