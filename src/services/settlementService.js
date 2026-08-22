@@ -1541,7 +1541,7 @@ async function commitSettlementTransaction({ run, lockOwner, tradingDate, faultI
       }, { session });
       if (committed.matchedCount !== 1) throw new Error('Settlement lease was lost before commit');
 
-      result = { stats, positionPriceMap: priceMap };
+      result = { stats, positionPriceMap: priceMap, usersAffected: [...usersAffected] };
     }, {
       readConcern: { level: 'snapshot' },
       writeConcern: { w: 'majority' },
@@ -1553,6 +1553,26 @@ async function commitSettlementTransaction({ run, lockOwner, tradingDate, faultI
   }
 
   if (!result) throw new Error('Settlement transaction ended without a commit result');
+
+  // The Weekly Admin Report's per-user cache (weeklyReportCache.js) is only
+  // ever refreshed from real trade-completion paths (metricsEngine.
+  // onTradeExecuted) — settlement never called it, despite a comment on
+  // refreshUserWeeklyAggregate claiming it did. Every trade this run just
+  // processed is now soft-deleted (deleted_at set above), so a stale cache
+  // entry kept showing each affected user's pre-settlement realised P&L as
+  // "this week's" total indefinitely, with settlement's own forced-close
+  // P&L never reflected either way. Recomputing now (fire-and-forget, same
+  // best-effort pattern as every other refreshUserWeeklyAggregate call)
+  // correctly reads back 0 for a user with nothing but now-deleted trades
+  // in the current week, and self-heals to the real total the moment they
+  // place a new trade.
+  if (result.usersAffected?.length > 0) {
+    const weeklyReportCache = require('./weeklyReportCache');
+    for (const userId of result.usersAffected) {
+      weeklyReportCache.refreshUserWeeklyAggregate(userId).catch(() => {});
+    }
+  }
+
   return result;
 }
 
