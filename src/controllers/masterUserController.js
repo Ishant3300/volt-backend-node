@@ -173,6 +173,7 @@ const createUser = async (req, res) => {
       name,
       username,
       password,
+      investor_password,
       credits,
       note,
       pnl_sharing,
@@ -289,10 +290,18 @@ const createUser = async (req, res) => {
       // Hash password
       const hashedPassword = await bcrypt.hash(password, 10);
 
+      // Hash investor password if provided
+      let hashedInvestorPassword = null;
+      if (investor_password && investor_password.trim()) {
+        if (investor_password === password) throw new Error('Investor password must be different from the main password');
+        hashedInvestorPassword = await bcrypt.hash(investor_password, 10);
+      }
+
       const user = new User({
         name,
         username,
         password: hashedPassword,
+        investor_password: hashedInvestorPassword,
         credits,
         equity: credits,
         note,
@@ -494,6 +503,7 @@ const updateUserDetails = async (req, res) => {
       name,
       username,
       password,
+      investor_password,
       note,
       pnl_sharing,
       brokerage_sharing,
@@ -537,6 +547,18 @@ const updateUserDetails = async (req, res) => {
     if (password && password.trim() !== '') {
       const hashedPassword = await bcrypt.hash(password, 10);
       user.password = hashedPassword;
+    }
+
+    // Handle investor password: set if provided, clear if empty string
+    if (investor_password !== undefined) {
+      if (investor_password && investor_password.trim()) {
+        if (password && investor_password === password) {
+          return res.status(400).json({ success: false, message: 'Investor password must be different from the main password', data: null });
+        }
+        user.investor_password = await bcrypt.hash(investor_password, 10);
+      } else {
+        user.investor_password = null;
+      }
     }
 
     // Validate percentages if provided

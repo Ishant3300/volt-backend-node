@@ -1,6 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const { authenticateAdminOrMaster } = require('../middlewares/auth');
+const { rejectIfInvestor } = require('../middlewares/rejectIfInvestor');
 const User = require('../models/User');
 const Master = require('../models/Master');
 const LoginHistory = require('../models/LoginHistory');
@@ -79,10 +80,10 @@ router.use(authenticateAdminOrMaster);
 // + Transaction audit, so no session handling is needed here.
 
 // Assign (fund) a direct child's category wallet from the master's own pool
-router.post('/wallet/assign', walletAssign);
+router.post('/wallet/assign', rejectIfInvestor, walletAssign);
 
 // Withdraw from a direct child's category wallet back to the master's pool
-router.post('/wallet/withdraw', walletWithdraw);
+router.post('/wallet/withdraw', rejectIfInvestor, walletWithdraw);
 
 // Read per-category available balances (self or a direct child)
 router.get('/wallet', getWallet);
@@ -92,17 +93,17 @@ router.get('/wallet', getWallet);
 // ============================================
 
 // Generate a unique 6-digit username (reserved for 5 minutes)
-router.get('/username/generate', generateUsername);
+router.get('/username/generate', rejectIfInvestor, generateUsername);
 
 // Release a reserved username if not used
-router.post('/username/release', releaseUsername);
+router.post('/username/release', rejectIfInvestor, releaseUsername);
 
 // ============================================
 // Child Master Management Routes
 // ============================================
 
 // Create child master
-router.post('/masters', createChildMaster);
+router.post('/masters', rejectIfInvestor, createChildMaster);
 
 // Get all child masters
 router.get('/masters', getAllChildMasters);
@@ -111,32 +112,32 @@ router.get('/masters', getAllChildMasters);
 router.get('/masters/:id', getChildMasterById);
 
 // Update child master permissions
-router.put('/masters/:id/permissions', updateChildMasterPermissions);
+router.put('/masters/:id/permissions', rejectIfInvestor, updateChildMasterPermissions);
 
 // Update child master details
-router.put('/masters/:id/details', updateChildMasterDetails);
+router.put('/masters/:id/details', rejectIfInvestor, updateChildMasterDetails);
 
 // Credit child master
-router.post('/masters/:id/credit', creditChildMaster);
+router.post('/masters/:id/credit', rejectIfInvestor, creditChildMaster);
 
 // Debit child master
-router.post('/masters/:id/debit', debitChildMaster);
+router.post('/masters/:id/debit', rejectIfInvestor, debitChildMaster);
 
 // Get child master position
 router.get('/masters/:id/position', getChildMasterPosition);
 
 // Send message to child master
-router.post('/masters/:id/messages', sendMessageToChildMaster);
+router.post('/masters/:id/messages', rejectIfInvestor, sendMessageToChildMaster);
 
 // Delete child master
-router.delete('/masters/:id', deleteChildMaster);
+router.delete('/masters/:id', rejectIfInvestor, deleteChildMaster);
 
 // ============================================
 // User Management Routes
 // ============================================
 
 // Create user
-router.post('/users', createUser);
+router.post('/users', rejectIfInvestor, createUser);
 
 // Get all users
 router.get('/users', getAllUsers);
@@ -145,34 +146,34 @@ router.get('/users', getAllUsers);
 router.get('/users/:id', getUserById);
 
 // Update user details
-router.put('/users/:id/details', updateUserDetails);
+router.put('/users/:id/details', rejectIfInvestor, updateUserDetails);
 
 // Update user (full update)
-router.put('/users/:id', updateUserDetails);
+router.put('/users/:id', rejectIfInvestor, updateUserDetails);
 
 // Update user intraday squareoff settings
-router.put('/users/:id/intraday-squareoff', updateUserIntradaySquareoff);
+router.put('/users/:id/intraday-squareoff', rejectIfInvestor, updateUserIntradaySquareoff);
 
 // Update user margin squareoff percentage
-router.put('/users/:id/margin-squareoff-percentage', updateUserMarginSquareoffPercentage);
+router.put('/users/:id/margin-squareoff-percentage', rejectIfInvestor, updateUserMarginSquareoffPercentage);
 
 // Update user report permissions
-router.put('/users/:id/report-permissions', updateUserReportPermissions);
+router.put('/users/:id/report-permissions', rejectIfInvestor, updateUserReportPermissions);
 
 // Credit user
-router.post('/users/:id/credit', creditUser);
+router.post('/users/:id/credit', rejectIfInvestor, creditUser);
 
 // Debit user
-router.post('/users/:id/debit', debitUser);
+router.post('/users/:id/debit', rejectIfInvestor, debitUser);
 
 // Get user position
 router.get('/users/:id/position', getUserPosition);
 
 // Send message to user
-router.post('/users/:id/messages', sendMessageToUser);
+router.post('/users/:id/messages', rejectIfInvestor, sendMessageToUser);
 
 // Delete user
-router.delete('/users/:id', deleteUser);
+router.delete('/users/:id', rejectIfInvestor, deleteUser);
 
 // ============================================
 // Trade Management Routes

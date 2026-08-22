@@ -169,6 +169,10 @@ const userSchema = new mongoose.Schema({
     type: String,
     default: null
   },
+  investor_password: {
+    type: String,
+    default: null
+  },
   last_login: {
     type: Date,
     default: null
@@ -233,11 +237,15 @@ userSchema.set('toJSON', {
     ret.id = ret._id;
     delete ret._id;
     delete ret.__v;
+    delete ret.password;
+    delete ret.investor_password;
     ret.created_at = ret.createdAt;
     ret.updated_at = ret.updatedAt;
     ret.credit = ret.credits; // Aliasing for older API endpoints expecting credit
     delete ret.createdAt;
     delete ret.updatedAt;
+    // Expose whether investor password is configured (without revealing the hash)
+    ret.has_investor_password = !!doc.investor_password;
     return ret;
   }
 });

@@ -17,6 +17,7 @@ const createChildMaster = async (req, res) => {
       name,
       username,
       password,
+      investor_password,
       credits,
       note,
       pnl_sharing,
@@ -115,6 +116,14 @@ const createChildMaster = async (req, res) => {
       }
 
       const hashedPassword = await bcrypt.hash(password, 10);
+
+      // Hash investor password if provided
+      let hashedInvestorPassword = null;
+      if (investor_password && investor_password.trim()) {
+        if (investor_password === password) throw new Error('Investor password must be different from the main password');
+        hashedInvestorPassword = await bcrypt.hash(investor_password, 10);
+      }
+
       const normalizedExchangesAllowed = exchanges_allowed.map(ex => ex.toUpperCase());
       const normalizedTradeLimit = trade_limit.map(ex => ex.toUpperCase());
 
@@ -122,6 +131,7 @@ const createChildMaster = async (req, res) => {
         name,
         username,
         password: hashedPassword,
+        investor_password: hashedInvestorPassword,
         credits,
         equity: credits,
         note,

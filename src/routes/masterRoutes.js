@@ -1,6 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const { authenticateAdminOrMaster, authenticateAdmin } = require('../middlewares/auth');
+const { rejectIfInvestor } = require('../middlewares/rejectIfInvestor');
 const {
   createMaster,
   getAllMasters,
@@ -32,42 +33,40 @@ router.get('/', authenticateAdminOrMaster, getAllMasters);
 router.get('/trades/all', authenticateAdminOrMaster, getAllTrades);
 
 router.get('/:id', authenticateAdminOrMaster, getMasterById);
-router.put('/:id', authenticateAdminOrMaster, updateMaster);
-router.delete('/:id', authenticateAdminOrMaster, deleteMaster);
+router.put('/:id', authenticateAdminOrMaster, rejectIfInvestor, updateMaster);
+router.delete('/:id', authenticateAdminOrMaster, rejectIfInvestor, deleteMaster);
 
 // Status management
-router.put('/:id/status', authenticateAdminOrMaster, updateMasterStatus);
+router.put('/:id/status', authenticateAdminOrMaster, rejectIfInvestor, updateMasterStatus);
 
 // Permission management
-router.put('/:id/permissions', authenticateAdminOrMaster, updateMasterPermissions);
+router.put('/:id/permissions', authenticateAdminOrMaster, rejectIfInvestor, updateMasterPermissions);
 
 // Details management
-router.put('/:id/details', authenticateAdminOrMaster, updateMasterDetails);
+router.put('/:id/details', authenticateAdminOrMaster, rejectIfInvestor, updateMasterDetails);
 
 // Intraday Squareoff Settings
-router.put('/:id/intraday-squareoff', authenticateAdminOrMaster, updateMasterIntradaySquareoff);
+router.put('/:id/intraday-squareoff', authenticateAdminOrMaster, rejectIfInvestor, updateMasterIntradaySquareoff);
 
 // Margin Squareoff Percentage
-router.put('/:id/margin-squareoff-percentage', authenticateAdminOrMaster, updateMasterMarginSquareoffPercentage);
+router.put('/:id/margin-squareoff-percentage', authenticateAdminOrMaster, rejectIfInvestor, updateMasterMarginSquareoffPercentage);
 
 // Credit/Debit operations
-router.post('/:id/credit', authenticateAdminOrMaster, creditMaster);
-router.post('/:id/debit', authenticateAdminOrMaster, debitMaster);
+router.post('/:id/credit', authenticateAdminOrMaster, rejectIfInvestor, creditMaster);
+router.post('/:id/debit', authenticateAdminOrMaster, rejectIfInvestor, debitMaster);
 
 // Position
 router.get('/:id/position', authenticateAdminOrMaster, getMasterPosition);
 
 // Messaging
-router.post('/:id/messages', authenticateAdminOrMaster, sendMessageToMaster);
+router.post('/:id/messages', authenticateAdminOrMaster, rejectIfInvestor, sendMessageToMaster);
 
 // Account Limit
 router.get('/:id/account-limit', authenticateAdminOrMaster, getAccountLimit);
-router.put('/:id/account-limit', authenticateAdminOrMaster, updateAccountLimit);
+router.put('/:id/account-limit', authenticateAdminOrMaster, rejectIfInvestor, updateAccountLimit);
 
-// Base rates — a master's own per-segment reference brokerage rate.
-// Display/autofill only for the hierarchy creation UI; GET is also how the
-// creation form fetches a selected parent's rates to prefill before save.
+// Base rates
 router.get('/:id/base-rates', authenticateAdminOrMaster, getMasterBaseRates);
-router.put('/:id/base-rates', authenticateAdminOrMaster, updateMasterBaseRates);
+router.put('/:id/base-rates', authenticateAdminOrMaster, rejectIfInvestor, updateMasterBaseRates);
 
 module.exports = router;

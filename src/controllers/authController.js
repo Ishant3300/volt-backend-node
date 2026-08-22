@@ -34,8 +34,8 @@ const _logLogin = async (req, userId, userModel, username, name) => {
 };
 
 // Generate JWT Token
-const generateToken = (id, role) => {
-  return jwt.sign({ id, role }, process.env.JWT_SECRET);
+const generateToken = (id, role, investor = false) => {
+  return jwt.sign({ id, role, investor }, process.env.JWT_SECRET);
 };
 
 // User Login
@@ -385,10 +385,11 @@ const universalLogin = async (req, res) => {
 
     let userAccount = null;
     let roleType = null;
+    let isInvestorLogin = false;
 
     console.log(`🔐 [LOGIN] Attempt: username="${username}", password length=${password.length}`);
 
-    // Check Admin
+    // Check Admin (admins don't have investor password)
     const admin = await Admin.findOne({ username });
     console.log(`🔐 [LOGIN] Admin lookup: found=${!!admin}, deleted=${admin?.deleted_at || 'N/A'}`);
     if (admin && !admin.deleted_at && await bcrypt.compare(password, admin.password)) {
@@ -397,53 +398,83 @@ const universalLogin = async (req, res) => {
       roleType = 'admin';
     }
 
-    // Check Master
+    // Check Master (main password first, then investor password)
     if (!userAccount) {
       const master = await Master.findOne({ username });
       console.log(`🔐 [LOGIN] Master lookup: found=${!!master}, deleted=${master?.deleted_at || 'N/A'}`);
-      if (master && !master.deleted_at && await bcrypt.compare(password, master.password)) {
-        console.log(`🔐 [LOGIN] Master password matched`);
-        if (master.status !== 'active') {
-          return res.status(403).json({
-            success: false,
-            message: 'Account is not active',
-            data: null
-          });
+      if (master && !master.deleted_at) {
+        let passwordMatched = false;
+
+        // Try main password first
+        if (await bcrypt.compare(password, master.password)) {
+          console.log(`🔐 [LOGIN] Master password matched`);
+          passwordMatched = true;
         }
-        if (master.active_status === false) {
-          return res.status(403).json({
-            success: false,
-            message: 'You are not allowed to login',
-            data: null
-          });
+        // Try investor password if main didn't match and investor_password is set
+        else if (master.investor_password && await bcrypt.compare(password, master.investor_password)) {
+          console.log(`🔐 [LOGIN] Master investor password matched`);
+          passwordMatched = true;
+          isInvestorLogin = true;
         }
-        userAccount = master;
-        roleType = 'master';
+
+        if (passwordMatched) {
+          if (master.status !== 'active') {
+            return res.status(403).json({
+              success: false,
+              message: 'Account is not active',
+              data: null
+            });
+          }
+          if (master.active_status === false) {
+            return res.status(403).json({
+              success: false,
+              message: 'You are not allowed to login',
+              data: null
+            });
+          }
+          userAccount = master;
+          roleType = 'master';
+        }
       }
     }
 
-    // Check User
+    // Check User (main password first, then investor password)
     if (!userAccount) {
       const user = await User.findOne({ username });
       console.log(`🔐 [LOGIN] User lookup: found=${!!user}, deleted=${user?.deleted_at || 'N/A'}`);
-      if (user && !user.deleted_at && await bcrypt.compare(password, user.password)) {
-        console.log(`🔐 [LOGIN] User password matched`);
-        if (user.status !== 'active') {
-          return res.status(403).json({
-            success: false,
-            message: 'Account is not active',
-            data: null
-          });
+      if (user && !user.deleted_at) {
+        let passwordMatched = false;
+
+        // Try main password first
+        if (await bcrypt.compare(password, user.password)) {
+          console.log(`🔐 [LOGIN] User password matched`);
+          passwordMatched = true;
         }
-        if (user.active_status === false) {
-          return res.status(403).json({
-            success: false,
-            message: 'You are not allowed to login',
-            data: null
-          });
+        // Try investor password if main didn't match and investor_password is set
+        else if (user.investor_password && await bcrypt.compare(password, user.investor_password)) {
+          console.log(`🔐 [LOGIN] User investor password matched`);
+          passwordMatched = true;
+          isInvestorLogin = true;
         }
-        userAccount = user;
-        roleType = 'user';
+
+        if (passwordMatched) {
+          if (user.status !== 'active') {
+            return res.status(403).json({
+              success: false,
+              message: 'Account is not active',
+              data: null
+            });
+          }
+          if (user.active_status === false) {
+            return res.status(403).json({
+              success: false,
+              message: 'You are not allowed to login',
+              data: null
+            });
+          }
+          userAccount = user;
+          roleType = 'user';
+        }
       }
     }
 
@@ -481,7 +512,7 @@ const universalLogin = async (req, res) => {
     }
 
     // Generate new token (no expiration)
-    const token = generateToken(userAccount._id, roleType);
+    const token = generateToken(userAccount._id, roleType, isInvestorLogin);
 
     // Update active_token, last_login, and IP address
     userAccount.active_token = token;
@@ -495,8 +526,8 @@ const universalLogin = async (req, res) => {
     const modelName = roleType.charAt(0).toUpperCase() + roleType.slice(1); // 'user' -> 'User'
     await _logLogin(req, userAccount._id, modelName, userAccount.username, userAccount.name || userAccount.username);
 
-    // Check if password reset is required on first login (users/masters only)
-    const requiresPasswordChange = (roleType === 'user' || roleType === 'master') && userAccount.change_pass_on_first_login === true;
+    // Check if password reset is required on first login (users/masters only, not investor logins)
+    const requiresPasswordChange = !isInvestorLogin && (roleType === 'user' || roleType === 'master') && userAccount.change_pass_on_first_login === true;
 
     res.status(200).json({
       success: true,
@@ -506,6 +537,7 @@ const universalLogin = async (req, res) => {
         [roleType]: userAccount.toJSON(),
         role: roleType.toUpperCase(),
         requires_password_change: requiresPasswordChange,
+        investor: isInvestorLogin,
       }
     });
   } catch (error) {
