@@ -300,6 +300,196 @@ function parseNseDatFile(text) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// BSE F&O — official bseindia.com UDiFF BhavCopy (direct download, no session)
+// ═══════════════════════════════════════════════════════════════════════════
+
+function buildBseSettlementOperations(
+  bseDate,
+  instruments,
+  bhavMap,
+  closePriceMap,
+  updatedAt = new Date()
+) {
+  const bfoInstruments = instruments.filter(instrument =>
+    instrument.exchange === 'BFO' || (instrument.exchange === 'BSE' && instrument.instrument_type)
+  );
+  const bulkOps = [];
+  let matched = 0;
+  let unmatched = 0;
+
+  for (const instrument of bfoInstruments) {
+    const key = buildMatchKey(instrument);
+    if (!key) {
+      unmatched++;
+      continue;
+    }
+    const bhav = bhavMap.get(key);
+    if (!bhav) {
+      unmatched++;
+      continue;
+    }
+
+    const token = instrument.instrument_token.toString();
+    closePriceMap[token] = bhav.settle_pr;
+    const settlementFields = {
+      settlement_price: bhav.settle_pr,
+      settlement_price_date: new Date(bseDate),
+      settlement_price_source: 'BSE_OFFICIAL_BHAVCOPY_SETTLEMENT',
+      settlement_price_updated_at: updatedAt,
+      ohlc_open: bhav.open,
+      ohlc_high: bhav.high,
+      ohlc_low: bhav.low,
+      ohlc_close: bhav.settle_pr,
+    };
+    bulkOps.push({
+      updateOne: {
+        filter: { instrument_token: token },
+        update: { $set: settlementFields },
+      },
+    });
+    matched++;
+  }
+
+  return { bulkOps, matched, unmatched };
+}
+
+/**
+ * Parse BSE's UDiFF derivatives BhavCopy CSV (header row present, confirmed
+ * against a real downloaded file). Relevant columns:
+ *   TradDt (YYYY-MM-DD, the file's own trading date — validated the same way
+ *   NSE's source date is), TckrSymb (underlying, e.g. "SENSEX"), XpryDt
+ *   (YYYY-MM-DD), StrkPric (blank for a FUT row), OptnTp ("CE"/"PE", blank
+ *   for FUT), OpnPric/HghPric/LwPric, SttlmPric (the official settlement
+ *   price — NOT ClsPric, same open/settlement distinction NSE's own file
+ *   makes between field 13 and field 25).
+ */
+function parseBseBhavcopyCsv(text) {
+  const lines = text.trim().split('\n');
+  if (lines.length < 2) return new Map();
+
+  const header = parseCsvLine(lines[0]).map(h => h.trim());
+  const idx = (name) => header.indexOf(name);
+  const iSymb = idx('TckrSymb');
+  const iExpiry = idx('XpryDt');
+  const iStrike = idx('StrkPric');
+  const iOptType = idx('OptnTp');
+  const iOpen = idx('OpnPric');
+  const iHigh = idx('HghPric');
+  const iLow = idx('LwPric');
+  const iSettle = idx('SttlmPric');
+  const iTradDt = idx('TradDt');
+
+  const map = new Map();
+  const sourceDates = new Set();
+  if ([iSymb, iExpiry, iSettle, iTradDt].some(i => i === -1)) {
+    // Header shape changed from the confirmed real format — fail closed
+    // rather than silently parsing the wrong columns.
+    return map;
+  }
+
+  for (let i = 1; i < lines.length; i++) {
+    const line = lines[i].trim();
+    if (!line) continue;
+    const c = parseCsvLine(line);
+    if (c.length < header.length) continue;
+
+    const underlying = (c[iSymb] || '').trim().toUpperCase();
+    const expiryRaw = (c[iExpiry] || '').trim();
+    const strikePr = parseFloat(c[iStrike]) || 0;
+    const optType = (c[iOptType] || '').trim().toUpperCase();
+    const open = parseFloat(c[iOpen]) || 0;
+    const high = parseFloat(c[iHigh]) || 0;
+    const low = parseFloat(c[iLow]) || 0;
+    const settlePr = parseFloat(c[iSettle]) || 0;
+    const tradDt = (c[iTradDt] || '').trim();
+
+    if (tradDt) sourceDates.add(tradDt);
+    if (!underlying || !expiryRaw || settlePr <= 0 || !tradDt) continue;
+
+    // XpryDt is already YYYY-MM-DD — strip dashes to match buildMatchKey's
+    // YYYYMMDD convention.
+    const expiryNorm = expiryRaw.replace(/-/g, '');
+    if (!/^\d{8}$/.test(expiryNorm)) continue;
+
+    let instType;
+    if (optType === 'CE') instType = 'CE';
+    else if (optType === 'PE') instType = 'PE';
+    else if (!optType) instType = 'FUT'; // OptnTp blank on a FUT row
+    else continue;
+
+    const strike = instType === 'FUT' ? '0' : String(Math.round(strikePr));
+    const key = `${underlying}|${expiryNorm}|${strike}|${instType}`;
+    map.set(key, { open, high, low, settle_pr: settlePr, sourceDate: tradDt });
+  }
+  map.sourceDates = sourceDates;
+  return map;
+}
+
+async function fetchBseBhavcopy(date, instruments, closePriceMap, options = {}) {
+  const bseDate = new Date(date);
+  console.log(`   [BSE] Fetching BSE F&O bhavcopy for ${dateToDashed(bseDate)}...`);
+
+  const { yyyymmdd } = dateParts(bseDate);
+  const url = `https://www.bseindia.com/download/Bhavcopy/Derivative/BhavCopy_BSE_FO_0_0_0_${yyyymmdd}_F_0000.CSV`;
+
+  let buf;
+  try {
+    const res = await axios.get(url, {
+      responseType: 'arraybuffer',
+      timeout: 60000,
+      validateStatus: () => true,
+      headers: { 'User-Agent': BROWSER_UA },
+    });
+    if (res.status !== 200) {
+      console.warn(`   [BSE] HTTP ${res.status} for ${dateToDashed(bseDate)}. No BSE data.`);
+      return { matched: 0, unmatched: 0, tradingDate: dateKey(bseDate) };
+    }
+    buf = Buffer.from(res.data);
+    if (buf.length < 200) {
+      console.warn(`   [BSE] ⚠️ Response too small (${buf.length}B).`);
+      return { matched: 0, unmatched: 0, tradingDate: dateKey(bseDate) };
+    }
+    const preview = buf.toString('utf8', 0, 80);
+    if (preview.startsWith('<!') || preview.startsWith('<html')) {
+      console.warn('   [BSE] ⚠️ Got HTML instead of data.');
+      return { matched: 0, unmatched: 0, tradingDate: dateKey(bseDate) };
+    }
+    console.log(`   [BSE] ✅ ${(buf.length / 1024).toFixed(1)} KB downloaded.`);
+  } catch (e) {
+    console.warn(`   [BSE] ⚠️ Download failed: ${e.message}`);
+    return { matched: 0, unmatched: 0, tradingDate: dateKey(bseDate) };
+  }
+
+  const bhavMap = parseBseBhavcopyCsv(buf.toString('utf8'));
+  console.log(`   [BSE] Parsed ${bhavMap.size} entries.`);
+
+  const requestedDate = dateKey(bseDate);
+  const sourceDates = bhavMap.sourceDates || new Set();
+  if (sourceDates.size !== 1 || !sourceDates.has(requestedDate)) {
+    console.warn(`   [BSE] Rejected bhavcopy: requested ${requestedDate}, source dates: ${[...sourceDates].join(', ') || 'missing'}.`);
+    return {
+      matched: 0,
+      unmatched: 0,
+      tradingDate: requestedDate,
+      rejectedSourceDate: true,
+      sourceDates: [...sourceDates],
+    };
+  }
+
+  const { bulkOps, matched, unmatched } = buildBseSettlementOperations(
+    bseDate,
+    instruments,
+    bhavMap,
+    closePriceMap,
+    new Date()
+  );
+
+  if (bulkOps.length > 0) await KiteInstrument.bulkWrite(bulkOps, { ordered: false });
+  console.log(`   [BSE] ✅ ${matched} matched, ${unmatched} unmatched.`);
+  return { matched, unmatched, tradingDate: requestedDate };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // MCX — official mcxindia.com BhavCopy
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -714,8 +904,14 @@ async function fetchAndApplyBhavcopy(targetDate, options = {}) {
   const applyToLivePrices = options.applyToLivePrices !== false;
   const nseFetcher = options._fetchNseBhavcopy || fetchNseBhavcopy;
   const mcxFetcher = options._fetchMcxBhavcopy || fetchMcxBhavcopy;
+  // BSE follows the same trading calendar as NSE (identical holidays), so
+  // there's no separate date-resolution path for it — reuse dates.nseDate.
+  const bseFetcher = options._fetchBseBhavcopy || fetchBseBhavcopy;
   const nseResult = await nseFetcher(dates.nseDate, allInstruments, closePriceMap, {
     allowPreviousDayFallback: !dates.explicitTarget,
+    applyToLivePrices,
+  });
+  const bseResult = await bseFetcher(dates.nseDate, allInstruments, closePriceMap, {
     applyToLivePrices,
   });
   const mcxResult = await mcxFetcher(dates.mcxDate, allInstruments, closePriceMap, {
@@ -723,7 +919,7 @@ async function fetchAndApplyBhavcopy(targetDate, options = {}) {
   });
 
   const total = Object.keys(closePriceMap).length;
-  console.log(`   Total: ${total} prices (NSE: ${nseResult.matched}, MCX: ${mcxResult.matched})`);
+  console.log(`   Total: ${total} prices (NSE: ${nseResult.matched}, BSE: ${bseResult.matched}, MCX: ${mcxResult.matched})`);
 
   if (total > 0 && applyToLivePrices) {
     try {
@@ -772,8 +968,10 @@ async function fetchAndApplyBhavcopy(targetDate, options = {}) {
   return {
     closePriceMap,
     nseMatched: nseResult.matched,
+    bseMatched: bseResult.matched,
     mcxMatched: mcxResult.matched,
     nseTradingDate: nseResult.tradingDate || dateKey(dates.nseDate),
+    bseTradingDate: bseResult.tradingDate || dateKey(dates.nseDate),
     mcxTradingDate: mcxResult.tradingDate || dateKey(dates.mcxDate),
   };
 }
@@ -782,11 +980,14 @@ module.exports = {
   fetchAndApplyBhavcopy,
   _private: {
     buildMatchKey,
+    buildBseSettlementOperations,
     buildMcxSettlementOperations,
     buildNseSettlementOperations,
+    fetchBseBhavcopy,
     fetchMcxBhavcopy,
     fetchNseBhavcopy,
     hasExactSourceDate,
+    parseBseBhavcopyCsv,
     parseMcxBhavcopyCSV,
     parseMcxSourceDate,
     parseNseDatFile,
