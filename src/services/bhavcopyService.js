@@ -104,11 +104,13 @@ function buildNseSettlementOperations(
     }
 
     const token = instrument.instrument_token.toString();
-    // Use the exchange's OFFICIAL settlement price (bhav.settle_pr), not the
-    // raw closing price (bhav.close) — they legitimately differ, and every
-    // downstream carry-forward/M2M consumer of settlement_price/ohlc_close
-    // expects the authoritative settlement value. parseNseDatFile already
-    // requires settle_pr > 0 for a row to be included, so no fallback needed.
+    // bhav.settle_pr IS bhav.close now (parseNseDatFile sets both from field
+    // 13) — a prior version sourced this from field 25 believing it was the
+    // official settlement price; confirmed via a real downloaded file that
+    // field 25 is actually the day's last traded price (0 for an illiquid
+    // contract with no trades, unlike field 13 which is always populated),
+    // and that field 13 matches the real, independently-verified settlement
+    // price. See parseNseDatFile's own comment for the full confirmation.
     closePriceMap[token] = bhav.settle_pr;
     const settlementFields = {
       settlement_price: bhav.settle_pr,
@@ -255,8 +257,17 @@ function parseNseDatFile(text) {
     if (!line || line.length < 50) continue;
 
     const c = line.split(',').map(s => s.trim());
-    // FNO_BC layout: close is field 13, source trading date is field 21,
-    // and the exchange's official daily settlement price is field 25.
+    // FNO_BC layout: close (the real official settlement price) is field 13,
+    // source trading date is field 21. Field 25 was previously (wrongly)
+    // treated as "the official settlement price" — confirmed against a real
+    // downloaded file this was actually the day's LAST TRADED PRICE, not the
+    // settlement price: for an illiquid contract with zero trades that day,
+    // field 25 is 0 (nothing traded) while field 13 still holds a real
+    // theoretical closing/settlement value, exactly the pattern of an LTP
+    // field vs. an always-populated settlement price. A real comparison also
+    // confirmed field 13 matches the actual, independently-verified official
+    // settlement price (e.g. COLPAL26AUGFUT: field 13 = 1892.50, the
+    // confirmed-correct value; field 25 = 1895.50, the day's LTP).
     if (c.length < 26) continue;
 
     const instrument = c[1]; // FUTSTK, FUTIDX, OPTSTK, OPTIDX
@@ -268,11 +279,10 @@ function parseNseDatFile(text) {
     const high = parseFloat(c[11]) || 0;
     const low = parseFloat(c[12]) || 0;
     const close = parseFloat(c[13]) || 0;
-    const settlePr = parseFloat(c[25]) || 0;
     const sourceDate = parseNseSourceDate(c[21]);
     if (sourceDate) sourceDates.add(sourceDate);
 
-    if (!underlying || !expiryRaw || settlePr <= 0 || !sourceDate) continue;
+    if (!underlying || !expiryRaw || close <= 0 || !sourceDate) continue;
     if (!instrument) continue;
 
     // Convert DDMMYYYY → YYYYMMDD
@@ -293,7 +303,7 @@ function parseNseDatFile(text) {
 
     const strike = instType === 'FUT' ? '0' : String(Math.round(strikePr));
     const key = `${underlying}|${expiryNorm}|${strike}|${instType}`;
-    map.set(key, { open, high, low, close, settle_pr: settlePr, sourceDate });
+    map.set(key, { open, high, low, close, settle_pr: close, sourceDate });
   }
   map.sourceDates = sourceDates;
   return map;

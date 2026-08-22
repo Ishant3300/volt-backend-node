@@ -79,13 +79,19 @@ describe('official bhavcopy parsing and exact authority', () => {
     '31/JUL/2026', '7288', '00007891.50', '00006651.00', '00007240.00',
   ].join(',');
 
-  test('NSE uses the official settlement field, not close, and validates source date', () => {
+  test('NSE uses the official settlement field (close, field 13), not field 25 (LTP), and validates source date', () => {
+    // Confirmed via a real downloaded NSE bhavcopy file: field 25 is the
+    // day's last traded price (0 for an illiquid contract with no trades
+    // that day), NOT the official settlement price — field 13 ("close") is
+    // always populated and matches the real, independently-verified
+    // settlement price. A prior version of this test (and the code)
+    // believed field 25 was authoritative; both were wrong.
     const parsed = parseNseDatFile(nseFuturesLine);
     const row = [...parsed.values()][0];
     expect([...parsed.sourceDates]).toEqual(['2026-07-31']);
     expect(row.close).toBe(7283.5);
-    expect(row.settle_pr).toBe(7240);
-    expect(row.settle_pr).not.toBe(row.close);
+    expect(row.settle_pr).toBe(7283.5);
+    expect(row.settle_pr).toBe(row.close);
     expect(hasExactSourceDate(parsed, new Date('2026-07-31T00:00:00.000Z'))).toBe(true);
     expect(hasExactSourceDate(parsed, new Date('2026-07-30T00:00:00.000Z'))).toBe(false);
   });
@@ -119,13 +125,13 @@ describe('official bhavcopy parsing and exact authority', () => {
     );
 
     expect(result).toMatchObject({ matched: 1, unmatched: 0 });
-    expect(closePriceMap).toEqual({ '2001': 7240 });
+    expect(closePriceMap).toEqual({ '2001': 7283.5 });
     expect(result.bulkOps[0].updateOne.update.$set).toMatchObject({
-      settlement_price: 7240,
+      settlement_price: 7283.5,
       settlement_price_date: new Date('2026-07-31T00:00:00.000Z'),
       settlement_price_source: 'NSE_OFFICIAL_BHAVCOPY_SETTLEMENT',
       settlement_price_updated_at: updatedAt,
-      ohlc_close: 7240,
+      ohlc_close: 7283.5,
     });
     expect(result.bulkOps[0].updateOne.update.$set).not.toHaveProperty('last_price');
   });
