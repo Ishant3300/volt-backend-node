@@ -104,6 +104,11 @@ app.get('/', (req, res) => {
 });
 
 app.use('/api/auth', authRoutes);
+
+// Global middleware: block all non-auth API calls if user/master needs to change password
+const { requirePasswordChanged } = require('./middlewares/requirePasswordChange');
+app.use('/api', requirePasswordChanged);
+
 app.use('/api/admin', adminRoutes);
 app.use('/api/users', userRoutes);
 app.use('/api/kite', kiteRoutes);

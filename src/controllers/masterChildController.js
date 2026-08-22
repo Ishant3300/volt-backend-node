@@ -130,7 +130,7 @@ const createChildMaster = async (req, res) => {
         exchanges_allowed: normalizedExchangesAllowed,
         trade_limit: normalizedTradeLimit,
         add_master: add_master || false,
-        change_pass_on_first_login: change_pass_on_first_login || false,
+        change_pass_on_first_login: change_pass_on_first_login !== undefined ? change_pass_on_first_login : true,
         server_id,
         master_id: parentMaster ? parentMaster._id : null,
         admin_id: adminId,
