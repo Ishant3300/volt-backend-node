@@ -960,7 +960,11 @@ const createBrokerageSettings = async (req, res) => {
       { type, exchange_name, script_name, user_id: user_id || null, deleted_at: null },
       // effective_from stamps the moment this rate takes effect (insert or update).
       { type, exchange_name, script_name, user_id: user_id || null, brk_value, deleted_at: null, effective_from: new Date() },
-      { upsert: true, new: true, setDefaultsOnInsert: true }
+      // runValidators — without it, Mongoose skips schema validation (including
+      // the `type` enum) on findOneAndUpdate/upsert. A frontend that offers a
+      // value outside the enum (e.g. a stale/removed brokerage type) would
+      // otherwise be saved silently instead of rejected with a clear error.
+      { upsert: true, new: true, setDefaultsOnInsert: true, runValidators: true }
     );
 
     res.status(201).json({

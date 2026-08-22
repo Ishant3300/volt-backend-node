@@ -154,6 +154,20 @@ const placeTrade = async (req, res) => {
                 throw new Error('User not found');
             }
 
+            // A master must only be able to place trades for users in their
+            // own subtree (any depth — sub-masters' users included), never
+            // an arbitrary user_id. Previously unchecked: any master could
+            // pass any user_id and this would place a real trade against
+            // that account. Admin remains unrestricted by design.
+            if (req.master) {
+                const { getAllSubMasterIds } = require('../services/masterHierarchyService');
+                const allowedMasterIds = await getAllSubMasterIds(req.master.id);
+                const userMasterId = (user.master_id?._id || user.master_id)?.toString();
+                if (!userMasterId || !allowedMasterIds.includes(userMasterId)) {
+                    throw new Error('Not authorized to place a trade for this user');
+                }
+            }
+
             // NOTE: The old live free-margin gate (metricsEngine equity/free_margin) is
             // replaced by the category-wallet gate applied at execution time below
             // (walletService.block). LIMIT orders no longer warn on free margin at
@@ -1145,6 +1159,7 @@ const placeTrade = async (req, res) => {
 
         let statusCode = error.status || 500;
         if (error.message === 'User not found') statusCode = 404;
+        else if (error.message === 'Not authorized to place a trade for this user') statusCode = 403;
         else if (error.message.includes('Option selling is not allowed') || error.message.includes('would create a short position')) statusCode = 403;
         else if (error.message.includes('Trading is currently disabled')) statusCode = 403;
         else if (error.message.includes('close-only mode')) statusCode = 403;
@@ -1344,17 +1359,37 @@ getPositions = async (req, res) => {
  */
 const cancelTrade = async (req, res) => {
     try {
-        const userId = req.user?.id || req.master?.id || req.admin?.id;
         const { tradeId } = req.params;
 
-        if (!userId) {
+        if (!req.user && !req.master && !req.admin) {
             return res.status(401).json({ success: false, message: 'Unauthorized' });
         }
 
-        const trade = await Trade.findOne({ _id: tradeId, user_id: userId, deleted_at: null });
+        const trade = await Trade.findOne({ _id: tradeId, deleted_at: null });
 
         if (!trade) {
             return res.status(404).json({ success: false, message: 'Trade not found' });
+        }
+
+        // Ownership check. A trade's user_id is always the CLIENT it belongs
+        // to, even when placed by a master/admin on that client's behalf —
+        // req.user/master/admin.id can never equal it for those callers, so
+        // this previously matched user_id against the CALLER's own id
+        // unconditionally, meaning a master/admin could never cancel a
+        // client's pending order at all. A User may only cancel their own
+        // order; a Master may cancel any order belonging to a user anywhere
+        // in their subtree (trade.master_id is that user's DIRECT master,
+        // which may be several tiers below the caller); Admin may cancel any.
+        if (req.user) {
+            if (trade.user_id.toString() !== req.user.id) {
+                return res.status(403).json({ success: false, message: 'Not authorized to cancel this trade' });
+            }
+        } else if (req.master && !req.admin) {
+            const { getAllSubMasterIds } = require('../services/masterHierarchyService');
+            const allowedMasterIds = await getAllSubMasterIds(req.master.id);
+            if (!trade.master_id || !allowedMasterIds.includes(trade.master_id.toString())) {
+                return res.status(403).json({ success: false, message: 'Not authorized to cancel this trade' });
+            }
         }
 
         if (trade.status !== 'pending') {

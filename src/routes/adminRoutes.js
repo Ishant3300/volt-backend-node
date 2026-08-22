@@ -137,7 +137,15 @@ router.put('/brokerage-settings/bulk-update', authenticateAdminOrMaster, async (
     // Stamp effective_from so this new rate only applies to trades from now onwards.
     const updateFields = { brk_value, effective_from: new Date() };
     if (type) updateFields.type = type;
-    const result = await BrokerageSettings.updateMany({ _id: { $in: ids }, deleted_at: null }, { $set: updateFields });
+    // runValidators — updateMany skips schema validation by default (including
+    // the `type` enum), so an unsupported type (e.g. a stale/removed option
+    // like the old "CRORE WISE") would otherwise save silently and then
+    // brokerageService.js would silently compute 0 brokerage for it forever.
+    const result = await BrokerageSettings.updateMany(
+      { _id: { $in: ids }, deleted_at: null },
+      { $set: updateFields },
+      { runValidators: true }
+    );
 
     // Reload metricsEngine rules so brokerage calculations use the new values immediately
     try { const me = require('../services/metricsEngine'); me.reloadRules(); } catch (_) {}

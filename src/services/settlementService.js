@@ -171,6 +171,9 @@ function settlementHistoryRunId(run) {
 
 function expectedPriceDateForInstrument(run, instrument) {
   if (instrument?.exchange === 'MCX') return run.price_dates?.mcx;
+  // BSE/BFO share NSE's trading calendar (bhavcopyService.js resolves BSE's
+  // target date from the same nseDate, not a separate calendar) — reusing
+  // price_dates.nse here stays consistent with that, not a mix-up.
   if (['NFO', 'NSE', 'BFO', 'BSE'].includes(instrument?.exchange)) return run.price_dates?.nse;
   return null;
 }
@@ -178,7 +181,12 @@ function expectedPriceDateForInstrument(run, instrument) {
 function hasOfficialSettlementAuthority(instrument) {
   const source = String(instrument?.settlement_price_source || '');
   if (instrument?.exchange === 'MCX') return source.startsWith('MCX_OFFICIAL_BHAVCOPY_');
-  if (['NFO', 'NSE', 'BFO', 'BSE'].includes(instrument?.exchange)) {
+  // BSE/BFO get their own settlement_price_source prefix from
+  // bhavcopyService.js's fetchBseBhavcopy (BSE_OFFICIAL_BHAVCOPY_...) —
+  // previously required the NSE prefix here, so a correctly-fetched BSE
+  // price would fail this check and never be treated as authoritative.
+  if (['BFO', 'BSE'].includes(instrument?.exchange)) return source.startsWith('BSE_OFFICIAL_BHAVCOPY_');
+  if (['NFO', 'NSE'].includes(instrument?.exchange)) {
     return source.startsWith('NSE_OFFICIAL_BHAVCOPY_');
   }
   return false;
