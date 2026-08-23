@@ -416,7 +416,14 @@ const updateMaster = async (req, res) => {
     // Handle investor password: set if provided, clear if empty string
     if (investor_password !== undefined) {
       if (investor_password && investor_password.trim()) {
-        if (password && investor_password === password) {
+        // Compare against the account's real current password (already
+        // updated above if `password` was also part of this request) —
+        // NOT just a `password` resent in this same request. Editing only
+        // the investor password (the normal case — the main password field
+        // is left blank) previously skipped this check entirely, since
+        // `password` was falsy, letting the investor password silently
+        // match the real one.
+        if (await bcrypt.compare(investor_password, master.password)) {
           return res.status(400).json({ success: false, message: 'Investor password must be different from the main password', data: null });
         }
         master.investor_password = await bcrypt.hash(investor_password, 10);

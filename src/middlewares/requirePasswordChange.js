@@ -1,13 +1,31 @@
 /**
  * Middleware: Block API access if user/master has a pending password reset.
  *
- * Enforces ONLY when BOTH conditions are true:
- *   1. change_pass_on_first_login === true
- *   2. The user has NEVER successfully logged in before (last_login is null)
+ * Enforces purely on change_pass_on_first_login === true — NOT also on
+ * last_login being unset. A prior version additionally required
+ * `!user.last_login`, believing that distinguished "never logged in before"
+ * from "has logged in before" — but universalLogin sets AND saves
+ * `last_login = new Date()` on every login, including the very first one,
+ * before the response is even sent. So by the time any request using that
+ * fresh token reached this middleware, last_login was already set from that
+ * same login, making `!user.last_login` always false and the block
+ * permanently unreachable — the enforcement never actually fired for
+ * anyone; only the Flutter app's own client-side check of the login
+ * response's `requires_password_change` flag did anything.
  *
- * This ensures backward compatibility — existing accounts that have already
- * been using the app are never locked out, even if they have the flag set
- * from before this feature was enforced.
+ * change_pass_on_first_login alone is the correct, sufficient signal: it's
+ * only ever cleared in changePassword after a real password reset, so it
+ * stays true across as many logins as it takes until the user actually
+ * changes their password — which is the intended behavior (keep blocking
+ * them every time, not just once).
+ *
+ * Backward compatibility for pre-existing accounts holds regardless: the
+ * schema default is `false`, and `true` is only ever written explicitly by
+ * the create-account controllers (adminController.js, masterController.js,
+ * masterUserController.js, masterChildController.js) — an old account
+ * created before this feature existed simply never had the field set, so
+ * it reads back `undefined`/`false`, not `true`, and `=== true` correctly
+ * skips enforcement for it.
  */
 const jwt = require('jsonwebtoken');
 const User = require('../models/User');
@@ -50,16 +68,8 @@ const requirePasswordChanged = async (req, res, next) => {
 
     // Check the flag for users
     if (decoded.role === 'user') {
-      const user = await User.findById(decoded.id).select('change_pass_on_first_login last_login').lean();
-      // Only enforce if flag is true AND user has never logged in before this session
-      // (last_login is set DURING the current login, so for a truly new user their
-      // last_login will be the current session time — but they'll have logged in exactly once.
-      // We use a count-based approach: if last_login exists and was set MORE than 5 seconds ago,
-      // it means they had a prior session — skip enforcement.)
-      // Simpler approach: only enforce if the flag is true. The login response already
-      // tells the Flutter app to show the reset screen. This middleware is the safety net
-      // for direct API callers. Old accounts will be fixed by a one-time migration.
-      if (user && user.change_pass_on_first_login === true && !user.last_login) {
+      const user = await User.findById(decoded.id).select('change_pass_on_first_login').lean();
+      if (user && user.change_pass_on_first_login === true) {
         return res.status(403).json({
           success: false,
           message: 'Password change required before accessing the application',
@@ -70,8 +80,8 @@ const requirePasswordChanged = async (req, res, next) => {
 
     // Check the flag for masters
     if (decoded.role === 'master') {
-      const master = await Master.findById(decoded.id).select('change_pass_on_first_login last_login').lean();
-      if (master && master.change_pass_on_first_login === true && !master.last_login) {
+      const master = await Master.findById(decoded.id).select('change_pass_on_first_login').lean();
+      if (master && master.change_pass_on_first_login === true) {
         return res.status(403).json({
           success: false,
           message: 'Password change required before accessing the application',
