@@ -515,6 +515,10 @@ const placeTrade = async (req, res) => {
         }
 
         let resultTrade;
+        // Captured for the Trade Alert broadcast below (outside the
+        // transaction closure) — reuses the `user` doc already fetched
+        // here for every other check in this function, no extra query.
+        let resultUserInfo = null;
         tradeWriteLease = await beginTradeWrite('place_trade');
 
         await session.withTransaction(async () => {
@@ -523,6 +527,7 @@ const placeTrade = async (req, res) => {
             if (!user) {
                 throw new Error('User not found');
             }
+            resultUserInfo = { name: user.name, username: user.username };
 
             // A master must only be able to place trades for users in their
             // own subtree (any depth — sub-masters' users included), never
@@ -1215,6 +1220,30 @@ const placeTrade = async (req, res) => {
                 pnl: resultTrade.pnl,
                 brokerage: resultTrade.brokerage,
             });
+
+            // Trade Alert (web-only): live log for a master watching their
+            // whole downstream tree, plus admin. Purely additive, own
+            // try/catch so any failure here can never affect the trade
+            // response already computed above.
+            try {
+                const metricsEngine = require('../services/metricsEngine');
+                metricsEngine.broadcastTradeAlert(resultTrade.user_id.toString(), {
+                    trade_id: resultTrade._id.toString(),
+                    user_id: resultTrade.user_id.toString(),
+                    client_name: resultUserInfo?.name || null,
+                    client_username: resultUserInfo?.username || null,
+                    instrument_token: resultTrade.instrument_token,
+                    tradingsymbol: resultTrade.tradingsymbol,
+                    transaction_type: resultTrade.transaction_type,
+                    quantity: resultTrade.executed_quantity,
+                    price: resultTrade.executed_price,
+                    order_type: resultTrade.order_type,
+                    status: 'completed',
+                    executed_at: resultTrade.executed_at || new Date(),
+                });
+            } catch (alertErr) {
+                console.error('⚠️ [TradeAlert] broadcast error:', alertErr.message);
+            }
         }
 
         // Register pending LIMIT and SL/SL-M orders before releasing the
@@ -1260,6 +1289,30 @@ const placeTrade = async (req, res) => {
                     order_type: resultTrade.order_type,
                     status: 'pending',
                 });
+
+                // Trade Alert (web-only): a pending LIMIT/SL/SL-M order was
+                // just placed, not yet filled — logged with status
+                // 'pending' so the live log distinguishes it from an actual
+                // execution. Own try/catch, purely additive.
+                try {
+                    const metricsEngine = require('../services/metricsEngine');
+                    metricsEngine.broadcastTradeAlert(resultTrade.user_id.toString(), {
+                        trade_id: resultTrade._id.toString(),
+                        user_id: resultTrade.user_id.toString(),
+                        client_name: resultUserInfo?.name || null,
+                        client_username: resultUserInfo?.username || null,
+                        instrument_token: resultTrade.instrument_token,
+                        tradingsymbol: resultTrade.tradingsymbol,
+                        transaction_type: resultTrade.transaction_type,
+                        quantity: resultTrade.quantity,
+                        price: resultTrade.price,
+                        order_type: resultTrade.order_type,
+                        status: 'pending',
+                        executed_at: resultTrade.created_at || new Date(),
+                    });
+                } catch (alertErr) {
+                    console.error('⚠️ [TradeAlert] broadcast error:', alertErr.message);
+                }
             }
         }
 

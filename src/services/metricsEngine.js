@@ -15,8 +15,9 @@ const BrokerageSettings = require('../models/BrokerageSettings');
 const KiteInstrument = require('../models/KiteInstrument');
 const SettlementHistory = require('../models/SettlementHistory');
 const SettlementRun = require('../models/SettlementRun');
-const { dateRange, isWeekendInIndia } = require('../utils/settlementDates');
+const { dateRange, isWeekendInIndia, getLatestDueSettlementFriday, toIndiaDateOnly } = require('../utils/settlementDates');
 const { allowedCategories } = require('../utils/walletCategory');
+const { GLOBAL_INDEX_NAMES } = require('../constants/massiveInstruments');
 
 class MetricsEngine {
   constructor() {
@@ -53,6 +54,13 @@ class MetricsEngine {
     this._appliedSettlementRunId = null;
     this._settlementSyncPromise = null;
     this._lastSettlementCheckAt = 0;
+
+    // adminId (string) → { ids: Set<masterId>, expiresAt: epoch ms }. This
+    // broadcast runs on every tick batch (can fire multiple times per
+    // second), so a per-admin master-visibility lookup cannot hit the DB
+    // fresh every time — short TTL bounds staleness after a Super Admin
+    // edit to a few seconds instead of doing it on every single tick.
+    this._adminHiddenMasterCache = new Map();
 
     this._initialized = false;
   }
@@ -263,6 +271,7 @@ class MetricsEngine {
       const walletBalances = {
         NSE: Number(wallet?.NSE) || 0,
         MCX: Number(wallet?.MCX) || 0,
+        COMEX: Number(wallet?.COMEX) || 0,
         GLOBAL: Number(wallet?.GLOBAL) || 0,
       };
       const allowedCats = allowedCategories(exchangesAllowed || []);
@@ -500,7 +509,7 @@ class MetricsEngine {
     if (!cache) return null;
 
     const { credit, settledPnl, openPositions, fifoPnl, brokerage, wallet, allowedCategories: allowedCats } = cache;
-    const walletBalances = wallet || { NSE: 0, MCX: 0, GLOBAL: 0 };
+    const walletBalances = wallet || { NSE: 0, MCX: 0, COMEX: 0, GLOBAL: 0 };
     const allowed = allowedCats || [];
 
     let totalFloating = 0;
@@ -539,6 +548,7 @@ class MetricsEngine {
         instrument_token: pos.token,
         exchange: pos.exchange,
         tradingsymbol: pos.tradingsymbol,
+        raw_name: pos.rawName || '',
         net_qty: pos.netQty,
         avg_buy_price: Math.round(pos.avgBuy * 100) / 100,
         avg_sell_price: Math.round(pos.avgSell * 100) / 100,
@@ -629,10 +639,55 @@ class MetricsEngine {
   }
 
   /**
+   * Broadcast a single trade event (placed, executed, or filled later off
+   * a pending LIMIT/SL order) to the trade owner's DIRECT MASTER and every
+   * ancestor master up the chain, plus all admin clients — for the Trade
+   * Alert live-log page. Same fan-out walk _broadcastUserMetrics already
+   * uses for metrics_update (this._userCache / this._masterParentMap),
+   * just a different event type and payload; does not touch or replace
+   * anything that function does. Deliberately does NOT send to the trade
+   * owner's own socket — trade_executed/trade_placed already cover that
+   * separately (tradeController.js), this is purely for the
+   * watching-my-tree audience.
+   *
+   * Swallows its own errors — a failure here must never affect the trade
+   * placement/fill flow that calls it. Call sites wrap this in their own
+   * try/catch too as a second layer, since this runs on the hot trade path.
+   */
+  broadcastTradeAlert(userId, alertData) {
+    if (!this.livePriceService) return;
+    try {
+      const msg = { type: 'trade_alert', data: alertData };
+
+      const cache = this._userCache.get(userId);
+      if (cache && cache.masterId) {
+        let currentMasterId = cache.masterId;
+        const visited = new Set();
+        while (currentMasterId && !visited.has(currentMasterId)) {
+          visited.add(currentMasterId);
+          this.livePriceService.broadcastToUser(currentMasterId, msg);
+          currentMasterId = this._masterParentMap?.[currentMasterId] || null;
+        }
+      }
+
+      if (this.livePriceService.wss) {
+        const raw = JSON.stringify(msg);
+        this.livePriceService.wss.clients.forEach(client => {
+          if (client.readyState === 1 && client.isAdmin) {
+            client.send(raw);
+          }
+        });
+      }
+    } catch (e) {
+      console.error('📊 [MetricsEngine] broadcastTradeAlert error:', e.message);
+    }
+  }
+
+  /**
    * Aggregate per-user metrics into per-master totals and broadcast to masters/admins.
    * Each master receives data for ALL users in their hierarchy (direct + sub-masters' users).
    */
-  _broadcastMasterMetrics() {
+  async _broadcastMasterMetrics() {
     if (!this.livePriceService) return;
 
     // Step 1: Build direct master → users mapping
@@ -736,7 +791,6 @@ class MetricsEngine {
     // Broadcast admin-level summary
     if (this.livePriceService.wss) {
       // For admin, group by top-level master (master_id = null or created by admin)
-      const adminSummary = [];
       const topLevelMasters = new Set();
       for (const mid of Object.keys(directMasterUsers)) {
         // Walk up to find the top-level master
@@ -747,51 +801,112 @@ class MetricsEngine {
         topLevelMasters.add(current);
       }
 
-      for (const masterId of topLevelMasters) {
-        const descendantMasterIds = this._getDescendantMasterIds(masterId);
-        const allMasterIdsForThis = [masterId, ...descendantMasterIds];
-        let totalPnl = 0;
-        let userCount = 0;
-        for (const mid of allMasterIdsForThis) {
-          const users = directMasterUsers[mid] || [];
-          userCount += users.length;
-          for (const u of users) {
-            totalPnl += (u.realised_pnl || 0) + (u.position_pnl || 0);
-          }
-        }
-        // Aggregate wallet for admin across this master's users
-        const adminMasterWallet = {};
-        const allUsersForAdmin = [];
-        for (const mid of allMasterIdsForThis) {
-          const users = directMasterUsers[mid] || [];
-          for (const u of users) {
-             allUsersForAdmin.push(u);
-             if (u.wallet) {
-                for (const [cat, val] of Object.entries(u.wallet)) {
-                   adminMasterWallet[cat] = (adminMasterWallet[cat] ?? 0) + (Number(val) || 0);
-                }
-             }
-          }
-        }
-        for (const cat of Object.keys(adminMasterWallet)) {
-          adminMasterWallet[cat] = Math.round(adminMasterWallet[cat] * 100) / 100;
-        }
+      // Per-admin master-visibility restriction: a hidden master's
+      // contribution must be excluded from these live totals, not just
+      // from the REST snapshot endpoints — this is the same continuous
+      // stream those endpoints' initial load is seeded from. Different
+      // admins can have different hidden sets, so the summary is built
+      // once per unique connected admin, not once globally.
+      const adminClients = [];
+      this.livePriceService.wss.clients.forEach(client => {
+        if (client.readyState === 1 && client.isAdmin) adminClients.push(client);
+      });
+      if (adminClients.length === 0) return;
 
-        adminSummary.push({
-          master_id: masterId,
-          total_pnl: Math.round(totalPnl * 100) / 100,
-          user_count: userCount,
-          wallet: adminMasterWallet
+      const uniqueAdminIds = [...new Set(adminClients.map(c => c.authUserId).filter(Boolean))];
+      const hiddenByAdmin = new Map();
+      await Promise.all(uniqueAdminIds.map(async (adminId) => {
+        hiddenByAdmin.set(adminId, await this._getHiddenMasterIdsForAdmin(adminId));
+      }));
+
+      const buildSummaryFor = (hiddenMasterIds) => {
+        const adminSummary = [];
+        for (const masterId of topLevelMasters) {
+          if (hiddenMasterIds.has(masterId)) continue;
+          const descendantMasterIds = this._getDescendantMasterIds(masterId);
+          const allMasterIdsForThis = [masterId, ...descendantMasterIds].filter(
+            mid => !hiddenMasterIds.has(mid)
+          );
+          let totalPnl = 0;
+          let userCount = 0;
+          for (const mid of allMasterIdsForThis) {
+            const users = directMasterUsers[mid] || [];
+            userCount += users.length;
+            for (const u of users) {
+              totalPnl += (u.realised_pnl || 0) + (u.position_pnl || 0);
+            }
+          }
+          // Aggregate wallet for admin across this master's users
+          const adminMasterWallet = {};
+          for (const mid of allMasterIdsForThis) {
+            const users = directMasterUsers[mid] || [];
+            for (const u of users) {
+              if (u.wallet) {
+                for (const [cat, val] of Object.entries(u.wallet)) {
+                  adminMasterWallet[cat] = (adminMasterWallet[cat] ?? 0) + (Number(val) || 0);
+                }
+              }
+            }
+          }
+          for (const cat of Object.keys(adminMasterWallet)) {
+            adminMasterWallet[cat] = Math.round(adminMasterWallet[cat] * 100) / 100;
+          }
+
+          adminSummary.push({
+            master_id: masterId,
+            total_pnl: Math.round(totalPnl * 100) / 100,
+            user_count: userCount,
+            wallet: adminMasterWallet
+          });
+        }
+        return adminSummary;
+      };
+
+      // Build once per unique admin id, then fan out to that admin's own
+      // socket(s) — an admin can have more than one dashboard tab open.
+      const summaryByAdminId = new Map();
+      for (const adminId of uniqueAdminIds) {
+        summaryByAdminId.set(adminId, buildSummaryFor(hiddenByAdmin.get(adminId) || new Set()));
+      }
+      for (const client of adminClients) {
+        const summary = summaryByAdminId.get(client.authUserId) || [];
+        try {
+          client.send(JSON.stringify({ type: 'admin_metrics_update', data: summary }));
+        } catch (_) {}
+      }
+    }
+  }
+
+  /**
+   * Resolve (with a short-TTL cache) the set of master ids a given Admin
+   * has hidden — including the full sub-master subtree, same expansion
+   * `getAdminHiddenMasterIds` performs for the REST endpoints.
+   */
+  async _getHiddenMasterIdsForAdmin(adminId) {
+    const cached = this._adminHiddenMasterCache.get(adminId);
+    if (cached && cached.expiresAt > Date.now()) return cached.ids;
+
+    let ids = new Set();
+    try {
+      const Admin = require('../models/Admin');
+      const { getAdminHiddenMasterIds } = require('./masterHierarchyService');
+      const adminDoc = await Admin.findById(adminId).select('is_super_admin hidden_master_ids').lean();
+      if (adminDoc && !adminDoc.is_super_admin && (adminDoc.hidden_master_ids || []).length > 0) {
+        ids = await getAdminHiddenMasterIds({
+          isSuperAdmin: false,
+          hiddenMasterIds: adminDoc.hidden_master_ids.map(id => id.toString()),
         });
       }
-
-      const msg = JSON.stringify({ type: 'admin_metrics_update', data: adminSummary });
-      this.livePriceService.wss.clients.forEach(client => {
-        if (client.readyState === 1 && client.isAdmin) {
-          client.send(msg);
-        }
-      });
+    } catch (_) {
+      // On lookup failure, fail closed to "no restriction lifted beyond
+      // cache" is not possible here — default to an empty set (matches
+      // unrestricted) rather than silently blocking a legitimate admin's
+      // whole dashboard over a transient DB hiccup.
+      ids = new Set();
     }
+
+    this._adminHiddenMasterCache.set(adminId, { ids, expiresAt: Date.now() + 10_000 });
+    return ids;
   }
 
   /**
@@ -958,18 +1073,56 @@ class MetricsEngine {
       if (applyPrices) {
         const nseRange = dateRange(run.price_dates?.nse || run.trading_date);
         const mcxRange = dateRange(run.price_dates?.mcx || run.trading_date);
+        const globalRange = dateRange(run.price_dates?.global || run.trading_date);
+
+        // The picked SettlementRun record is a WEEKLY settlement-cycle log — it
+        // can legitimately lag behind the actual latest trading day by up to a
+        // few days (e.g. the current Friday's weekly run hasn't been created
+        // yet even though Friday's bhavcopy-sourced settlement_price on each
+        // instrument was already refreshed same-day). Union in the actual
+        // latest-due settlement Friday's own date range so an instrument this
+        // fresh is never excluded just because the run bookkeeping hasn't
+        // caught up.
+        const latestFriday = getLatestDueSettlementFriday(options.now || new Date());
+        const latestRange = dateRange(latestFriday);
+
+        // A run's own trading_date is the reference point priceMap's
+        // SettlementHistory snapshots represent — a carry-forward reopen
+        // price frozen at THAT settlement, e.g. "this user's position was
+        // reopened at 13498 back on 2026-08-28". That's correct as a
+        // historical fact, but priceMap.set(token, ...) makes it win via
+        // `if (!allPriceMap.has(token))` below FOREVER after, even once a
+        // newer Friday's official settlement_price (12722, refreshed
+        // same-day from bhavcopy) is clearly the more current, authoritative
+        // number — confirmed real: MARUTI26SEPFUT kept showing CMP 13498
+        // (an Aug-28 carry-forward reopen price, not a bug value) instead of
+        // its correct, much more recent settlement price, purely because the
+        // picked run was still Aug-28 (no newer run exists yet) and its own
+        // stale snapshot price kept winning over the instrument's own fresher
+        // data. Instruments whose settlement_price_date is strictly newer
+        // than this run's own reference date represent objectively more
+        // current pricing than anything priceMap could know about — those
+        // must override, not just fill gaps.
+        const runReferenceDate = toIndiaDateOnly(run.trading_date);
         const instruments = await KiteInstrument.find({
           is_active: true,
           deleted_at: null,
           settlement_price: { $gt: 0 },
           $or: [
             { exchange: 'MCX', settlement_price_date: { $gte: mcxRange.start, $lt: mcxRange.end } },
-            { exchange: { $ne: 'MCX' }, settlement_price_date: { $gte: nseRange.start, $lt: nseRange.end } },
+            { exchange: 'COMEX', settlement_price_date: { $gte: globalRange.start, $lt: globalRange.end } },
+            { exchange: 'GLOBAL', name: { $in: GLOBAL_INDEX_NAMES }, settlement_price_date: { $gte: globalRange.start, $lt: globalRange.end } },
+            { exchange: { $nin: ['MCX', 'COMEX', 'GLOBAL'] }, settlement_price_date: { $gte: nseRange.start, $lt: nseRange.end } },
+            { exchange: 'GLOBAL', name: { $nin: GLOBAL_INDEX_NAMES }, settlement_price_date: { $gte: nseRange.start, $lt: nseRange.end } },
+            { settlement_price_date: { $gte: latestRange.start, $lt: latestRange.end } },
           ],
-        }).select('instrument_token settlement_price').lean();
+        }).select('instrument_token settlement_price settlement_price_date').lean();
         for (const instrument of instruments) {
           const token = instrument.instrument_token.toString();
-          if (!allPriceMap.has(token)) allPriceMap.set(token, Number(instrument.settlement_price));
+          const isNewerThanRun = instrument.settlement_price_date && new Date(instrument.settlement_price_date) > runReferenceDate;
+          if (isNewerThanRun || !allPriceMap.has(token)) {
+            allPriceMap.set(token, Number(instrument.settlement_price));
+          }
         }
 
         for (const [token, price] of allPriceMap) {
