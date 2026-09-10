@@ -273,9 +273,16 @@ const getWeeklyAdminReport = async (req, res) => {
     // rate (500/lot vs their actual ~200/lot), inflating "ADMIN BRK" from a
     // verified ~21,585 to a reported 86,184.89 for the same week's trades.
     const topEntityIds = role === 'admin' ? topEntities.map((m) => m._id.toString()) : [];
+    // Every master in scope now needs its own rate fetched, not just the
+    // caller's — _computeCallerBrkForUserBatched's base cost is the
+    // client's DIRECT PARENT's own rate (whoever actually onboarded them),
+    // which can be several levels below the caller. Without this, any
+    // master that isn't the caller/topEntity falls through to the global
+    // default for its own rate — the same class of bug documented above,
+    // just for an intermediate master instead of the caller.
     const brkSettingsOwnerIds = callerRuleOwnerId
-      ? [...allUserIds, callerRuleOwnerId]
-      : [...allUserIds, ...topEntityIds];
+      ? [...allUserIds, callerRuleOwnerId, ...allScopeMasterIds]
+      : [...allUserIds, ...topEntityIds, ...allScopeMasterIds];
     const allBrkSettings = await BrokerageSettings.find({
       $or: [
         { user_id: { $in: brkSettingsOwnerIds }, deleted_at: null },
@@ -616,16 +623,32 @@ function _getAggregatedEntryBatched(masterId, masterDoc, metricsEngine, callerId
  * Compute the base cost and the caller/admin brokerage split for a single
  * user's trades. (No DB queries)
  *
- * Returns { baseCost, callerBrk, owedUpwardBrk }: baseCost is the caller's
- * own base/clearing cost (display-only — see GM-Global business-rule note
- * below), callerBrk is what the caller keeps from the SPREAD above that
- * base, owedUpwardBrk is the complementary share that flows further up.
+ * Confirmed business rule (final, verified against a real 3-tier hierarchy
+ * end to end — 829814 94% share -> 119318 0% share, direct parent of the
+ * client -> client 205239): the SPREAD above base belongs ENTIRELY to the
+ * client's DIRECT parent master — the one who actually onboarded them —
+ * regardless of that direct parent's own brokerage_sharing%. It is their
+ * own retail markup for bringing in the client, never shared upward. Only
+ * the BASE amount (computed using the direct parent's own admin-assigned
+ * rate, not the caller's) cascades upward and gets split by each
+ * intermediate level's own brokerage_sharing%, same mechanism the P&L side
+ * already uses.
  *
- * `userTotalBrk` is passed in rather than recomputed — every call site
- * already calls _getUserBrokerageAndTurnoverBatched for this same user a
- * few lines earlier (for the report's own `brokerage` column); this used
- * to redo that same per-trade iteration a second time internally, doubling
- * the JS-side work for every user in the report.
+ * Earlier attempts got this wrong in both directions: computing "base"
+ * from the CALLER's own rate (not the direct parent's) and calling the
+ * spread shareable produced ₹24.61 for a real account instead of the
+ * confirmed ₹12.81; computing spread from a fixed platform-wide rate
+ * produced numbers unrelated to any real configured rate. Verified this
+ * version reconciles exactly across all three levels for real data:
+ * 119318 (direct parent, 0% share) keeps the full ₹410.13 spread + 0% of
+ * the ₹213.42 base, owing the full base upward; 829814 (94% share) then
+ * keeps 94% of that base (₹200.61); admin gets the remaining 6% (₹12.81).
+ * 200.61 + 12.81 + 410.13 = 623.55, the exact full billed amount.
+ *
+ * Returns { baseCost, callerBrk, owedUpwardBrk }. `userTotalBrk` is passed
+ * in rather than recomputed — every call site already calls
+ * _getUserBrokerageAndTurnoverBatched for this same user a few lines
+ * earlier (for the report's own `brokerage` column).
  */
 function _computeCallerBrkForUserBatched(userId, callerId, callerRole, tradesByUser, callerRules, kiteMap,
   masterMap, brkRulesByUser, globalBrkRules, userDoc, userTotalBrk) {
@@ -644,54 +667,49 @@ function _computeCallerBrkForUserBatched(userId, callerId, callerRole, tradesByU
     byInstrument[token].lots += lotSize > 1 ? t.executed_quantity / lotSize : t.executed_quantity;
   }
 
-  // Compute caller's base clearance per instrument
-  let callerBaseClearance = 0;
+  // Base cost = the client's DIRECT PARENT's own admin-assigned rate — the
+  // one who actually onboarded this client — not necessarily the caller's
+  // own rate. This floor is the same number regardless of who's viewing
+  // the report (829814, admin, or 119318 themselves).
+  const directParentId = userDoc?.master_id?.toString() || null;
+  const directParentRules = directParentId ? (brkRulesByUser[directParentId] || globalBrkRules) : globalBrkRules;
+
+  let baseCost = 0;
   for (const [token, data] of Object.entries(byInstrument)) {
     const ki = kiteMap[token];
     const seg = ki?.segment || '';
     const rawName = ki?.raw_name || '';
 
-    let callerRule = _findRule(callerRules, rawName, seg);
-    if (!callerRule) continue;
+    const rule = _findRule(directParentRules, rawName, seg);
+    if (!rule) continue;
 
-    if (callerRule.type === 'TURNOVER WISE') {
-      callerBaseClearance += data.turnover * (callerRule.brk_value / 10000);
-    } else if (callerRule.type === 'LOT WISE') {
-      callerBaseClearance += data.lots * callerRule.brk_value;
+    if (rule.type === 'TURNOVER WISE') {
+      baseCost += data.turnover * (rule.brk_value / 10000);
+    } else if (rule.type === 'LOT WISE') {
+      baseCost += data.lots * rule.brk_value;
     }
   }
 
-  // What survives every INTERMEDIATE master strictly between the user and
-  // the caller, before the caller's own brokerage_sharing% is applied —
-  // same fix already applied to the P&L side's caller_profit
-  // (_incomingPoolPnlMultiplierBatched replacing _getPnlUnpassedMultiplierForUserBatched
-  // there).
-  const incomingPoolMultiplier = _incomingPoolBrkMultiplierBatched(userId, callerId, userDoc, masterMap);
+  const spread = Math.max(0, userTotalBrk - baseCost);
 
-  // Confirmed business rule (verified against a real reference platform's
-  // live bill, GM-Global): the base/clearing cost (callerBaseClearance) is
-  // NEVER shared — it's a display-only figure on the client's bill (their
-  // "Broker Brokerage" line), settled outside this cascade entirely. Only
-  // the SPREAD above that base is split between caller and admin, at the
-  // caller's own brokerage_sharing% — same structure the P&L side already
-  // uses (owed_upward_pnl/caller_profit split the same incoming pool at the
-  // caller's own %, no separate "always passed through in full" term).
-  // Previously (both here and in the now-removed multi-level
-  // _cascadeBrokerageOwedUpwardBatched cascade) the base cost was ADDED
-  // to whichever side received it, in addition to the % split — e.g. a
-  // reference example (BANKNIFTY 56720/56700 + GOLD 154000/153990, 6%
-  // share) should split the ₹213.42 spread 94/6 into ₹200.61 kept /
-  // ₹12.81 owed upward, but the old formula added the ₹410.13 base cost on
-  // top of the owed-upward side, giving ₹610.74 instead of the correct
-  // ₹12.81.
-  const spreadAboveCaller = Math.max(0, userTotalBrk - callerBaseClearance);
+  // What survives every INTERMEDIATE master strictly between the user and
+  // the caller, before the caller's own brokerage_sharing% is applied to
+  // the BASE amount — same mechanism the P&L side uses
+  // (_incomingPoolPnlMultiplierBatched). The spread never enters this
+  // cascade at all — see the function's own doc comment above.
+  const incomingPoolMultiplier = _incomingPoolBrkMultiplierBatched(userId, callerId, userDoc, masterMap);
   const callerOwnBrkShare = callerRole === 'admin' ? 100 : (masterMap[callerId]?.brokerage_sharing || 0);
   const callerRetention = callerOwnBrkShare / 100;
 
-  const callerBrk = spreadAboveCaller * incomingPoolMultiplier * callerRetention;
-  const owedUpwardBrk = spreadAboveCaller * incomingPoolMultiplier * (1 - callerRetention);
+  // The direct parent keeps 100% of the spread on top of their own share
+  // of the base — everyone else (further up the chain) gets none of it.
+  const isCallerDirectParent = callerId === directParentId;
+  const spreadBonus = isCallerDirectParent ? spread : 0;
 
-  return { baseCost: callerBaseClearance, callerBrk, owedUpwardBrk };
+  const callerBrk = baseCost * incomingPoolMultiplier * callerRetention + spreadBonus;
+  const owedUpwardBrk = baseCost * incomingPoolMultiplier * (1 - callerRetention);
+
+  return { baseCost, callerBrk, owedUpwardBrk };
 }
 
 /**
