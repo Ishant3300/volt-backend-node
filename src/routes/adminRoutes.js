@@ -1,4 +1,5 @@
 const express = require('express');
+const { sanitizeErrorMessage } = require('../utils/sanitizeError');
 const router = express.Router();
 const {
   createUser,
@@ -29,6 +30,10 @@ const {
 } = require('../controllers/adminController');
 const { getLotNamesByExchange, getUniqueRawNamesBySegment, bulkCreateGroup, getGroupInstruments, bulkCreateBrokerage, getBrokerageByExchange, bulkCreateScriptQuantity, getScriptQuantityByExchange } = require('../controllers/groupedQuantityController');
 const { authenticateAdmin, authenticateAdminOrMaster, authenticateMaster, authenticateAny } = require('../middlewares/auth');
+const { rejectIfInvestor } = require('../middlewares/rejectIfInvestor');
+const { requireAdminPermission } = require('../middlewares/requireAdminPermission');
+const { rejectIfAdminWatchOnly } = require('../middlewares/rejectIfAdminWatchOnly');
+const { escapeRegex } = require('../utils/escapeRegex');
 
 // Category trade-wallet funding (Task 12 / Requirements 5.1–5.7)
 const {
@@ -42,58 +47,85 @@ const {
 
 
 // User CRUD operations
-router.post('/users', authenticateMaster, createUser);
+router.post('/users', authenticateMaster, rejectIfInvestor, createUser);
 router.get('/users', authenticateAdminOrMaster, getAllUsers);
 router.get('/users/:id', authenticateAdminOrMaster, getUserById);
-router.put('/users/:id', authenticateAdminOrMaster, updateUser);
-router.delete('/users/:id', authenticateMaster, deleteUser);
-router.post('/users/:id/credit', authenticateAdmin, creditUserByAdmin);
-router.post('/users/:id/debit', authenticateAdmin, debitUserByAdmin);
+router.put('/users/:id', authenticateAdminOrMaster, rejectIfInvestor, rejectIfAdminWatchOnly, updateUser);
+router.delete('/users/:id', authenticateMaster, rejectIfInvestor, deleteUser);
+// Money-moving, previously ungated — WALLET_MANAGE already gates the
+// semantically identical /admin/wallet/assign|withdraw below, but these two
+// (direct `credits` ledger, not the category wallet) had no permission key
+// at all, letting any regular Admin move money regardless of granted keys.
+router.post('/users/:id/credit', authenticateAdmin, rejectIfAdminWatchOnly, requireAdminPermission('WALLET_MANAGE'), creditUserByAdmin);
+router.post('/users/:id/debit', authenticateAdmin, rejectIfAdminWatchOnly, requireAdminPermission('WALLET_MANAGE'), debitUserByAdmin);
 
 // ==================== WALLET FUNDING ROUTES (admin grant/remove) ====================
 // Admin is the root of funds: assign is a grant (credit only, no debit source),
 // withdraw removes funds from the target. The walletController resolves req.admin
 // as the actor; walletService owns the Mongo transaction + Transaction audit.
-router.post('/wallet/assign', authenticateAdmin, walletAssign);
-router.post('/wallet/withdraw', authenticateAdmin, walletWithdraw);
+router.post('/wallet/assign', authenticateAdmin, rejectIfAdminWatchOnly, requireAdminPermission('WALLET_MANAGE'), walletAssign);
+router.post('/wallet/withdraw', authenticateAdmin, rejectIfAdminWatchOnly, requireAdminPermission('WALLET_MANAGE'), walletWithdraw);
 router.get('/wallet', authenticateAdmin, walletGet);
 // Drift audit: per-category { available, blocked, total } from open positions
 router.get('/wallet/reconcile', authenticateAdmin, walletReconcile);
 
 // Grouped Quantity CRUD operations
-router.post('/grouped-quantities', authenticateAdmin, createGroupedQuantity);
-router.post('/grouped-quantities/bulk-create', authenticateAdmin, bulkCreateGroup);
+// QUANTITY_MANAGE previously didn't exist — these writes (and Script
+// Quantity's below) had no permission key at all, unlike every sibling
+// CRUD surface (Brokerage/Instrument/FreshStoploss), letting any regular
+// Admin mutate platform-wide quantity limits regardless of granted keys.
+// requireAdminPermission is a no-op for a Master caller (see its own doc
+// comment), so this doesn't affect the Master-shared script-quantity routes.
+router.post('/grouped-quantities', authenticateAdmin, rejectIfAdminWatchOnly, requireAdminPermission('QUANTITY_MANAGE'), createGroupedQuantity);
+router.post('/grouped-quantities/bulk-create', authenticateAdmin, rejectIfAdminWatchOnly, requireAdminPermission('QUANTITY_MANAGE'), bulkCreateGroup);
 router.get('/grouped-quantities/unique-raw-names/:segment', authenticateAdminOrMaster, getUniqueRawNamesBySegment);
 router.get('/grouped-quantities/group/:exchange_name/:lot_name', authenticateAdminOrMaster, getGroupInstruments);
 router.get('/grouped-quantities/exchange/:exchange_name/lot-names', authenticateAdminOrMaster, getLotNamesByExchange);
 router.get('/grouped-quantities', authenticateAdminOrMaster, getAllGroupedQuantities);
 router.get('/grouped-quantities/:id', authenticateAdminOrMaster, getGroupedQuantityById);
-router.put('/grouped-quantities/:id', authenticateAdmin, updateGroupedQuantity);
-router.delete('/grouped-quantities/:id', authenticateAdmin, deleteGroupedQuantity);
+router.put('/grouped-quantities/:id', authenticateAdmin, rejectIfAdminWatchOnly, requireAdminPermission('QUANTITY_MANAGE'), updateGroupedQuantity);
+router.delete('/grouped-quantities/:id', authenticateAdmin, rejectIfAdminWatchOnly, requireAdminPermission('QUANTITY_MANAGE'), deleteGroupedQuantity);
 
 // Script Quantity CRUD operations
-router.post('/script-quantities/bulk-create', authenticateAdminOrMaster, bulkCreateScriptQuantity);
+router.post('/script-quantities/bulk-create', authenticateAdminOrMaster, rejectIfInvestor, rejectIfAdminWatchOnly, requireAdminPermission('QUANTITY_MANAGE'), bulkCreateScriptQuantity);
 router.get('/script-quantities/exchange/:exchange_name', authenticateAdminOrMaster, getScriptQuantityByExchange);
-router.post('/script-quantities', authenticateAdminOrMaster, createScriptQuantity);
+router.post('/script-quantities', authenticateAdminOrMaster, rejectIfInvestor, rejectIfAdminWatchOnly, requireAdminPermission('QUANTITY_MANAGE'), createScriptQuantity);
 router.get('/script-quantities', authenticateAdminOrMaster, getAllScriptQuantities);
 router.get('/script-quantities/:id', authenticateAdminOrMaster, getScriptQuantityById);
-router.put('/script-quantities/:id', authenticateAdminOrMaster, updateScriptQuantity);
-router.delete('/script-quantities/:id', authenticateAdminOrMaster, deleteScriptQuantity);
+router.put('/script-quantities/:id', authenticateAdminOrMaster, rejectIfInvestor, rejectIfAdminWatchOnly, requireAdminPermission('QUANTITY_MANAGE'), updateScriptQuantity);
+router.delete('/script-quantities/:id', authenticateAdminOrMaster, rejectIfInvestor, rejectIfAdminWatchOnly, requireAdminPermission('QUANTITY_MANAGE'), deleteScriptQuantity);
 
 // Brokerage Settings CRUD operations
-router.post('/brokerage-settings/bulk-create', authenticateAdminOrMaster, bulkCreateBrokerage);
+router.post('/brokerage-settings/bulk-create', authenticateAdminOrMaster, rejectIfInvestor, rejectIfAdminWatchOnly, requireAdminPermission('BROKERAGE_MANAGE'), bulkCreateBrokerage);
 router.get('/brokerage-settings/exchange/:exchange_name', authenticateAdminOrMaster, getBrokerageByExchange);
-router.post('/brokerage-settings', authenticateAdminOrMaster, createBrokerageSettings);
+router.post('/brokerage-settings', authenticateAdminOrMaster, rejectIfInvestor, rejectIfAdminWatchOnly, requireAdminPermission('BROKERAGE_MANAGE'), createBrokerageSettings);
 router.get('/brokerage-settings', authenticateAdminOrMaster, getAllBrokerageSettings);
 router.get('/brokerage-settings/:id', authenticateAdminOrMaster, getBrokerageSettingsById);
 // Bulk update brokerage settings (update multiple IDs with same value)
-router.put('/brokerage-settings/bulk-update', authenticateAdminOrMaster, async (req, res) => {
+router.put('/brokerage-settings/bulk-update', authenticateAdminOrMaster, rejectIfInvestor, rejectIfAdminWatchOnly, requireAdminPermission('BROKERAGE_MANAGE'), async (req, res) => {
   try {
     const { ids, brk_value, type } = req.body;
     if (!ids || !Array.isArray(ids) || ids.length === 0 || brk_value === undefined) {
       return res.status(400).json({ success: false, message: 'ids array and brk_value are required', data: null });
     }
     const BrokerageSettings = require('../models/BrokerageSettings');
+
+    // Ownership check: every id in the batch must belong to the caller's own
+    // subtree, not just the sample record used for the floor check below —
+    // without this, a master could smuggle in ids belonging to unrelated
+    // accounts platform-wide via this one bulk endpoint. Admin unrestricted.
+    if (req.master) {
+      const { getAllSubMasterIds } = require('../services/masterHierarchyService');
+      const { resolveBrokerageOwnerMasterId } = require('../controllers/adminController');
+      const allowedMasterIds = await getAllSubMasterIds(req.master.id);
+      const records = await BrokerageSettings.find({ _id: { $in: ids }, deleted_at: null }).select('user_id').lean();
+      for (const record of records) {
+        const ownerMasterId = record.user_id ? await resolveBrokerageOwnerMasterId(record.user_id) : null;
+        if (!ownerMasterId || !allowedMasterIds.includes(ownerMasterId)) {
+          return res.status(403).json({ success: false, message: 'Not authorized to update one or more of these brokerage settings', data: null });
+        }
+      }
+    }
 
     // Floor validation: check the first record to determine owner, then validate
     // Admin bypasses this — admin can set any rate on their children
@@ -152,47 +184,112 @@ router.put('/brokerage-settings/bulk-update', authenticateAdminOrMaster, async (
 
     res.json({ success: true, message: `Updated ${result.modifiedCount} brokerage setting(s)`, data: { modified: result.modifiedCount } });
   } catch (e) {
-    res.status(500).json({ success: false, message: e.message, data: null });
+    res.status(500).json({ success: false, message: sanitizeErrorMessage(e), data: null });
   }
 });
-router.put('/brokerage-settings/:id', authenticateAdminOrMaster, updateBrokerageSettings);
-router.delete('/brokerage-settings/:id', authenticateAdminOrMaster, deleteBrokerageSettings);
+router.put('/brokerage-settings/:id', authenticateAdminOrMaster, rejectIfInvestor, rejectIfAdminWatchOnly, requireAdminPermission('BROKERAGE_MANAGE'), updateBrokerageSettings);
+router.delete('/brokerage-settings/:id', authenticateAdminOrMaster, rejectIfInvestor, rejectIfAdminWatchOnly, requireAdminPermission('BROKERAGE_MANAGE'), deleteBrokerageSettings);
 
-// Refresh close prices (admin-only, for testing / manual trigger)
-router.post('/refresh-close-prices', authenticateAdmin, async (req, res) => {
+// Platform base/clearing rates — the single fixed cost-basis per instrument
+// (e.g. NSE Futures 1.5 paisa, MCX Gold ₹120/lot/side) used by the weekly
+// admin report's owed_upward_brk cascade. Admin-only: this is a platform-
+// wide figure, not something any individual master should be able to set.
+router.get('/platform-base-rates', authenticateAdmin, requireAdminPermission('BROKERAGE_MANAGE'), async (req, res) => {
+  try {
+    const PlatformBaseRate = require('../models/PlatformBaseRate');
+    const rates = await PlatformBaseRate.find({ deleted_at: null }).sort({ exchange_name: 1, script_name: 1 }).lean();
+    res.json({ success: true, data: rates });
+  } catch (e) {
+    res.status(500).json({ success: false, message: sanitizeErrorMessage(e), data: null });
+  }
+});
+router.post('/platform-base-rates', authenticateAdmin, rejectIfAdminWatchOnly, requireAdminPermission('BROKERAGE_MANAGE'), async (req, res) => {
+  try {
+    const { type, exchange_name, script_name, brk_value } = req.body;
+    if (!type || !exchange_name || brk_value === undefined) {
+      return res.status(400).json({ success: false, message: 'type, exchange_name, and brk_value are required', data: null });
+    }
+    const PlatformBaseRate = require('../models/PlatformBaseRate');
+    const rate = await PlatformBaseRate.create({
+      type, exchange_name, script_name: script_name || '', brk_value, effective_from: new Date(),
+    });
+    res.status(201).json({ success: true, data: rate });
+  } catch (e) {
+    res.status(500).json({ success: false, message: sanitizeErrorMessage(e), data: null });
+  }
+});
+router.put('/platform-base-rates/:id', authenticateAdmin, rejectIfAdminWatchOnly, requireAdminPermission('BROKERAGE_MANAGE'), async (req, res) => {
+  try {
+    const { brk_value, type } = req.body;
+    if (brk_value === undefined) {
+      return res.status(400).json({ success: false, message: 'brk_value is required', data: null });
+    }
+    const PlatformBaseRate = require('../models/PlatformBaseRate');
+    const updateFields = { brk_value, effective_from: new Date() };
+    if (type) updateFields.type = type;
+    const rate = await PlatformBaseRate.findOneAndUpdate(
+      { _id: req.params.id, deleted_at: null },
+      { $set: updateFields },
+      { new: true, runValidators: true }
+    );
+    if (!rate) return res.status(404).json({ success: false, message: 'Platform base rate not found', data: null });
+    res.json({ success: true, data: rate });
+  } catch (e) {
+    res.status(500).json({ success: false, message: sanitizeErrorMessage(e), data: null });
+  }
+});
+router.delete('/platform-base-rates/:id', authenticateAdmin, rejectIfAdminWatchOnly, requireAdminPermission('BROKERAGE_MANAGE'), async (req, res) => {
+  try {
+    const PlatformBaseRate = require('../models/PlatformBaseRate');
+    const rate = await PlatformBaseRate.findOneAndUpdate(
+      { _id: req.params.id, deleted_at: null },
+      { $set: { deleted_at: new Date() } },
+      { new: true }
+    );
+    if (!rate) return res.status(404).json({ success: false, message: 'Platform base rate not found', data: null });
+    res.json({ success: true, data: null });
+  } catch (e) {
+    res.status(500).json({ success: false, message: sanitizeErrorMessage(e), data: null });
+  }
+});
+
+// Refresh close prices (admin-only, for testing / manual trigger) — feeds
+// the same settlement price pipeline as /admin/settlement/start, but had
+// no permission key at all, unlike that SETTLEMENT_TRIGGER-gated sibling.
+router.post('/refresh-close-prices', authenticateAdmin, requireAdminPermission('SETTLEMENT_TRIGGER'), async (req, res) => {
   try {
     const livePriceService = require('../services/livePriceService');
     const result = await livePriceService.refreshClosePrices();
     res.json({ success: true, message: 'Close prices refreshed', ...result });
   } catch (error) {
-    res.status(500).json({ success: false, message: error.message });
+    res.status(500).json({ success: false, message: sanitizeErrorMessage(error) });
   }
 });
 
 // Refresh settlement prices via OHLC API (admin-only, for testing / manual trigger)
-router.post('/refresh-settlement-prices', authenticateAdmin, async (req, res) => {
+router.post('/refresh-settlement-prices', authenticateAdmin, requireAdminPermission('SETTLEMENT_TRIGGER'), async (req, res) => {
   try {
     const livePriceService = require('../services/livePriceService');
     const result = await livePriceService.refreshSettlementPrices();
     res.json({ success: true, message: 'Settlement prices refreshed', ...result });
   } catch (error) {
-    res.status(500).json({ success: false, message: error.message });
+    res.status(500).json({ success: false, message: sanitizeErrorMessage(error) });
   }
 });
 
 // ==================== ANNOUNCEMENT ROUTES ====================
 const { setAnnouncement, clearAnnouncement, getActiveAnnouncement } = require('../controllers/announcementController');
-router.post('/announcements', authenticateAdmin, setAnnouncement);
-router.delete('/announcements', authenticateAdmin, clearAnnouncement);
+router.post('/announcements', authenticateAdmin, rejectIfAdminWatchOnly, setAnnouncement);
+router.delete('/announcements', authenticateAdmin, rejectIfAdminWatchOnly, clearAnnouncement);
 router.get('/announcements/active', authenticateAny, getActiveAnnouncement);
 
 // ==================== FRESH STOPLOSS LIMIT ROUTES ====================
 const { getAllFreshStoplossLimits, bulkCreateFreshStoplossLimits, updateFreshStoplossLimit, deleteFreshStoplossLimit, bulkUpdateFreshStoplossLimits } = require('../controllers/freshStoplossLimitController');
 router.get('/fresh-stoploss-limits', authenticateAdmin, getAllFreshStoplossLimits);
-router.post('/fresh-stoploss-limits/bulk-create', authenticateAdmin, bulkCreateFreshStoplossLimits);
-router.put('/fresh-stoploss-limits/bulk-update', authenticateAdmin, bulkUpdateFreshStoplossLimits);
-router.put('/fresh-stoploss-limits/:id', authenticateAdmin, updateFreshStoplossLimit);
-router.delete('/fresh-stoploss-limits/:id', authenticateAdmin, deleteFreshStoplossLimit);
+router.post('/fresh-stoploss-limits/bulk-create', authenticateAdmin, rejectIfAdminWatchOnly, requireAdminPermission('FRESH_STOPLOSS_MANAGE'), bulkCreateFreshStoplossLimits);
+router.put('/fresh-stoploss-limits/bulk-update', authenticateAdmin, rejectIfAdminWatchOnly, requireAdminPermission('FRESH_STOPLOSS_MANAGE'), bulkUpdateFreshStoplossLimits);
+router.put('/fresh-stoploss-limits/:id', authenticateAdmin, rejectIfAdminWatchOnly, requireAdminPermission('FRESH_STOPLOSS_MANAGE'), updateFreshStoplossLimit);
+router.delete('/fresh-stoploss-limits/:id', authenticateAdmin, rejectIfAdminWatchOnly, requireAdminPermission('FRESH_STOPLOSS_MANAGE'), deleteFreshStoplossLimit);
 
 // ==================== TOTP ROUTES ====================
 const totpService = require('../services/adminOtpService');
@@ -203,7 +300,7 @@ router.get('/totp/status', authenticateAdmin, async (req, res) => {
     if (!status) return res.status(404).json({ success: false, message: 'Admin not found', data: null });
     res.json({ success: true, data: status });
   } catch (e) {
-    res.status(500).json({ success: false, message: e.message, data: null });
+    res.status(500).json({ success: false, message: sanitizeErrorMessage(e), data: null });
   }
 });
 
@@ -212,7 +309,7 @@ router.post('/totp/generate', authenticateAdmin, async (req, res) => {
     const result = await totpService.generateSecret(req.admin.id);
     res.json({ success: true, data: { qr_data_url: result.qrDataUrl, secret: result.secret } });
   } catch (e) {
-    res.status(500).json({ success: false, message: e.message, data: null });
+    res.status(500).json({ success: false, message: sanitizeErrorMessage(e), data: null });
   }
 });
 
@@ -224,7 +321,7 @@ router.post('/totp/verify-setup', authenticateAdmin, async (req, res) => {
     if (!verified) return res.status(400).json({ success: false, message: 'Invalid TOTP code', data: null });
     res.json({ success: true, message: 'TOTP activated successfully' });
   } catch (e) {
-    res.status(500).json({ success: false, message: e.message, data: null });
+    res.status(500).json({ success: false, message: sanitizeErrorMessage(e), data: null });
   }
 });
 
@@ -235,7 +332,7 @@ router.post('/totp/toggle', authenticateAdmin, async (req, res) => {
     await totpService.toggleTotp(req.admin.id, enabled);
     res.json({ success: true, message: `TOTP ${enabled ? 'enabled' : 'disabled'}` });
   } catch (e) {
-    res.status(500).json({ success: false, message: e.message, data: null });
+    res.status(500).json({ success: false, message: sanitizeErrorMessage(e), data: null });
   }
 });
 
@@ -244,7 +341,7 @@ router.post('/totp/reset', authenticateAdmin, async (req, res) => {
     await totpService.resetTotp(req.admin.id);
     res.json({ success: true, message: 'TOTP reset successfully' });
   } catch (e) {
-    res.status(500).json({ success: false, message: e.message, data: null });
+    res.status(500).json({ success: false, message: sanitizeErrorMessage(e), data: null });
   }
 });
 
@@ -275,7 +372,7 @@ async function cancelPendingOrdersForInstrument(instrumentToken, { blockAll = fa
     status: 'pending',
     instrument_token: instrumentToken,
     deleted_at: null,
-  }).select('_id user_id instrument_token transaction_type quantity order_type').lean();
+  }).select('_id user_id instrument_token transaction_type quantity order_type trigger_direction').lean();
   if (pendingOrders.length === 0) return 0;
 
   let toCancel = pendingOrders;
@@ -305,7 +402,7 @@ async function cancelPendingOrdersForInstrument(instrumentToken, { blockAll = fa
   );
   for (const order of toCancel) {
     try {
-      await orderBookService.removeOrder(order._id.toString(), order.instrument_token.toString(), order.transaction_type, order.order_type);
+      await orderBookService.removeOrder(order._id.toString(), order.instrument_token.toString(), order.transaction_type, order.order_type, order.trigger_direction);
     } catch (_) { /* best-effort — DB status is authoritative */ }
   }
   return toCancel.length;
@@ -317,12 +414,37 @@ router.get('/instruments/segments', authenticateAdmin, async (req, res) => {
     const segments = await KiteInstrument.distinct('segment', { deleted_at: null });
     res.json({ success: true, data: segments.sort() });
   } catch (e) {
-    res.status(500).json({ success: false, message: e.message, data: null });
+    res.status(500).json({ success: false, message: sanitizeErrorMessage(e), data: null });
+  }
+});
+
+// GET /admin/instruments/expiries?segment=NFO — distinct expiry dates for one segment
+// (each segment has its own independent expiry calendar — NFO's dates are unrelated
+// to MCX's or GIFT NIFTY's — so this always requires a segment, never returns a global list)
+router.get('/instruments/expiries', authenticateAdmin, async (req, res) => {
+  try {
+    const { segment } = req.query;
+    if (!segment) {
+      return res.status(400).json({ success: false, message: 'segment is required', data: null });
+    }
+    // Only current/future expiries — matches the default (no ?expiry=) filter
+    // on GET /admin/instruments, which already hides expired contracts.
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    const expiries = await KiteInstrument.distinct('expiry', {
+      segment,
+      deleted_at: null,
+      expiry: { $gte: today },
+    });
+    expiries.sort((a, b) => new Date(a) - new Date(b));
+    res.json({ success: true, data: expiries });
+  } catch (e) {
+    res.status(500).json({ success: false, message: sanitizeErrorMessage(e), data: null });
   }
 });
 
 // PUT /admin/instruments/bulk-toggle — enable/disable multiple instruments
-router.put('/instruments/bulk-toggle', authenticateAdmin, async (req, res) => {
+router.put('/instruments/bulk-toggle', authenticateAdmin, rejectIfAdminWatchOnly, requireAdminPermission('INSTRUMENT_MANAGE'), async (req, res) => {
   try {
     const { ids, enabled } = req.body;
     if (!ids || !Array.isArray(ids) || enabled === undefined) {
@@ -344,7 +466,7 @@ router.put('/instruments/bulk-toggle', authenticateAdmin, async (req, res) => {
 
     res.json({ success: true, message: `${result.modifiedCount} instrument(s) ${enabled ? 'enabled' : 'disabled'}`, data: { modified: result.modifiedCount } });
   } catch (e) {
-    res.status(500).json({ success: false, message: e.message, data: null });
+    res.status(500).json({ success: false, message: sanitizeErrorMessage(e), data: null });
   }
 });
 
@@ -370,7 +492,7 @@ router.get('/instruments', authenticateAdmin, async (req, res) => {
     }
 
     if (segment) filter.segment = segment;
-    if (raw_name) filter.raw_name = { $regex: raw_name, $options: 'i' };
+    if (raw_name) filter.raw_name = { $regex: escapeRegex(raw_name), $options: 'i' };
     if (expiry) {
       // Override default expiry filter with specific date
       delete filter.$and;
@@ -382,10 +504,11 @@ router.get('/instruments', authenticateAdmin, async (req, res) => {
     if (enabled === 'true') filter.enabled = true;
     if (enabled === 'false') filter.enabled = false;
     if (search) {
+      const safeSearch = escapeRegex(search);
       const searchOr = [
-        { tradingsymbol: { $regex: search, $options: 'i' } },
-        { raw_name: { $regex: search, $options: 'i' } },
-        { display_name: { $regex: search, $options: 'i' } },
+        { tradingsymbol: { $regex: safeSearch, $options: 'i' } },
+        { raw_name: { $regex: safeSearch, $options: 'i' } },
+        { display_name: { $regex: safeSearch, $options: 'i' } },
       ];
       if (filter.$and) {
         filter.$and.push({ $or: searchOr });
@@ -411,12 +534,12 @@ router.get('/instruments', authenticateAdmin, async (req, res) => {
       pagination: { page: parseInt(page), limit: parseInt(limit), total, pages: Math.ceil(total / parseInt(limit)) },
     });
   } catch (e) {
-    res.status(500).json({ success: false, message: e.message, data: null });
+    res.status(500).json({ success: false, message: sanitizeErrorMessage(e), data: null });
   }
 });
 
 // PUT /admin/instruments/:id/toggle — enable/disable an instrument
-router.put('/instruments/:id/toggle', authenticateAdmin, async (req, res) => {
+router.put('/instruments/:id/toggle', authenticateAdmin, rejectIfAdminWatchOnly, requireAdminPermission('INSTRUMENT_MANAGE'), async (req, res) => {
   try {
     const { enabled } = req.body;
     if (enabled === undefined) {
@@ -437,12 +560,12 @@ router.put('/instruments/:id/toggle', authenticateAdmin, async (req, res) => {
 
     res.json({ success: true, message: `Instrument ${enabled ? 'enabled' : 'disabled'}`, data: inst });
   } catch (e) {
-    res.status(500).json({ success: false, message: e.message, data: null });
+    res.status(500).json({ success: false, message: sanitizeErrorMessage(e), data: null });
   }
 });
 
 // DELETE /admin/instruments/:id — soft delete an instrument
-router.delete('/instruments/:id', authenticateAdmin, async (req, res) => {
+router.delete('/instruments/:id', authenticateAdmin, rejectIfAdminWatchOnly, requireAdminPermission('INSTRUMENT_MANAGE'), async (req, res) => {
   try {
     const inst = await KiteInstrument.findByIdAndUpdate(req.params.id, { deleted_at: new Date(), enabled: false }, { new: true });
     if (!inst) return res.status(404).json({ success: false, message: 'Instrument not found', data: null });
@@ -456,12 +579,12 @@ router.delete('/instruments/:id', authenticateAdmin, async (req, res) => {
 
     res.json({ success: true, message: 'Instrument deleted', data: inst });
   } catch (e) {
-    res.status(500).json({ success: false, message: e.message, data: null });
+    res.status(500).json({ success: false, message: sanitizeErrorMessage(e), data: null });
   }
 });
 
 // PUT /admin/instruments/:id/restore — restore a soft-deleted instrument
-router.put('/instruments/:id/restore', authenticateAdmin, async (req, res) => {
+router.put('/instruments/:id/restore', authenticateAdmin, rejectIfAdminWatchOnly, requireAdminPermission('INSTRUMENT_MANAGE'), async (req, res) => {
   try {
     const inst = await KiteInstrument.findByIdAndUpdate(req.params.id, { deleted_at: null, enabled: true }, { new: true });
     if (!inst) return res.status(404).json({ success: false, message: 'Instrument not found', data: null });
@@ -473,12 +596,12 @@ router.put('/instruments/:id/restore', authenticateAdmin, async (req, res) => {
 
     res.json({ success: true, message: 'Instrument restored', data: inst });
   } catch (e) {
-    res.status(500).json({ success: false, message: e.message, data: null });
+    res.status(500).json({ success: false, message: sanitizeErrorMessage(e), data: null });
   }
 });
 
 // Trigger bhavcopy settlement price fetch (admin-only)
-router.post('/bhavcopy/fetch', authenticateAdmin, async (req, res) => {
+router.post('/bhavcopy/fetch', authenticateAdmin, requireAdminPermission('SETTLEMENT_TRIGGER'), async (req, res) => {
   try {
     const { date } = req.body; // optional: YYYY-MM-DD string
     const { fetchAndApplyBhavcopy } = require('../services/bhavcopyService');
@@ -495,13 +618,13 @@ router.post('/bhavcopy/fetch', authenticateAdmin, async (req, res) => {
       },
     });
   } catch (error) {
-    res.status(500).json({ success: false, message: error.message });
+    res.status(500).json({ success: false, message: sanitizeErrorMessage(error) });
   }
 });
 
 // Settlement
 const { startSettlement, getSettlementStatus } = require('../controllers/settlementController');
-router.post('/settlement/start', authenticateAdmin, startSettlement);
+router.post('/settlement/start', authenticateAdmin, rejectIfAdminWatchOnly, requireAdminPermission('SETTLEMENT_TRIGGER'), startSettlement);
 router.get('/settlement/status', authenticateAdmin, getSettlementStatus);
 
 // ==================== ADMIN PROFILE ROUTE ====================
@@ -529,10 +652,18 @@ router.get('/profile', authenticateAdmin, async (req, res) => {
         server_id: serverName || 'N/A',
         last_login: admin.last_login || null,
         created_at: admin.createdAt,
+        // Added for the mobile app's Super Admin / permissions UI — the
+        // login response already carries these (admin.toJSON()), but this
+        // separate profile fetch (used to refresh/re-derive admin state
+        // without a fresh login, e.g. after app restart) didn't.
+        is_super_admin: !!admin.is_super_admin,
+        watch_only: !!admin.watch_only,
+        permissions: admin.permissions || [],
+        active_status: admin.active_status !== false,
       }
     });
   } catch (e) {
-    res.status(500).json({ success: false, message: e.message, data: null });
+    res.status(500).json({ success: false, message: sanitizeErrorMessage(e), data: null });
   }
 });
 
