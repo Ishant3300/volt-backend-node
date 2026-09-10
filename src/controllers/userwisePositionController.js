@@ -4,6 +4,8 @@ const Master = require('../models/Master');
 const { getLatestQuotes } = require('../services/kiteService');
 const KiteInstrument = require('../models/KiteInstrument');
 const { calculateMargin } = require('../services/marginService');
+const { escapeRegex } = require('../utils/escapeRegex');
+const { sanitizeErrorMessage } = require('../utils/sanitizeError');
 
 /**
  * GET /api/trade/userwise-positions
@@ -29,12 +31,15 @@ const getUserwisePositions = async (req, res) => {
       const { getAllSubMasterIds } = require('../services/masterHierarchyService');
       const allMasterIds = await getAllSubMasterIds(masterId);
       userFilter = { master_id: { $in: allMasterIds }, deleted_at: null };
-      if (search) userFilter.username = { $regex: search, $options: 'i' };
+      if (search) userFilter.username = { $regex: escapeRegex(search), $options: 'i' };
       users = await User.find(userFilter).select('_id name username master_id');
     } else {
       // admin
       userFilter = { deleted_at: null };
-      if (search) userFilter.username = { $regex: search, $options: 'i' };
+      if (search) userFilter.username = { $regex: escapeRegex(search), $options: 'i' };
+      const { resolveHiddenMasterIds } = require('../utils/adminVisibility');
+      const hiddenMasterIds = await resolveHiddenMasterIds(req);
+      if (hiddenMasterIds) userFilter.master_id = { $nin: [...hiddenMasterIds] };
       users = await User.find(userFilter).select('_id name username master_id');
     }
 
@@ -67,7 +72,7 @@ const getUserwisePositions = async (req, res) => {
       deleted_at: null
     };
     if (exchange) tradeMatch.exchange = exchange;
-    if (tradingsymbol) tradeMatch.tradingsymbol = { $regex: tradingsymbol, $options: 'i' };
+    if (tradingsymbol) tradeMatch.tradingsymbol = { $regex: escapeRegex(tradingsymbol), $options: 'i' };
 
     // Aggregate per user per instrument
     const positions = await Trade.aggregate([
@@ -155,6 +160,7 @@ const getUserwisePositions = async (req, res) => {
 
       result.push({
         user_id: uid,
+        name: info.name,
         username: info.username,
         master_username: info.master_username,
         instrument_token: p._id.instrument_token,
@@ -174,7 +180,7 @@ const getUserwisePositions = async (req, res) => {
 
     res.status(200).json({ success: true, data: result });
   } catch (error) {
-    res.status(500).json({ success: false, message: error.message, data: null });
+    res.status(500).json({ success: false, message: sanitizeErrorMessage(error), data: null });
   }
 };
 
