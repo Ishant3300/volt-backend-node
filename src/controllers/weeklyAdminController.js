@@ -657,20 +657,25 @@ function _computeCallerBrkForUserBatched(userId, callerId, callerRole, tradesByU
     }
   }
 
-  // Cascade through EVERY intermediate master's own brokerage_sharing%
-  // between the user and the caller — mirrors
-  // _getPnlUnpassedMultiplierForUserBatched exactly. Previously this only
-  // looked at the SINGLE topmost master below the caller (the first whose
-  // own parent was the caller) and applied just that one master's
-  // brokerage_sharing% to the entire spread, silently ignoring any
-  // different brokerage_sharing% configured on deeper intermediate masters
-  // — correct by coincidence for 1- and 2-tier hierarchies (nothing to
-  // ignore), wrong for 3+ tiers.
-  const unpassedFraction = _getBrkUnpassedMultiplierForUserBatched(userId, callerId, userDoc, masterMap);
+  // What survives every INTERMEDIATE master strictly between the user and
+  // the caller, before the caller's own brokerage_sharing% is applied —
+  // same fix already applied to the P&L side's caller_profit
+  // (_incomingPoolPnlMultiplierBatched replacing _getPnlUnpassedMultiplierForUserBatched
+  // there). caller_brk is the caller's GROSS take using their OWN rate —
+  // it must reflect 100% of whatever reaches them, not their own
+  // post-sharing net. Confirmed bug this replaces: _getBrkUnpassedMultiplierForUserBatched
+  // multiplies in the CALLER's own hop too (same class of bug the P&L side
+  // had), collapsing caller_brk down to roughly the same figure as
+  // owed_upward_brk whenever the caller has a high brokerage_sharing% —
+  // e.g. a live 3-tier chain (94% top master, 0% mid master) showed
+  // "MASTER BRK" and "ADMIN BRK" both at 238.03 for the same row, when the
+  // correct MASTER BRK (nothing absorbed by the 0%-share mid master) is
+  // the full 623.55 billed amount.
+  const incomingPoolMultiplier = _incomingPoolBrkMultiplierBatched(userId, callerId, userDoc, masterMap);
 
   // Spread above caller's base = what's left after caller takes their base
   const spreadAboveCaller = Math.max(0, userTotalBrk - callerBaseClearance);
-  const unpassedAmount = spreadAboveCaller * unpassedFraction;
+  const unpassedAmount = spreadAboveCaller * incomingPoolMultiplier;
 
   return callerBaseClearance + unpassedAmount;
 }
@@ -793,6 +798,42 @@ function _getBrkUnpassedMultiplierForUserBatched(userId, callerId, userDoc, mast
     if (currentMasterId === callerId) break;
     if (!master.master_id) break;
     currentMasterId = master.master_id.toString();
+  }
+
+  return multiplier;
+}
+
+/**
+ * The brokerage spread ARRIVING at the caller for this user, before the
+ * caller's own brokerage_sharing% is taken out — brokerage-side mirror of
+ * _incomingPoolPnlMultiplierBatched. Every intermediate master strictly
+ * BETWEEN the user and the caller absorbs their own share and passes the
+ * remainder up; the caller's own absorption is deliberately excluded here
+ * (the caller applies their own rate/share to this result separately).
+ * Returns 1 for a direct client of the caller (nothing absorbed yet).
+ *
+ * _getBrkUnpassedMultiplierForUserBatched above answers a different
+ * question ("how much reaches the caller as THEIR OWN take", including
+ * their own hop) — right for that purpose, wrong for "pool before the
+ * caller's own absorption", which is what _computeCallerBrkForUserBatched
+ * actually needs for caller_brk (a GROSS figure, not the caller's net).
+ */
+function _incomingPoolBrkMultiplierBatched(userId, callerId, userDoc, masterMap) {
+  const userMasterId = userDoc?.master_id?.toString();
+  if (!userMasterId) return 0;
+  if (userMasterId === callerId) return 1;
+
+  let multiplier = 1;
+  let currentMasterId = userMasterId;
+  const visited = new Set();
+
+  while (currentMasterId && currentMasterId !== callerId && !visited.has(currentMasterId)) {
+    visited.add(currentMasterId);
+    const master = masterMap[currentMasterId];
+    if (!master) break;
+
+    multiplier *= (100 - (master.brokerage_sharing || 0)) / 100;
+    currentMasterId = master.master_id ? master.master_id.toString() : null;
   }
 
   return multiplier;
@@ -1003,6 +1044,7 @@ module.exports = {
     _getPnlUnpassedMultiplierForUserBatched,
     _getBrkUnpassedMultiplierForUserBatched,
     _incomingPoolPnlMultiplierBatched,
+    _incomingPoolBrkMultiplierBatched,
     _cascadeBrokerageOwedUpwardBatched,
     _getUserBrokerageAndTurnoverBatched,
     _findRule,
