@@ -931,6 +931,7 @@ function _sumTotals(data) {
     m2m_pnl: _r2(data.reduce((s, d) => s + d.m2m_pnl, 0)),
     brokerage: _r2(data.reduce((s, d) => s + d.brokerage, 0)),
     turnover: _r2(data.reduce((s, d) => s + (d.turnover || 0), 0)),
+    broker_brokerage: _r2(data.reduce((s, d) => s + (d.broker_brokerage || 0), 0)),
     caller_brk: _r2(data.reduce((s, d) => s + (d.caller_brk || 0), 0)),
     total_pnl: _r2(data.reduce((s, d) => s + d.total_pnl, 0)),
     caller_profit: _r2(data.reduce((s, d) => s + (d.caller_profit || 0), 0)),
