@@ -306,18 +306,6 @@ const getWeeklyAdminReport = async (req, res) => {
       if (callerRules.length === 0) callerRules = globalBrkRules;
     }
 
-    // 8. Load the platform's fixed base/clearing rates — ONE rate per
-    // instrument, platform-wide (e.g. NSE Futures 1.5 paisa, MCX Gold
-    // ₹120/lot/side), not per-master. Replaces the previous per-master
-    // MasterBaseRate cascade: each master's own configurable "what my
-    // parent charges me" figure meant the owed-upward brokerage floor
-    // varied by which master happened to be in the chain, rather than
-    // reflecting the platform's actual, single clearing cost. Confirmed
-    // business rule change — see PlatformBaseRate.js.
-    const PlatformBaseRate = require('../models/PlatformBaseRate');
-    const platformBaseRates = await PlatformBaseRate.find({ deleted_at: null }).lean();
-    _mark('7_platformBaseRates');
-
     // ═══════════════════════════════════════════════════════════════════════
     // PHASE 2: Compute report using in-memory data (zero DB queries)
     // ═══════════════════════════════════════════════════════════════════════
@@ -341,8 +329,7 @@ const getWeeklyAdminReport = async (req, res) => {
         const masterOwnRules = brkRulesByUser[master._id.toString()] || globalBrkRules;
         const entry = _getAggregatedEntryBatched(
           master._id.toString(), master, metricsEngine, callerId, 'admin',
-          masterMap, masterChildrenMap, usersByMaster, tradesByUser, kiteMap, brkRulesByUser, globalBrkRules, masterOwnRules,
-          platformBaseRates
+          masterMap, masterChildrenMap, usersByMaster, tradesByUser, kiteMap, brkRulesByUser, globalBrkRules, masterOwnRules
         );
         entry.parent_username = 'ADMIN';
         entry.type = 'master';
@@ -353,8 +340,7 @@ const getWeeklyAdminReport = async (req, res) => {
       for (const cm of topEntities) {
         const entry = _getAggregatedEntryBatched(
           cm._id.toString(), cm, metricsEngine, callerId, 'master',
-          masterMap, masterChildrenMap, usersByMaster, tradesByUser, kiteMap, brkRulesByUser, globalBrkRules, callerRules,
-          platformBaseRates
+          masterMap, masterChildrenMap, usersByMaster, tradesByUser, kiteMap, brkRulesByUser, globalBrkRules, callerRules
         );
         entry.parent_username = callerMaster?.username || '';
         entry.type = 'master';
@@ -366,8 +352,7 @@ const getWeeklyAdminReport = async (req, res) => {
       for (const u of directUsers) {
         const entry = _getUserEntryBatched(
           u, metricsEngine, callerMaster, callerId, 'master',
-          masterMap, tradesByUser, kiteMap, brkRulesByUser, globalBrkRules, callerRules,
-          platformBaseRates
+          masterMap, tradesByUser, kiteMap, brkRulesByUser, globalBrkRules, callerRules
         );
         data.push(entry);
       }
@@ -429,7 +414,7 @@ function _getAllSubMasterIdsBatched(masterId, masterChildrenMap) {
  * Report entry for a single user. (No DB queries)
  */
 function _getUserEntryBatched(userDoc, metricsEngine, callerMaster, callerId, callerRole,
-  masterMap, tradesByUser, kiteMap, brkRulesByUser, globalBrkRules, callerRules, platformBaseRates) {
+  masterMap, tradesByUser, kiteMap, brkRulesByUser, globalBrkRules, callerRules) {
 
   const userId = userDoc._id.toString();
   const metrics = metricsEngine.getCachedMetrics(userId);
@@ -479,7 +464,7 @@ function _getUserEntryBatched(userDoc, metricsEngine, callerMaster, callerId, ca
   // for the brokerage-side cascade.
   const owedUpwardPnl = _r2(((-sharingBasis) * incomingPoolMultiplier) * (100 - callerOwnPnlShare) / 100);
   const owedUpwardBrk = _r2(_cascadeBrokerageOwedUpwardBatched(
-    userId, callerId, tradesByUser, brkRulesByUser, globalBrkRules, kiteMap, userDoc, masterMap, platformBaseRates
+    userId, callerId, tradesByUser, brkRulesByUser, globalBrkRules, kiteMap, userDoc, masterMap
   ));
 
   return {
@@ -510,8 +495,7 @@ function _getUserEntryBatched(userDoc, metricsEngine, callerMaster, callerId, ca
  * Aggregated report entry for a master and their entire sub-hierarchy. (No DB queries)
  */
 function _getAggregatedEntryBatched(masterId, masterDoc, metricsEngine, callerId, callerRole,
-  masterMap, masterChildrenMap, usersByMaster, tradesByUser, kiteMap, brkRulesByUser, globalBrkRules, callerRules,
-  platformBaseRates) {
+  masterMap, masterChildrenMap, usersByMaster, tradesByUser, kiteMap, brkRulesByUser, globalBrkRules, callerRules) {
 
   const allMasterIds = _getAllSubMasterIdsBatched(masterId, masterChildrenMap);
 
@@ -600,7 +584,7 @@ function _getAggregatedEntryBatched(masterId, masterDoc, metricsEngine, callerId
     // Same fix as owedUpwardPnl above — cascade all the way through the
     // CALLER's own step, not just up to masterId's own step.
     owedUpwardBrk += _cascadeBrokerageOwedUpwardBatched(
-      uid, callerId, tradesByUser, brkRulesByUser, globalBrkRules, kiteMap, u, masterMap, platformBaseRates
+      uid, callerId, tradesByUser, brkRulesByUser, globalBrkRules, kiteMap, u, masterMap
     );
   }
   callerProfit = _r2(callerProfit);
@@ -819,10 +803,13 @@ function _getBrkUnpassedMultiplierForUserBatched(userId, callerId, userDoc, mast
  * brokerage — a different question from _computeCallerBrkForUserBatched
  * (what the caller keeps). Per the confirmed business rule:
  *
- *   base_cost_owed = volume × the PLATFORM's fixed base/clearing rate for
- *                    this instrument (e.g. NSE Futures 1.5 paisa, MCX Gold
- *                    ₹120/lot/side) — the same figure at every level of the
- *                    chain, not a per-master configurable value.
+ *   base_cost_owed = volume × THIS LEVEL's own rate — whatever
+ *                    BrokerageSettings row admin actually assigned to this
+ *                    specific master (brkRulesByUser[masterId], the same
+ *                    mechanism used to bill a leaf user, just keyed by a
+ *                    master's own id), falling back to the global default
+ *                    only if admin never assigned this master an
+ *                    individual rate. Per-master, not a fixed constant.
  *   spread_margin  = amount arriving at this level − base_cost_owed
  *   passed_up      = base_cost_owed + spread_margin × (1 − brokerage_sharing% / 100)
  *
@@ -836,19 +823,18 @@ function _getBrkUnpassedMultiplierForUserBatched(userId, callerId, userDoc, mast
  * function only returns a total, not a per-instrument breakdown to feed
  * this cascade.
  *
- * Previously used each master's own MasterBaseRate (a self-reported "what
- * my parent charges me" figure, editable per master) as the floor at their
- * own level — meaning the floor shifted depending on which master happened
- * to sit in the chain, rather than reflecting the platform's actual, single
- * clearing cost. Confirmed business rule change: one fixed PlatformBaseRate
- * per instrument, used identically at every level.
+ * Previously used a separate MasterBaseRate collection (a self-reported,
+ * rarely-configured value with no relation to what admin actually billed
+ * that master) — replaced with the real BrokerageSettings rate on file for
+ * each level, same data source _computeCallerBrkForUserBatched already
+ * uses for a caller's own base clearance.
  *
- * An instrument with no PlatformBaseRate configured treats base_cost_owed
- * as 0 (same fail-open convention _computeCallerBrkForUserBatched uses via
- * _findRule — no rate on file means nothing is treated as a floor cost).
+ * A level with no individually-assigned rate falls back to the global
+ * default rather than treating base_cost_owed as 0 — same fail-open
+ * convention as every other lookup in this file (ownRules || globalBrkRules).
  */
 function _cascadeBrokerageOwedUpwardBatched(
-  userId, callerId, tradesByUser, brkRulesByUser, globalBrkRules, kiteMap, userDoc, masterMap, platformBaseRates
+  userId, callerId, tradesByUser, brkRulesByUser, globalBrkRules, kiteMap, userDoc, masterMap
 ) {
   const trades = tradesByUser[userId] || [];
   if (trades.length === 0) return 0;
@@ -895,10 +881,16 @@ function _cascadeBrokerageOwedUpwardBatched(
     if (!master) break;
 
     const sharePct = master.brokerage_sharing || 0;
+    // This level's OWN base cost = whatever rate ADMIN actually assigned to
+    // THIS master specifically — the same BrokerageSettings row used to
+    // bill a leaf user, just keyed by this master's own id instead. Falls
+    // back to the global default only if admin never assigned this master
+    // an individual rate, same convention every other lookup in this file
+    // uses (_findRule via ownRules || globalBrkRules).
+    const levelOwnRules = brkRulesByUser[currentMasterId] || globalBrkRules;
 
     for (const [token, d] of Object.entries(byInstrument)) {
-      // Same fixed platform rate at every level — not per-master.
-      const baseRule = _findRule(platformBaseRates, d.rawName, d.seg);
+      const baseRule = _findRule(levelOwnRules, d.rawName, d.seg);
       let baseCostOwed = 0;
       if (baseRule) {
         if (baseRule.type === 'TURNOVER WISE') baseCostOwed = d.turnover * (baseRule.brk_value / 10000);

@@ -190,69 +190,6 @@ router.put('/brokerage-settings/bulk-update', authenticateAdminOrMaster, rejectI
 router.put('/brokerage-settings/:id', authenticateAdminOrMaster, rejectIfInvestor, rejectIfAdminWatchOnly, requireAdminPermission('BROKERAGE_MANAGE'), updateBrokerageSettings);
 router.delete('/brokerage-settings/:id', authenticateAdminOrMaster, rejectIfInvestor, rejectIfAdminWatchOnly, requireAdminPermission('BROKERAGE_MANAGE'), deleteBrokerageSettings);
 
-// Platform base/clearing rates — the single fixed cost-basis per instrument
-// (e.g. NSE Futures 1.5 paisa, MCX Gold ₹120/lot/side) used by the weekly
-// admin report's owed_upward_brk cascade. Admin-only: this is a platform-
-// wide figure, not something any individual master should be able to set.
-router.get('/platform-base-rates', authenticateAdmin, requireAdminPermission('BROKERAGE_MANAGE'), async (req, res) => {
-  try {
-    const PlatformBaseRate = require('../models/PlatformBaseRate');
-    const rates = await PlatformBaseRate.find({ deleted_at: null }).sort({ exchange_name: 1, script_name: 1 }).lean();
-    res.json({ success: true, data: rates });
-  } catch (e) {
-    res.status(500).json({ success: false, message: sanitizeErrorMessage(e), data: null });
-  }
-});
-router.post('/platform-base-rates', authenticateAdmin, rejectIfAdminWatchOnly, requireAdminPermission('BROKERAGE_MANAGE'), async (req, res) => {
-  try {
-    const { type, exchange_name, script_name, brk_value } = req.body;
-    if (!type || !exchange_name || brk_value === undefined) {
-      return res.status(400).json({ success: false, message: 'type, exchange_name, and brk_value are required', data: null });
-    }
-    const PlatformBaseRate = require('../models/PlatformBaseRate');
-    const rate = await PlatformBaseRate.create({
-      type, exchange_name, script_name: script_name || '', brk_value, effective_from: new Date(),
-    });
-    res.status(201).json({ success: true, data: rate });
-  } catch (e) {
-    res.status(500).json({ success: false, message: sanitizeErrorMessage(e), data: null });
-  }
-});
-router.put('/platform-base-rates/:id', authenticateAdmin, rejectIfAdminWatchOnly, requireAdminPermission('BROKERAGE_MANAGE'), async (req, res) => {
-  try {
-    const { brk_value, type } = req.body;
-    if (brk_value === undefined) {
-      return res.status(400).json({ success: false, message: 'brk_value is required', data: null });
-    }
-    const PlatformBaseRate = require('../models/PlatformBaseRate');
-    const updateFields = { brk_value, effective_from: new Date() };
-    if (type) updateFields.type = type;
-    const rate = await PlatformBaseRate.findOneAndUpdate(
-      { _id: req.params.id, deleted_at: null },
-      { $set: updateFields },
-      { new: true, runValidators: true }
-    );
-    if (!rate) return res.status(404).json({ success: false, message: 'Platform base rate not found', data: null });
-    res.json({ success: true, data: rate });
-  } catch (e) {
-    res.status(500).json({ success: false, message: sanitizeErrorMessage(e), data: null });
-  }
-});
-router.delete('/platform-base-rates/:id', authenticateAdmin, rejectIfAdminWatchOnly, requireAdminPermission('BROKERAGE_MANAGE'), async (req, res) => {
-  try {
-    const PlatformBaseRate = require('../models/PlatformBaseRate');
-    const rate = await PlatformBaseRate.findOneAndUpdate(
-      { _id: req.params.id, deleted_at: null },
-      { $set: { deleted_at: new Date() } },
-      { new: true }
-    );
-    if (!rate) return res.status(404).json({ success: false, message: 'Platform base rate not found', data: null });
-    res.json({ success: true, data: null });
-  } catch (e) {
-    res.status(500).json({ success: false, message: sanitizeErrorMessage(e), data: null });
-  }
-});
-
 // Refresh close prices (admin-only, for testing / manual trigger) — feeds
 // the same settlement price pipeline as /admin/settlement/start, but had
 // no permission key at all, unlike that SETTLEMENT_TRIGGER-gated sibling.
