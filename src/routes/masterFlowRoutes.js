@@ -1,6 +1,10 @@
 const express = require('express');
+const { sanitizeErrorMessage } = require('../utils/sanitizeError');
 const router = express.Router();
 const { authenticateAdminOrMaster } = require('../middlewares/auth');
+const { rejectIfInvestor } = require('../middlewares/rejectIfInvestor');
+const { requireAdminPermission } = require('../middlewares/requireAdminPermission');
+const { escapeRegex } = require('../utils/escapeRegex');
 const User = require('../models/User');
 const Master = require('../models/Master');
 const LoginHistory = require('../models/LoginHistory');
@@ -52,6 +56,7 @@ const {
 } = require('../controllers/masterPositionController');
 
 const { getPnlSummary } = require('../controllers/pnlSummaryController');
+const { getTradeAlerts } = require('../controllers/tradeAlertController');
 const { getWeeklyAdminReport } = require('../controllers/weeklyAdminController');
 const { getSettlementReport } = require('../controllers/settlementController');
 
@@ -79,10 +84,10 @@ router.use(authenticateAdminOrMaster);
 // + Transaction audit, so no session handling is needed here.
 
 // Assign (fund) a direct child's category wallet from the master's own pool
-router.post('/wallet/assign', walletAssign);
+router.post('/wallet/assign', rejectIfInvestor, walletAssign);
 
 // Withdraw from a direct child's category wallet back to the master's pool
-router.post('/wallet/withdraw', walletWithdraw);
+router.post('/wallet/withdraw', rejectIfInvestor, walletWithdraw);
 
 // Read per-category available balances (self or a direct child)
 router.get('/wallet', getWallet);
@@ -92,17 +97,17 @@ router.get('/wallet', getWallet);
 // ============================================
 
 // Generate a unique 6-digit username (reserved for 5 minutes)
-router.get('/username/generate', generateUsername);
+router.get('/username/generate', rejectIfInvestor, generateUsername);
 
 // Release a reserved username if not used
-router.post('/username/release', releaseUsername);
+router.post('/username/release', rejectIfInvestor, releaseUsername);
 
 // ============================================
 // Child Master Management Routes
 // ============================================
 
 // Create child master
-router.post('/masters', createChildMaster);
+router.post('/masters', rejectIfInvestor, createChildMaster);
 
 // Get all child masters
 router.get('/masters', getAllChildMasters);
@@ -111,32 +116,32 @@ router.get('/masters', getAllChildMasters);
 router.get('/masters/:id', getChildMasterById);
 
 // Update child master permissions
-router.put('/masters/:id/permissions', updateChildMasterPermissions);
+router.put('/masters/:id/permissions', rejectIfInvestor, updateChildMasterPermissions);
 
 // Update child master details
-router.put('/masters/:id/details', updateChildMasterDetails);
+router.put('/masters/:id/details', rejectIfInvestor, updateChildMasterDetails);
 
 // Credit child master
-router.post('/masters/:id/credit', creditChildMaster);
+router.post('/masters/:id/credit', rejectIfInvestor, creditChildMaster);
 
 // Debit child master
-router.post('/masters/:id/debit', debitChildMaster);
+router.post('/masters/:id/debit', rejectIfInvestor, debitChildMaster);
 
 // Get child master position
 router.get('/masters/:id/position', getChildMasterPosition);
 
 // Send message to child master
-router.post('/masters/:id/messages', sendMessageToChildMaster);
+router.post('/masters/:id/messages', rejectIfInvestor, sendMessageToChildMaster);
 
 // Delete child master
-router.delete('/masters/:id', deleteChildMaster);
+router.delete('/masters/:id', rejectIfInvestor, deleteChildMaster);
 
 // ============================================
 // User Management Routes
 // ============================================
 
 // Create user
-router.post('/users', createUser);
+router.post('/users', rejectIfInvestor, createUser);
 
 // Get all users
 router.get('/users', getAllUsers);
@@ -145,34 +150,34 @@ router.get('/users', getAllUsers);
 router.get('/users/:id', getUserById);
 
 // Update user details
-router.put('/users/:id/details', updateUserDetails);
+router.put('/users/:id/details', rejectIfInvestor, updateUserDetails);
 
 // Update user (full update)
-router.put('/users/:id', updateUserDetails);
+router.put('/users/:id', rejectIfInvestor, updateUserDetails);
 
 // Update user intraday squareoff settings
-router.put('/users/:id/intraday-squareoff', updateUserIntradaySquareoff);
+router.put('/users/:id/intraday-squareoff', rejectIfInvestor, updateUserIntradaySquareoff);
 
 // Update user margin squareoff percentage
-router.put('/users/:id/margin-squareoff-percentage', updateUserMarginSquareoffPercentage);
+router.put('/users/:id/margin-squareoff-percentage', rejectIfInvestor, updateUserMarginSquareoffPercentage);
 
 // Update user report permissions
-router.put('/users/:id/report-permissions', updateUserReportPermissions);
+router.put('/users/:id/report-permissions', rejectIfInvestor, updateUserReportPermissions);
 
 // Credit user
-router.post('/users/:id/credit', creditUser);
+router.post('/users/:id/credit', rejectIfInvestor, creditUser);
 
 // Debit user
-router.post('/users/:id/debit', debitUser);
+router.post('/users/:id/debit', rejectIfInvestor, debitUser);
 
 // Get user position
 router.get('/users/:id/position', getUserPosition);
 
 // Send message to user
-router.post('/users/:id/messages', sendMessageToUser);
+router.post('/users/:id/messages', rejectIfInvestor, sendMessageToUser);
 
 // Delete user
-router.delete('/users/:id', deleteUser);
+router.delete('/users/:id', rejectIfInvestor, deleteUser);
 
 // ============================================
 // Trade Management Routes
@@ -212,10 +217,13 @@ router.get('/positions/live-metrics', getLiveMetrics);
 router.get('/pnl-summary', getPnlSummary);
 
 // Weekly admin report: Master sees per-user, Admin sees per-master
-router.get('/weekly-admin-report', getWeeklyAdminReport);
+router.get('/weekly-admin-report', requireAdminPermission('REPORTS_ACCESS'), getWeeklyAdminReport);
+// Backfill for the web-only Trade Alert live-log page — new, isolated
+// controller (tradeAlertController.js), no existing route/query touched.
+router.get('/trade-alerts', getTradeAlerts);
 
 // Settlement report: per-user P&L + brokerage for a given date
-router.get('/settlement-report', getSettlementReport);
+router.get('/settlement-report', requireAdminPermission('REPORTS_ACCESS'), getSettlementReport);
 
 // ============================================
 // Sharing Details Route
@@ -228,6 +236,15 @@ router.get('/sharing-details', async (req, res) => {
 
     // Determine which master's children to fetch
     const targetMasterId = (role === 'admin' && master_id) ? master_id : callerId;
+
+    // A hidden master's sharing config must never be reachable by direct ID.
+    if (role === 'admin' && master_id) {
+      const { resolveHiddenMasterIds } = require('../utils/adminVisibility');
+      const hiddenMasterIds = await resolveHiddenMasterIds(req);
+      if (hiddenMasterIds && hiddenMasterIds.has(targetMasterId.toString())) {
+        return res.status(404).json({ success: false, message: 'Master not found', data: null });
+      }
+    }
 
     // Fetch the master itself
     const master = await Master.findOne({ _id: targetMasterId, deleted_at: null })
@@ -265,7 +282,7 @@ router.get('/sharing-details', async (req, res) => {
 
     res.status(200).json({ success: true, data });
   } catch (error) {
-    res.status(500).json({ success: false, message: error.message });
+    res.status(500).json({ success: false, message: sanitizeErrorMessage(error) });
   }
 });
 
@@ -280,21 +297,39 @@ router.get('/login-history', async (req, res) => {
     const role = req.admin ? 'admin' : 'master';
     const callerId = req.admin ? req.admin.id : req.master.id;
 
-    // Build filter: admin sees all, master sees own children + self
+    // Build filter: admin sees all except hidden masters' own + their subtree's
+    // history, master sees own children + self
     const filter = {};
     if (role === 'master') {
-      // Get child user IDs and child master IDs
-      const childUserIds = await User.find({ master_id: callerId, deleted_at: null }).distinct('_id');
-      const childMasterIds = await Master.find({ parent_master_id: callerId, deleted_at: null }).distinct('_id');
+      // Get the full recursive subtree of sub-master IDs (inclusive of self)
+      // and every user under any of them. Previously this queried
+      // `Master.find({ parent_master_id: callerId })` — that field doesn't
+      // exist on the Master schema (the real parent-link field is
+      // `master_id`, per masterHierarchyService.js), so childMasterIds was
+      // always empty: no sub-master's login history ever surfaced here, and
+      // by extension neither did any user under a sub-master (only direct
+      // child users of the calling master itself were ever included).
+      const { getAllSubMasterIds } = require('../services/masterHierarchyService');
+      const subtreeMasterIds = await getAllSubMasterIds(callerId);
+      const subtreeUserIds = await User.find({ master_id: { $in: subtreeMasterIds }, deleted_at: null }).distinct('_id');
       const mongoose = require('mongoose');
-      const selfId = new mongoose.Types.ObjectId(callerId);
-      filter.userId = { $in: [selfId, ...childUserIds, ...childMasterIds] };
+      const subtreeMasterObjectIds = subtreeMasterIds.map(id => new mongoose.Types.ObjectId(id));
+      filter.userId = { $in: [...subtreeMasterObjectIds, ...subtreeUserIds] };
+    } else {
+      const { resolveHiddenMasterIds } = require('../utils/adminVisibility');
+      const hiddenMasterIds = await resolveHiddenMasterIds(req);
+      if (hiddenMasterIds && hiddenMasterIds.size > 0) {
+        const hiddenIdList = [...hiddenMasterIds];
+        const hiddenUserIds = await User.find({ master_id: { $in: hiddenIdList }, deleted_at: null }).distinct('_id');
+        filter.userId = { $nin: [...hiddenIdList, ...hiddenUserIds] };
+      }
     }
 
     if (search) {
+      const safeSearch = escapeRegex(search);
       filter.$or = [
-        { username: { $regex: search, $options: 'i' } },
-        { name: { $regex: search, $options: 'i' } },
+        { username: { $regex: safeSearch, $options: 'i' } },
+        { name: { $regex: safeSearch, $options: 'i' } },
       ];
     }
 
@@ -319,7 +354,7 @@ router.get('/login-history', async (req, res) => {
 
     res.status(200).json({ success: true, data, total, page: parseInt(page), limit: parseInt(limit) });
   } catch (error) {
-    res.status(500).json({ success: false, message: error.message });
+    res.status(500).json({ success: false, message: sanitizeErrorMessage(error) });
   }
 });
 
