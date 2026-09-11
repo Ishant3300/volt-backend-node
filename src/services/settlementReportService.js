@@ -327,6 +327,12 @@ async function buildSettlementReport(targetType, targetDoc, from, to, withOpenin
   const profit = rows.filter((r) => r.total >= 0);
   const loss = rows.filter((r) => r.total < 0);
   const totalPnl = r2(rows.reduce((s, r) => s + r.total, 0));
+  // Caller's own combined net across every row — same cascade fields each
+  // row already carries, just summed for the top "Total Profit & Loss"
+  // tile. undefined (not 0) when cascadeCtx wasn't set up, matching every
+  // other caller_* field's "only present when caller identity is known"
+  // convention.
+  const callerTotalPnl = cascadeCtx ? r2(rows.reduce((s, r) => s + (r.caller_total || 0), 0)) : undefined;
 
   return {
     target: targetDoc
@@ -335,6 +341,7 @@ async function buildSettlementReport(targetType, targetDoc, from, to, withOpenin
     range: { from: from.toISOString(), to: to.toISOString() },
     with_opening: !!withOpening,
     total_pnl: totalPnl,
+    caller_total_pnl: callerTotalPnl,
     profit,
     loss,
   };
