@@ -253,7 +253,17 @@ async function _squareOffAllPositions(triggerUser, options = {}) {
         'instrument_token ohlc_close settlement_price last_price'
       ).lean();
       for (const inst of instruments) {
-        const prevClose = Number(inst.ohlc_close || 0) || Number(inst.settlement_price || 0) || Number(inst.last_price || 0);
+        // settlement_price first, not ohlc_close: bhavcopyService.js (MCX/NSE/
+        // BSE) writes both together, always identical, but massiveSettlement
+        // Service.js (COMEX/GLOBAL, via the Massive API) and giftNiftySettlement
+        // Service.js (GiftNifty, scraped from NSEIX) only ever write
+        // settlement_price — ohlc_close for those segments is stale or
+        // unrelated (confirmed live: GIFT NIFTY's ohlc_close was just mirroring
+        // its OWN live last_price, not a real close, while settlement_price
+        // held the actual dated NSEIX_OFFICIAL_DAILY_SETTLEMENT value).
+        // settlement_price is the one field every segment's own feed keeps
+        // reliably current, so it's the safe universal first choice.
+        const prevClose = Number(inst.settlement_price || 0) || Number(inst.ohlc_close || 0) || Number(inst.last_price || 0);
         if (prevClose > 0) previousCloseByToken.set(inst.instrument_token.toString(), prevClose);
       }
     }
