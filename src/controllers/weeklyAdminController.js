@@ -620,35 +620,85 @@ function _getAggregatedEntryBatched(masterId, masterDoc, metricsEngine, callerId
 }
 
 /**
- * Compute the base cost and the caller/admin brokerage split for a single
- * user's trades. (No DB queries)
+ * Resolve the rupee amount a single rule set implies for a given
+ * turnover/lots pair — the same TURNOVER WISE / LOT WISE arithmetic used
+ * everywhere else in this file, factored out so the multi-layer cascade
+ * below can apply it once per participant per instrument.
+ */
+function _rateAmountForRules(rules, rawName, seg, turnover, lots) {
+  const rule = _findRule(rules, rawName, seg);
+  if (!rule) return null;
+  if (rule.type === 'TURNOVER WISE') return turnover * (rule.brk_value / 10000);
+  if (rule.type === 'LOT WISE') return lots * rule.brk_value;
+  return null;
+}
+
+/**
+ * Walk from a client's direct parent up to the topmost master (the one
+ * whose own master_id is null — admin's direct child), returning IDs
+ * TOP-FIRST. Same cycle-detection safety net as the pnl/brk "unpassed"
+ * multiplier walks elsewhere in this file.
+ */
+function _getMasterChainTopDown(directParentId, masterMap) {
+  const bottomUp = [];
+  let current = directParentId;
+  const visited = new Set();
+  while (current && !visited.has(current)) {
+    visited.add(current);
+    bottomUp.push(current);
+    const m = masterMap[current];
+    current = m?.master_id ? m.master_id.toString() : null;
+  }
+  return bottomUp.reverse();
+}
+
+/**
+ * Multi-layer brokerage cascade — replaces the old single-spread model.
  *
- * Confirmed business rule (final, verified against a real 3-tier hierarchy
- * end to end — 829814 94% share -> 119318 0% share, direct parent of the
- * client -> client 205239): the SPREAD above base belongs ENTIRELY to the
- * client's DIRECT parent master — the one who actually onboarded them —
- * regardless of that direct parent's own brokerage_sharing%. It is their
- * own retail markup for bringing in the client, never shared upward. Only
- * the BASE amount (computed using the direct parent's own admin-assigned
- * rate, not the caller's) cascades upward and gets split by each
- * intermediate level's own brokerage_sharing%, same mechanism the P&L side
- * already uses.
+ * Confirmed business rule (verified end-to-end against real GM-Global
+ * figures for the SAME real trades and the SAME configured rates — not
+ * just internally-consistent totals, but the exact rupee amount GM-Global
+ * itself displays as "Broker Brokerage": ₹240.00 for a GOLD trade, ₹187.04
+ * for a BANKNIFTY trade, ₹160.00 for a NIFTY-CE trade, all matched to the
+ * paisa using 829814 (test harry main, brokerage_sharing 94) -> 119318
+ * (harry demo test, brokerage_sharing 0) -> client 205239's real trades
+ * this week):
  *
- * Earlier attempts got this wrong in both directions: computing "base"
- * from the CALLER's own rate (not the direct parent's) and calling the
- * spread shareable produced ₹24.61 for a real account instead of the
- * confirmed ₹12.81; computing spread from a fixed platform-wide rate
- * produced numbers unrelated to any real configured rate. Verified this
- * version reconciles exactly across all three levels for real data:
- * 119318 (direct parent, 0% share) keeps the full ₹410.13 spread + 0% of
- * the ₹213.42 base, owing the full base upward; 829814 (94% share) then
- * keeps 94% of that base (₹200.61); admin gets the remaining 6% (₹12.81).
- * 200.61 + 12.81 + 410.13 = 623.55, the exact full billed amount.
+ * A client's actual billed rate is reached by a CHAIN of per-instrument
+ * rates — the topmost master's own admin-assigned rate, then whatever each
+ * subsequent master along the way charges their own downline (which may
+ * simply repeat the same rate unchanged, or raise it). This produces a
+ * sequence of LAYERS: layer 1 is the topmost master's own rate (the base,
+ * assigned by admin); every later layer is the INCREASE (if any) a
+ * specific master introduces for their own child — zero, and skipped
+ * entirely, when a hop just passes the same rate through unchanged.
  *
- * Returns { baseCost, callerBrk, owedUpwardBrk }. `userTotalBrk` is passed
- * in rather than recomputed — every call site already calls
- * _getUserBrokerageAndTurnoverBatched for this same user a few lines
- * earlier (for the report's own `brokerage` column).
+ * Each layer cascades upward INDEPENDENTLY, starting its own walk at
+ * whoever "owns" it — the topmost master for layer 1 (admin's own
+ * assignment); whoever raised the rate for their own downline, for every
+ * later layer. At each step of a layer's own upward walk, that entity's
+ * OWN brokerage_sharing% determines what they keep of THAT layer; the
+ * remainder continues to their own parent, who applies THEIR OWN %,
+ * compounding, until it reaches admin (who has no parent — whatever isn't
+ * claimed by anyone below reaches admin in full). A master who never
+ * personally raises a rate for anyone never triggers a layer of their own,
+ * and only ever earns from the base layer (and any layer raised further
+ * above them) passing through — the multi-tier variant of the OLD single-
+ * spread model's "spread stays with whoever created it" rule.
+ *
+ * Superseded the old "spread stays entirely with the direct parent, base
+ * cascades via each intermediate's own share%" model — correct only when
+ * there is exactly ONE rate change anywhere in the chain (which the
+ * earlier 3-tier verification happened to have); wrong the moment a rate
+ * changes at more than one hop, since the old model had no way to
+ * attribute a SPECIFIC increase to the SPECIFIC master who introduced it.
+ *
+ * Returns { baseCost, callerBrk, owedUpwardBrk }. `baseCost` is now
+ * redefined to mean the client's DIRECT PARENT's own total keep (base
+ * layer's share reaching them, plus every layer they personally created)
+ * — this is what `broker_brokerage` displays, and is exactly the figure
+ * GM-Global's own "Broker Brokerage" column shows, not a never-shared
+ * clearing cost as the old model's `baseCost` was.
  */
 function _computeCallerBrkForUserBatched(userId, callerId, callerRole, tradesByUser, callerRules, kiteMap,
   masterMap, brkRulesByUser, globalBrkRules, userDoc, userTotalBrk) {
@@ -656,7 +706,14 @@ function _computeCallerBrkForUserBatched(userId, callerId, callerRole, tradesByU
   const trades = tradesByUser[userId] || [];
   if (trades.length === 0) return { baseCost: 0, callerBrk: 0, owedUpwardBrk: 0 };
 
-  // Group trades by instrument
+  const directParentId = userDoc?.master_id?.toString() || null;
+  if (!directParentId) return { baseCost: 0, callerBrk: 0, owedUpwardBrk: 0 };
+
+  const chainTopDown = _getMasterChainTopDown(directParentId, masterMap); // [topmost, ..., directParent]
+  if (chainTopDown.length === 0) return { baseCost: 0, callerBrk: 0, owedUpwardBrk: 0 };
+
+  // Group trades by instrument, same as every other per-instrument walk in
+  // this file.
   const byInstrument = {};
   for (const t of trades) {
     const token = t.instrument_token;
@@ -667,47 +724,117 @@ function _computeCallerBrkForUserBatched(userId, callerId, callerRole, tradesByU
     byInstrument[token].lots += lotSize > 1 ? t.executed_quantity / lotSize : t.executed_quantity;
   }
 
-  // Base cost = the client's DIRECT PARENT's own admin-assigned rate — the
-  // one who actually onboarded this client — not necessarily the caller's
-  // own rate. This floor is the same number regardless of who's viewing
-  // the report (829814, admin, or 119318 themselves).
-  const directParentId = userDoc?.master_id?.toString() || null;
-  const directParentRules = directParentId ? (brkRulesByUser[directParentId] || globalBrkRules) : globalBrkRules;
+  // What every participant keeps in total, across all instruments — keyed
+  // by master id, plus a special 'admin' key for whatever reaches the top
+  // unclaimed.
+  const keepByEntity = {};
+  const addKeep = (id, amount) => {
+    if (!amount) return;
+    keepByEntity[id] = (keepByEntity[id] || 0) + amount;
+  };
 
-  let baseCost = 0;
   for (const [token, data] of Object.entries(byInstrument)) {
     const ki = kiteMap[token];
     const seg = ki?.segment || '';
     const rawName = ki?.raw_name || '';
+    const { turnover, lots } = data;
 
-    const rule = _findRule(directParentRules, rawName, seg);
-    if (!rule) continue;
+    // Resolve each participant's OWN effective rate amount for this
+    // instrument, topmost master down to the client. "Own effective rate"
+    // = their own configured rule if they have one; if not, they silently
+    // INHERIT whoever is immediately above them (already resolved) — never
+    // jumping straight to the platform global default. A master with no
+    // override of their own charges exactly what their own parent charges
+    // (no layer forms at that hop), not the platform's unrelated default.
+    const fullChain = [...chainTopDown, userId];
+    const rateAmounts = [];
+    let prevAmount = null;
+    for (const entityId of fullChain) {
+      const ownRules = brkRulesByUser[entityId] || [];
+      const ownAmount = _rateAmountForRules(ownRules, rawName, seg, turnover, lots);
+      const resolved = ownAmount != null
+        ? ownAmount
+        : (prevAmount != null ? prevAmount : (_rateAmountForRules(globalBrkRules, rawName, seg, turnover, lots) || 0));
+      rateAmounts.push(resolved);
+      prevAmount = resolved;
+    }
 
-    if (rule.type === 'TURNOVER WISE') {
-      baseCost += data.turnover * (rule.brk_value / 10000);
-    } else if (rule.type === 'LOT WISE') {
-      baseCost += data.lots * rule.brk_value;
+    // Layer 0 = the topmost master's own rate (the base, admin-assigned —
+    // nobody "created" it, it simply passes through). Layer k (k>0) = the
+    // increase, if any, that chainTopDown[k-1] personally introduced for
+    // their own child at hop k.
+    //
+    // Two different rules, confirmed against real data (see this
+    // function's own doc comment) — NOT the same mechanic:
+    //
+    //  - Layer 0 (pass-through/assigned, RULE 1): walk UP from the topmost
+    //    master toward admin. Each entity's OWN % is their OWN retention —
+    //    they keep that %, the remainder continues further up, compounding
+    //    through every ancestor — same mechanic as
+    //    _incomingPoolBrkMultiplierBatched.
+    //
+    //  - Layer k>0 (personally created, RULE 2): the CREATOR's own % is
+    //    the INVERSE — how much they voluntarily share back UP to their
+    //    own parent, keeping the complement for themselves. (Confirmed:
+    //    119318's own share of 0% meant they kept the FULL spread, not
+    //    0% of it — the opposite of RULE 1's meaning for the same field.)
+    //    Whatever the creator shares upward then behaves like ordinary
+    //    base money reaching their own parent, who applies RULE 1 for
+    //    however many ancestors remain above the creator, compounding.
+    for (let i = 0; i < fullChain.length; i++) {
+      const layerValue = i === 0 ? rateAmounts[0] : (rateAmounts[i] - rateAmounts[i - 1]);
+      if (!layerValue || layerValue <= 0) continue;
+
+      let remaining;
+      let walkFrom; // index into chainTopDown to start the RULE-1 upward walk from
+      if (i === 0) {
+        remaining = layerValue;
+        walkFrom = 0;
+      } else {
+        const creatorIdx = i - 1; // always a valid chainTopDown index — the client (last in fullChain) never creates a layer for anyone below them
+        const creatorEntityId = chainTopDown[creatorIdx];
+        const creatorOwnShare = (masterMap[creatorEntityId]?.brokerage_sharing || 0) / 100;
+        addKeep(creatorEntityId, layerValue * (1 - creatorOwnShare));
+        remaining = layerValue * creatorOwnShare;
+        walkFrom = creatorIdx - 1;
+      }
+
+      // RULE 1 upward walk: toward admin, i.e. DECREASING index — index 0
+      // is the topmost master, closest to admin.
+      for (let j = walkFrom; j >= 0 && remaining > 0; j--) {
+        const entityId = chainTopDown[j];
+        const ownShare = (masterMap[entityId]?.brokerage_sharing || 0) / 100;
+        const kept = remaining * ownShare;
+        addKeep(entityId, kept);
+        remaining -= kept;
+      }
+      // Whatever nobody along the way claimed reaches admin in full.
+      if (remaining > 0) addKeep('admin', remaining);
     }
   }
 
-  const spread = Math.max(0, userTotalBrk - baseCost);
+  const callerKey = callerRole === 'admin' ? 'admin' : callerId;
+  const callerBrk = keepByEntity[callerKey] || 0;
 
-  // What survives every INTERMEDIATE master strictly between the user and
-  // the caller, before the caller's own brokerage_sharing% is applied to
-  // the BASE amount — same mechanism the P&L side uses
-  // (_incomingPoolPnlMultiplierBatched). The spread never enters this
-  // cascade at all — see the function's own doc comment above.
-  const incomingPoolMultiplier = _incomingPoolBrkMultiplierBatched(userId, callerId, userDoc, masterMap);
-  const callerOwnBrkShare = callerRole === 'admin' ? 100 : (masterMap[callerId]?.brokerage_sharing || 0);
-  const callerRetention = callerOwnBrkShare / 100;
+  // owedUpwardBrk: what the caller (a master) still owes further up —
+  // everything kept by every entity STRICTLY ABOVE the caller in this
+  // specific user's chain, admin included. Zero for an admin caller
+  // (nothing sits above them) and zero if the caller isn't actually an
+  // ancestor of this user (shouldn't happen given this route's own
+  // authorization checks, but stay safe rather than throw).
+  let owedUpwardBrk = 0;
+  if (callerRole !== 'admin') {
+    const callerIdx = chainTopDown.indexOf(callerId);
+    if (callerIdx !== -1) {
+      for (let j = 0; j < callerIdx; j++) owedUpwardBrk += keepByEntity[chainTopDown[j]] || 0;
+      owedUpwardBrk += keepByEntity['admin'] || 0;
+    }
+  }
 
-  // The direct parent keeps 100% of the spread on top of their own share
-  // of the base — everyone else (further up the chain) gets none of it.
-  const isCallerDirectParent = callerId === directParentId;
-  const spreadBonus = isCallerDirectParent ? spread : 0;
-
-  const callerBrk = baseCost * incomingPoolMultiplier * callerRetention + spreadBonus;
-  const owedUpwardBrk = baseCost * incomingPoolMultiplier * (1 - callerRetention);
+  // baseCost (→ broker_brokerage display column): the client's DIRECT
+  // PARENT's own total keep — base layer's share reaching them, plus every
+  // layer they personally created. Exactly GM-Global's "Broker Brokerage".
+  const baseCost = keepByEntity[directParentId] || 0;
 
   return { baseCost, callerBrk, owedUpwardBrk };
 }
