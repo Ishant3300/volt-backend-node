@@ -235,3 +235,80 @@ describe('_computeCallerBrkForUserBatched — multi-layer case (rate raised at T
     expect(admin + master + submaster).toBeCloseTo(340, 2);
   });
 });
+
+describe('_computeCallerBrkForUserBatched — no leak when a rate drops below its own parent', () => {
+  // Real scenario this reproduces: a leftover/never-updated intermediate
+  // rate left BELOW what an ancestor above it resolves to (exactly what
+  // happened with 829814/119318's GOLDM rates mid-session — 829814 was
+  // changed to 25 while 119318 was still at 50, an accidental drop). The
+  // client's own rate (150) stays the ceiling of the whole chain, as it
+  // does in every real configuration — a master would never knowingly
+  // bill their client LESS than their own cost.
+  const masterMap = {
+    m1: { master_id: null, brokerage_sharing: 94 },
+    m2: { master_id: 'm1', brokerage_sharing: 0 },
+  };
+  const kiteMap = { TOK: { lot_size: 1, segment: 'MCX-FUT', raw_name: 'TEST' } };
+  const userDoc = { master_id: 'm2' };
+  const trades = [{ instrument_token: 'TOK', executed_price: 1, executed_quantity: 1 }]; // 1 lot
+  const tradesByUser = { client: trades };
+  const globalBrkRules = [];
+  const brkRulesByUser = {
+    m1: [{ script_name: 'TEST', exchange_name: 'MCX-FUT', type: 'LOT WISE', brk_value: 100 }],
+    m2: [{ script_name: 'TEST', exchange_name: 'MCX-FUT', type: 'LOT WISE', brk_value: 50 }], // DROPS below m1's 100
+    client: [{ script_name: 'TEST', exchange_name: 'MCX-FUT', type: 'LOT WISE', brk_value: 150 }],
+  };
+
+  test('total distributed across every participant exactly equals the client\'s actual bill (no leak)', () => {
+    const admin = _computeCallerBrkForUserBatched('client', 'ADMIN', 'admin', tradesByUser, [], kiteMap, masterMap, brkRulesByUser, globalBrkRules, userDoc, 150).callerBrk;
+    const m1keep = _computeCallerBrkForUserBatched('client', 'm1', 'master', tradesByUser, [], kiteMap, masterMap, brkRulesByUser, globalBrkRules, userDoc, 150).callerBrk;
+    const m2keep = _computeCallerBrkForUserBatched('client', 'm2', 'master', tradesByUser, [], kiteMap, masterMap, brkRulesByUser, globalBrkRules, userDoc, 150).callerBrk;
+
+    // Without the floor fix this summed to 200 (100 base fully distributed
+    // via m1's own rate, PLUS another 100 spread computed as if m2's rate
+    // were still 50 relative to m1) — 50 more than the client ever paid.
+    // With the floor, m2's own 50 is clamped up to m1's 100 for cascade
+    // purposes (no layer forms at the m1->m2 hop), and only the genuine
+    // 150-100=50 markup m2 introduced for the client gets distributed.
+    expect(admin + m1keep + m2keep).toBeCloseTo(150, 2);
+    expect(admin + m1keep + m2keep).not.toBeCloseTo(200, 2);
+  });
+});
+
+describe('_computeCallerBrkForUserBatched — 4-level chain (admin -> master -> submaster -> subsubmaster -> client)', () => {
+  // Every level charges MORE than its own parent (the normal, well-formed
+  // case — markup increases toward the client) — confirms no leak across
+  // a longer chain, and that each new markup layer is correctly attributed
+  // to the specific level that introduced it.
+  const masterMap = {
+    top: { master_id: null, brokerage_sharing: 90 },
+    mid: { master_id: 'top', brokerage_sharing: 80 },
+    low: { master_id: 'mid', brokerage_sharing: 70 },
+  };
+  const kiteMap = { TOK: { lot_size: 1, segment: 'MCX-FUT', raw_name: 'TEST' } };
+  const userDoc = { master_id: 'low' };
+  const trades = [{ instrument_token: 'TOK', executed_price: 1, executed_quantity: 1 }];
+  const tradesByUser = { client: trades };
+  const globalBrkRules = [];
+  const brkRulesByUser = {
+    top: [{ script_name: 'TEST', exchange_name: 'MCX-FUT', type: 'LOT WISE', brk_value: 100 }], // base
+    mid: [{ script_name: 'TEST', exchange_name: 'MCX-FUT', type: 'LOT WISE', brk_value: 130 }], // +30 layer, owned by top
+    low: [{ script_name: 'TEST', exchange_name: 'MCX-FUT', type: 'LOT WISE', brk_value: 170 }], // +40 layer, owned by mid
+    client: [{ script_name: 'TEST', exchange_name: 'MCX-FUT', type: 'LOT WISE', brk_value: 220 }], // +50 layer, owned by low
+  };
+
+  test('every participant\'s keep sums to exactly the client\'s total bill', () => {
+    const admin = _computeCallerBrkForUserBatched('client', 'ADMIN', 'admin', tradesByUser, [], kiteMap, masterMap, brkRulesByUser, globalBrkRules, userDoc, 220).callerBrk;
+    const top = _computeCallerBrkForUserBatched('client', 'top', 'master', tradesByUser, [], kiteMap, masterMap, brkRulesByUser, globalBrkRules, userDoc, 220).callerBrk;
+    const mid = _computeCallerBrkForUserBatched('client', 'mid', 'master', tradesByUser, [], kiteMap, masterMap, brkRulesByUser, globalBrkRules, userDoc, 220).callerBrk;
+    const low = _computeCallerBrkForUserBatched('client', 'low', 'master', tradesByUser, [], kiteMap, masterMap, brkRulesByUser, globalBrkRules, userDoc, 220).callerBrk;
+
+    expect(admin + top + mid + low).toBeCloseTo(220, 2);
+    // Sanity: every participant actually got something (each level really
+    // does own a distinct layer in this fixture).
+    expect(admin).toBeGreaterThan(0);
+    expect(top).toBeGreaterThan(0);
+    expect(mid).toBeGreaterThan(0);
+    expect(low).toBeGreaterThan(0);
+  });
+});

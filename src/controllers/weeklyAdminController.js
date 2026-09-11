@@ -746,15 +746,34 @@ function _computeCallerBrkForUserBatched(userId, callerId, callerRole, tradesByU
     // jumping straight to the platform global default. A master with no
     // override of their own charges exactly what their own parent charges
     // (no layer forms at that hop), not the platform's unrelated default.
+    // FLOOR against the inherited amount (never let a resolved rate DROP
+    // below what's already flowing in from above) — confirmed real leak
+    // otherwise: if a middle entity's own configured rate is lower than
+    // their own parent's (e.g. left over from testing, or simply never
+    // updated after a parent's rate changed), the base layer still gets
+    // fully distributed using the ORIGINAL higher rate, and a later
+    // markup layer further down gets computed AND distributed again
+    // relative to the now-lower baseline — double-counting the gap. A
+    // 3-level trace (top=100, middle drops to 50, client billed 90) pays
+    // out 140 total from a client who only paid 90 without this floor.
+    // Flooring treats an accidental/leftover drop as "no layer at this
+    // hop" (their own rate is simply ignored in favour of the inherited
+    // one) instead of creating a phantom negative-then-repeated-positive
+    // gap — the correctness guarantee that matters here (total
+    // distributed == total billed), not preserving the literal
+    // misconfigured number.
     const fullChain = [...chainTopDown, userId];
     const rateAmounts = [];
     let prevAmount = null;
     for (const entityId of fullChain) {
       const ownRules = brkRulesByUser[entityId] || [];
       const ownAmount = _rateAmountForRules(ownRules, rawName, seg, turnover, lots);
-      const resolved = ownAmount != null
-        ? ownAmount
-        : (prevAmount != null ? prevAmount : (_rateAmountForRules(globalBrkRules, rawName, seg, turnover, lots) || 0));
+      let resolved;
+      if (ownAmount != null) {
+        resolved = prevAmount != null ? Math.max(ownAmount, prevAmount) : ownAmount;
+      } else {
+        resolved = prevAmount != null ? prevAmount : (_rateAmountForRules(globalBrkRules, rawName, seg, turnover, lots) || 0);
+      }
       rateAmounts.push(resolved);
       prevAmount = resolved;
     }
