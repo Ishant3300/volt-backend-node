@@ -13,6 +13,7 @@
 const Trade = require('../models/Trade');
 const User = require('../models/User');
 const Master = require('../models/Master');
+const KiteInstrument = require('../models/KiteInstrument');
 const { getAllSubMasterIds } = require('../services/masterHierarchyService');
 const { sanitizeErrorMessage } = require('../utils/sanitizeError');
 
@@ -74,10 +75,27 @@ const getTradeAlerts = async (req, res) => {
     const masterById = {};
     for (const m of masters) masterById[m._id.toString()] = m;
 
+    // MCX-FUT trades only ever fill in whole lots on this platform (e.g.
+    // Gold's lot_size is 100) — the web Trade Alert page shows quantity as
+    // a lot count for these rows, so it needs segment/lot_size per
+    // instrument. Batched by instrument_token, same pattern every other
+    // controller in this file's neighborhood uses (weeklyAdminController.js,
+    // tradeController.js) rather than a query per row.
+    const instrumentTokens = [...new Set(trades.map((t) => t.instrument_token))];
+    const instruments = instrumentTokens.length
+      ? await KiteInstrument.find(
+          { instrument_token: { $in: instrumentTokens } },
+          'instrument_token segment lot_size'
+        ).lean()
+      : [];
+    const instrumentByToken = {};
+    for (const inst of instruments) instrumentByToken[inst.instrument_token] = inst;
+
     const data = trades.map((t) => {
       const u = userById[t.user_id.toString()];
       const m = u?.master_id ? masterById[u.master_id.toString()] : null;
       const isPending = t.status === 'pending';
+      const inst = instrumentByToken[t.instrument_token];
       return {
         trade_id: t._id.toString(),
         user_id: t.user_id.toString(),
@@ -87,6 +105,8 @@ const getTradeAlerts = async (req, res) => {
         master_username: m?.username || null,
         instrument_token: t.instrument_token,
         tradingsymbol: t.tradingsymbol,
+        segment: inst?.segment || null,
+        lot_size: inst?.lot_size || null,
         transaction_type: t.transaction_type,
         quantity: isPending ? t.quantity : t.executed_quantity,
         price: isPending ? t.price : t.executed_price,

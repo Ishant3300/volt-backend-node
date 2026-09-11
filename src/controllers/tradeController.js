@@ -1227,6 +1227,10 @@ const placeTrade = async (req, res) => {
             // response already computed above.
             try {
                 const metricsEngine = require('../services/metricsEngine');
+                // MCX-FUT trades only ever fill in whole lots on this platform —
+                // the web Trade Alert page shows quantity as a lot count for
+                // these rows, so the broadcast needs segment/lot_size too.
+                const alertInst = await KiteInstrument.findOne({ instrument_token: resultTrade.instrument_token }).select('segment lot_size').lean();
                 metricsEngine.broadcastTradeAlert(resultTrade.user_id.toString(), {
                     trade_id: resultTrade._id.toString(),
                     user_id: resultTrade.user_id.toString(),
@@ -1234,6 +1238,8 @@ const placeTrade = async (req, res) => {
                     client_username: resultUserInfo?.username || null,
                     instrument_token: resultTrade.instrument_token,
                     tradingsymbol: resultTrade.tradingsymbol,
+                    segment: alertInst?.segment || null,
+                    lot_size: alertInst?.lot_size || null,
                     transaction_type: resultTrade.transaction_type,
                     quantity: resultTrade.executed_quantity,
                     price: resultTrade.executed_price,
@@ -1296,6 +1302,7 @@ const placeTrade = async (req, res) => {
                 // execution. Own try/catch, purely additive.
                 try {
                     const metricsEngine = require('../services/metricsEngine');
+                    const alertInst = await KiteInstrument.findOne({ instrument_token: resultTrade.instrument_token }).select('segment lot_size').lean();
                     metricsEngine.broadcastTradeAlert(resultTrade.user_id.toString(), {
                         trade_id: resultTrade._id.toString(),
                         user_id: resultTrade.user_id.toString(),
@@ -1303,6 +1310,8 @@ const placeTrade = async (req, res) => {
                         client_username: resultUserInfo?.username || null,
                         instrument_token: resultTrade.instrument_token,
                         tradingsymbol: resultTrade.tradingsymbol,
+                        segment: alertInst?.segment || null,
+                        lot_size: alertInst?.lot_size || null,
                         transaction_type: resultTrade.transaction_type,
                         quantity: resultTrade.quantity,
                         price: resultTrade.price,

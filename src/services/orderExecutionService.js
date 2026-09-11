@@ -13,6 +13,9 @@ const { computeWalletSplit } = require('../utils/walletSplit');
 const firebaseService = require('./firebaseService');
 const { beginTradeWrite } = require('./tradeWriteFenceService');
 const { calculateBrokerage } = require('./brokerageService');
+const { LOG_REDIS_ORDERS } = require('../config/logFlags');
+
+const _ts = () => new Date().toISOString();
 
 /**
  * Fetches live prices from Kite for a list of instrument tokens.
@@ -45,7 +48,14 @@ const _getLivePrices = async (instrumentTokens) => {
  */
 const processPendingOrders = async () => {
     // Skip if Redis + BullMQ are handling execution
-    if (redisService.isAvailable()) return;
+    if (redisService.isAvailable()) {
+        if (LOG_REDIS_ORDERS) {
+            console.log(`⏭️  [OrderExecution] [${_ts()}] processPendingOrders SKIPPED — Redis available (BullMQ handling execution)`);
+        }
+        return;
+    }
+
+    console.log(`🟠 [OrderExecution] [${_ts()}] processPendingOrders ACTIVE — Redis UNAVAILABLE, DB fallback running | diagnostics=${JSON.stringify(redisService.getDiagnostics())}`);
 
     try {
         // Previously 'LIMIT' only — SL/SL-M orders were accepted at
@@ -62,7 +72,14 @@ const processPendingOrders = async () => {
             deleted_at: null,
         });
 
-        if (pendingTrades.length === 0) return;
+        if (pendingTrades.length === 0) {
+            if (LOG_REDIS_ORDERS) {
+                console.log(`   ↳ [OrderExecution] [${_ts()}] No pending orders found in DB`);
+            }
+            return;
+        }
+
+        console.log(`   ↳ [OrderExecution] [${_ts()}] Found ${pendingTrades.length} pending order(s) in DB`);
 
         // Collect distinct instrument tokens
         const tokenSet = new Set(pendingTrades.map(t => parseInt(t.instrument_token)));
@@ -72,7 +89,12 @@ const processPendingOrders = async () => {
 
         if (ltpMap.size === 0) {
             // Could not fetch any prices, skip this cycle
+            console.log(`   ↳ [OrderExecution] [${_ts()}] Could not fetch ANY live prices (${tokenArray.length} tokens requested) — skipping cycle`);
             return;
+        }
+
+        if (LOG_REDIS_ORDERS) {
+            console.log(`   ↳ [OrderExecution] [${_ts()}] Fetched LTP for ${ltpMap.size}/${tokenArray.length} tokens`);
         }
 
         let executedCount = 0;
@@ -84,10 +106,16 @@ const processPendingOrders = async () => {
             let shouldExecute = false;
 
             if (trade.order_type === 'SL' || trade.order_type === 'SL-M') {
-                // Stop-Loss: BUY triggers when price >= trigger, SELL triggers when price <= trigger
-                if (trade.transaction_type === 'BUY' && livePrice >= trade.price) {
+                // Direction-based, matching orderBookService.js/tradeController.js —
+                // NOT hardcoded by transaction_type. trigger_direction is decided
+                // once at placement (trigger vs live price at that moment); a
+                // legacy trade placed before that field existed (null) falls
+                // back to the old BUY=rise/SELL=fall mapping so it keeps
+                // matching exactly as it always did.
+                const direction = trade.trigger_direction || (trade.transaction_type === 'BUY' ? 'RISE' : 'FALL');
+                if (direction === 'RISE' && livePrice >= trade.price) {
                     shouldExecute = true;
-                } else if (trade.transaction_type === 'SELL' && livePrice <= trade.price) {
+                } else if (direction === 'FALL' && livePrice <= trade.price) {
                     shouldExecute = true;
                 }
             } else {
@@ -100,6 +128,9 @@ const processPendingOrders = async () => {
             }
 
             if (shouldExecute) {
+                if (LOG_REDIS_ORDERS) {
+                    console.log(`   ↳ [OrderExecution] [${_ts()}] TRIGGERING tradeId=${trade._id} ${trade.order_type} ${trade.transaction_type} ${trade.tradingsymbol} @ ${trade.price} | livePrice=${livePrice}`);
+                }
                 const session = await mongoose.startSession();
                 let tradeWriteLease = null;
                 try {
@@ -217,7 +248,7 @@ const processPendingOrders = async () => {
                         //    `freshTrade.exchange` (which carries no segment), so 'NFO-FUT'
                         //    maps to NSE and 'MCX-FUT' to MCX rather than GLOBAL.
                         const walletInstrument = await KiteInstrument.findOne({ instrument_token: freshTrade.instrument_token })
-                            .select('segment enabled deleted_at').session(session).lean();
+                            .select('segment enabled deleted_at instrument_type').session(session).lean();
                         const walletCategory = categoryForSegment(walletInstrument?.segment || freshTrade.exchange || '');
 
                         const { closingQty: walletClosingQty, openingQty: walletOpeningQty } =
@@ -255,6 +286,119 @@ const processPendingOrders = async () => {
                                 }], { session });
                             } catch (_) {}
                             console.log(`⚠️ [OrderExecution] Rejected ${freshTrade.tradingsymbol} — ${instrumentRejectRemark}`);
+                            return;
+                        }
+
+                        // Bet / close-only gate at FILL time — mirrors placeTrade's
+                        // placement-time checks (tradeController.js) and priceQueueService's
+                        // primary-path fill gate. An admin flips bet=false or
+                        // close_only=true specifically to stop a user opening further risk
+                        // right now; a LIMIT/SL/SL-M order already pending at that moment
+                        // would otherwise still fill and open a fresh position, bypassing
+                        // the admin's intent entirely. Same rejection shape as the
+                        // instrument-blocked gate above.
+                        const gateUser = await User.findById(freshTrade.user_id).select('bet close_only exchanges_allowed margin_call_blocked margin_square_off margin_square_off_percentage credits').session(session).lean();
+                        const isClosingForCloseOnly = (freshTrade.transaction_type === 'SELL' && prevNetQtyCheck > 0)
+                            || (freshTrade.transaction_type === 'BUY' && prevNetQtyCheck < 0);
+                        const betBlocked = gateUser?.bet === false;
+                        const closeOnlyBlocked = gateUser?.close_only === true && !isClosingForCloseOnly;
+
+                        // Margin-call gate at FILL time — mirrors placeTrade's
+                        // placement-time checks and priceQueueService's fill gate.
+                        const marginCallFullyBlocked = gateUser?.margin_call_blocked === true;
+                        let marginCallLiveBlocked = false;
+                        if (!marginCallFullyBlocked && !gateUser?.margin_square_off && !(gateUser?.margin_square_off_percentage > 0)) {
+                            const metricsEngineForMarginCall = require('./metricsEngine');
+                            const liveMetricsForMarginCall = metricsEngineForMarginCall.getCachedMetrics(freshTrade.user_id.toString());
+                            const creditForMarginCall = Number(gateUser?.credits || 0);
+                            marginCallLiveBlocked = !!liveMetricsForMarginCall
+                                && Number(liveMetricsForMarginCall.m2m_pnl || 0) <= -creditForMarginCall
+                                && !isClosingForCloseOnly;
+                        }
+
+                        // Exchange-permission gate — mirrors placeTrade's placement-time
+                        // check and priceQueueService's primary-path fill gate.
+                        const rawSegmentForAllow = (walletInstrument?.segment || freshTrade.exchange || '').toUpperCase();
+                        const allowCandidates = new Set([rawSegmentForAllow]);
+                        if (rawSegmentForAllow === 'GLOBAL') allowCandidates.add('INDICES');
+                        if (rawSegmentForAllow === 'INDICES') allowCandidates.add('GLOBAL');
+                        const exchangeBlocked = !(gateUser?.exchanges_allowed || []).some((ex) => {
+                            const name = (ex.exchange_name || '').toUpperCase();
+                            const normalized = name === 'INDICES' ? 'GLOBAL' : name;
+                            return allowCandidates.has(name) || allowCandidates.has(normalized);
+                        });
+
+                        if (betBlocked || closeOnlyBlocked || marginCallFullyBlocked || marginCallLiveBlocked || exchangeBlocked) {
+                            const userGateRejectRemark = betBlocked
+                                ? 'Trading is currently disabled for your account.'
+                                : closeOnlyBlocked
+                                ? 'Your account is in close-only mode. You can only close existing positions.'
+                                : marginCallFullyBlocked
+                                ? 'Trading is blocked: a margin square-off already closed all your positions. Contact your master/admin to add credit and resume.'
+                                : marginCallLiveBlocked
+                                ? 'Trading is blocked: your live M2M loss has reached your full credit. You can only close existing positions until your master/admin adds credit.'
+                                : `Your account is not permitted to trade ${rawSegmentForAllow || 'this instrument'}. Contact your master/admin.`;
+                            freshTrade.status = 'rejected';
+                            freshTrade.pnl = 0;
+                            freshTrade.net_amount = 0;
+                            freshTrade.remarks = userGateRejectRemark;
+                            await freshTrade.save({ session });
+                            try {
+                                await Trade.create([{
+                                    user_id: freshTrade.user_id,
+                                    master_id: freshTrade.master_id,
+                                    admin_id: freshTrade.admin_id || null,
+                                    instrument_token: freshTrade.instrument_token,
+                                    tradingsymbol: freshTrade.tradingsymbol,
+                                    exchange: freshTrade.exchange,
+                                    transaction_type: freshTrade.transaction_type,
+                                    quantity: freshTrade.quantity,
+                                    price: freshTrade.price,
+                                    order_type: freshTrade.order_type,
+                                    status: 'rejected',
+                                    remarks: userGateRejectRemark,
+                                }], { session });
+                            } catch (_) {}
+                            console.log(`⚠️ [OrderExecution] Rejected ${freshTrade.tradingsymbol} — ${userGateRejectRemark}`);
+                            return;
+                        }
+
+                        // Naked-option-short gate at FILL time — mirrors placeTrade's
+                        // placement-time check (tradeController.js), which only runs once,
+                        // at the moment the order is PLACED. A pending SELL LIMIT/SL/SL-M
+                        // order placed while the user still held the option stays queued
+                        // even if that position gets closed by some other trade before this
+                        // one fills — without re-checking here, it fills anyway and opens a
+                        // fresh naked short the placement-time check exists specifically to
+                        // prevent. Same rejection shape as the instrument-blocked gate above.
+                        const isOptionInstrument = ['CE', 'PE'].includes(walletInstrument?.instrument_type);
+                        const nakedOptionShort = isOptionInstrument
+                            && freshTrade.transaction_type === 'SELL'
+                            && prevNetQtyCheck <= 0;
+                        if (nakedOptionShort) {
+                            const nakedShortRejectRemark = 'Option selling is not allowed. You must own this option before you can sell it.';
+                            freshTrade.status = 'rejected';
+                            freshTrade.pnl = 0;
+                            freshTrade.net_amount = 0;
+                            freshTrade.remarks = nakedShortRejectRemark;
+                            await freshTrade.save({ session });
+                            try {
+                                await Trade.create([{
+                                    user_id: freshTrade.user_id,
+                                    master_id: freshTrade.master_id,
+                                    admin_id: freshTrade.admin_id || null,
+                                    instrument_token: freshTrade.instrument_token,
+                                    tradingsymbol: freshTrade.tradingsymbol,
+                                    exchange: freshTrade.exchange,
+                                    transaction_type: freshTrade.transaction_type,
+                                    quantity: freshTrade.quantity,
+                                    price: freshTrade.price,
+                                    order_type: freshTrade.order_type,
+                                    status: 'rejected',
+                                    remarks: nakedShortRejectRemark,
+                                }], { session });
+                            } catch (_) {}
+                            console.log(`⚠️ [OrderExecution] Rejected ${freshTrade.tradingsymbol} — ${nakedShortRejectRemark}`);
                             return;
                         }
 
@@ -337,13 +481,16 @@ const processPendingOrders = async () => {
                         const marginPerUnit = await calculateMargin(freshTrade.exchange, 1, freshTrade.price);
                         const prevMargin = Math.abs(prevNetQtyForMargin) * marginPerUnit;
                         const newMargin = Math.abs(newNetQty) * marginPerUnit;
-                        // NOTE: marginDelta is now notional — persisted equity interaction
-                        // pending review (see Task 5 flag). calculateMargin returns |qty|×price
-                        // after Task 3, so this still subtracts a notional-sized amount from the
-                        // PERSISTED user.equity running balance. Kept byte-for-byte for parity
-                        // with placeTrade / priceQueueService; flagged for user review.
+                        // marginDelta is notional (calculateMargin returns |qty|×price since
+                        // Task 3), computed here for transaction metadata only — NOT
+                        // subtracted from persisted user.equity below. wallet.block/release
+                        // (this path's DB-fallback equivalent) already reserves/frees this
+                        // exact notional from the wallet balance, so subtracting it again
+                        // here double-counted the same margin against two balance fields
+                        // (design D2: persisted equity = credit + realised P&L only,
+                        // matching the same fix in placeTrade / priceQueueService).
                         const marginDelta = newMargin - prevMargin;
-                        const balanceChange = realisedPnl - marginDelta - brokerage;
+                        const balanceChange = realisedPnl - brokerage;
 
                         const user = await User.findById(freshTrade.user_id).session(session);
                         if (user) {
@@ -390,7 +537,7 @@ const processPendingOrders = async () => {
                     tradeWriteLease = null;
 
                     executedCount++;
-                    console.log(`✅ [OrderExecution/Fallback] Executed ${trade.transaction_type} LIMIT for ${trade.tradingsymbol} @ ${trade.price} (live: ${livePrice})`);
+                    console.log(`✅ [OrderExecution/Fallback] [${_ts()}] Executed ${trade.transaction_type} ${trade.order_type} for ${trade.tradingsymbol} @ ${trade.price} (live: ${livePrice}) | tradeId=${trade._id}`);
 
                     // Notify the user's Flutter client via WebSocket
                     const livePriceService = require('./livePriceService');
@@ -406,6 +553,38 @@ const processPendingOrders = async () => {
                         status: 'completed',
                     });
 
+                    // Notify masters/admins on the Trade Alert live-log page — same
+                    // broadcast as tradeController.js's placeTrade and
+                    // priceQueueService.js's notifyOutcome; this is the DB-fallback
+                    // fill path (used when Redis/BullMQ is unavailable), which never
+                    // had this wired in even though tradeAlertController.js's own
+                    // docblock claimed it did.
+                    try {
+                        const metricsEngine = require('./metricsEngine');
+                        const [alertInst, alertUser] = await Promise.all([
+                            KiteInstrument.findOne({ instrument_token: trade.instrument_token }).select('segment lot_size').lean(),
+                            User.findById(trade.user_id).select('name username').lean(),
+                        ]);
+                        metricsEngine.broadcastTradeAlert(trade.user_id.toString(), {
+                            trade_id: trade._id.toString(),
+                            user_id: trade.user_id.toString(),
+                            client_name: alertUser?.name || null,
+                            client_username: alertUser?.username || null,
+                            instrument_token: trade.instrument_token,
+                            tradingsymbol: trade.tradingsymbol,
+                            segment: alertInst?.segment || null,
+                            lot_size: alertInst?.lot_size || null,
+                            transaction_type: trade.transaction_type,
+                            quantity: trade.quantity,
+                            price: trade.price,
+                            order_type: trade.order_type,
+                            status: 'completed',
+                            executed_at: trade.executed_at || new Date(),
+                        });
+                    } catch (alertErr) {
+                        console.error('⚠️ [TradeAlert] broadcast error:', alertErr.message);
+                    }
+
                     // FCM push notification for pending order execution
                     firebaseService.sendNotification(trade.user_id.toString(), 'pending_order', {
                         title: 'Limit Order Executed',
@@ -416,17 +595,21 @@ const processPendingOrders = async () => {
                     session.endSession();
                     await tradeWriteLease?.release();
                     if (sessionErr.code !== 'SETTLEMENT_IN_PROGRESS') {
-                        console.error(`❌ [OrderExecution] Session error for trade ${trade._id}:`, sessionErr.message);
+                        console.error(`❌ [OrderExecution] [${_ts()}] Session error for trade ${trade._id} (${trade.tradingsymbol}): ${sessionErr.message}`);
+                    } else if (LOG_REDIS_ORDERS) {
+                        console.log(`⏸️  [OrderExecution] [${_ts()}] tradeId=${trade._id} skipped — settlement in progress`);
                     }
                 }
             }
         }
 
         if (executedCount > 0) {
-            console.log(`📊 [OrderExecution/Fallback] Executed ${executedCount} pending limit order(s) this cycle.`);
+            console.log(`📊 [OrderExecution/Fallback] [${_ts()}] Executed ${executedCount} pending limit order(s) this cycle.`);
+        } else if (LOG_REDIS_ORDERS) {
+            console.log(`   ↳ [OrderExecution] [${_ts()}] Cycle complete — 0 orders triggered out of ${pendingTrades.length} pending`);
         }
     } catch (error) {
-        console.error('[OrderExecution] Error processing pending orders:', error.message);
+        console.error(`❌ [OrderExecution] [${_ts()}] Error processing pending orders: ${error.message}`);
     }
 };
 

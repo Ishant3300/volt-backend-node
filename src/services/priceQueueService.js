@@ -529,6 +529,7 @@ async function notifyOutcome(outcome, livePrice) {
   // Own try/catch, purely additive.
   try {
     const alertUser = await User.findById(trade.user_id).select('name username').lean();
+    const alertInst = await KiteInstrument.findOne({ instrument_token: trade.instrument_token }).select('segment lot_size').lean();
     metricsEngine.broadcastTradeAlert(trade.user_id.toString(), {
       trade_id: trade._id.toString(),
       user_id: trade.user_id.toString(),
@@ -536,6 +537,8 @@ async function notifyOutcome(outcome, livePrice) {
       client_username: alertUser?.username || null,
       instrument_token: trade.instrument_token,
       tradingsymbol: trade.tradingsymbol,
+      segment: alertInst?.segment || null,
+      lot_size: alertInst?.lot_size || null,
       transaction_type: trade.transaction_type,
       quantity: trade.quantity,
       price: trade.price,
