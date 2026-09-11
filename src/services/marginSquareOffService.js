@@ -5,6 +5,7 @@ const mongoose = require('mongoose');
 const Transaction = require('../models/Transaction');
 const Trade = require('../models/Trade');
 const User = require('../models/User');
+const KiteInstrument = require('../models/KiteInstrument');
 const { beginTradeWrite } = require('./tradeWriteFenceService');
 const walletService = require('./walletService');
 const { categoryForSegment } = require('../utils/walletCategory');
@@ -228,12 +229,44 @@ async function _squareOffAllPositions(triggerUser, options = {}) {
     const positions = freshMetrics.positions.filter(position => Number(position.net_qty || 0) !== 0);
     if (positions.length === 0) return 0;
 
+    // `position.bid_price`/`ask_price` are genuinely 0 when no live tick has
+    // arrived for that token today (unlike `.ltp`/`.cmp`, which metricsEngine
+    // already silently fakes from the position's own average entry price
+    // when no live price exists — giving a phantom ZERO floating P&L, not an
+    // error). That matters here specifically: a multi-exchange account (e.g.
+    // MCX + NSE) can trigger square-off from MCX's real move alone, before
+    // NSE has opened for the day — closing the NSE leg at its own average
+    // entry price would silently realize it at exactly zero P&L, discarding
+    // whatever real unrealized loss/gain it was actually carrying from
+    // yesterday's close. Falling back to KiteInstrument's own persisted
+    // previous-close fields (ohlc_close / settlement_price — already the
+    // codebase's authoritative "official close, kept separate from live
+    // last_price" source, used elsewhere for weekend settlement) instead
+    // books that leg at a real, meaningful price.
+    const noLiveDataTokens = positions
+      .filter((p) => !(Number(p.bid_price || 0) > 0) && !(Number(p.ask_price || 0) > 0))
+      .map((p) => p.instrument_token);
+    const previousCloseByToken = new Map();
+    if (noLiveDataTokens.length > 0) {
+      const instruments = await KiteInstrument.find(
+        { instrument_token: { $in: noLiveDataTokens } },
+        'instrument_token ohlc_close settlement_price last_price'
+      ).lean();
+      for (const inst of instruments) {
+        const prevClose = Number(inst.ohlc_close || 0) || Number(inst.settlement_price || 0) || Number(inst.last_price || 0);
+        if (prevClose > 0) previousCloseByToken.set(inst.instrument_token.toString(), prevClose);
+      }
+    }
+
     const priceSnapshot = new Map();
     for (const position of positions) {
-      priceSnapshot.set(position.instrument_token.toString(), {
-        bid: Number(position.bid_price || position.cmp || position.ltp || 0),
-        ask: Number(position.ask_price || position.cmp || position.ltp || 0),
-        ltp: Number(position.ltp || 0),
+      const tokenStr = position.instrument_token.toString();
+      const hasLiveData = Number(position.bid_price || 0) > 0 || Number(position.ask_price || 0) > 0;
+      const prevClose = !hasLiveData ? previousCloseByToken.get(tokenStr) : null;
+      priceSnapshot.set(tokenStr, {
+        bid: Number(prevClose || position.bid_price || position.cmp || position.ltp || 0),
+        ask: Number(prevClose || position.ask_price || position.cmp || position.ltp || 0),
+        ltp: Number(prevClose || position.ltp || 0),
       });
     }
 
@@ -281,12 +314,12 @@ async function _squareOffAllPositions(triggerUser, options = {}) {
           net_amount: pnl,
           remarks: 'MARGIN_SQUARE_OFF',
         });
-        
+
         // Calculate brokerage
         const brokerage = await calculateBrokerage(newTrade, session);
         newTrade.brokerage = brokerage;
         newTrade.net_amount = pnl - brokerage;
-        
+
         await newTrade.save({ session });
 
         // Requirement 3.2 / 7.5: release the closed position's ENTRY notional
@@ -331,6 +364,13 @@ async function _squareOffAllPositions(triggerUser, options = {}) {
 
         console.log(`🛡️  [MarginSquareOff] Squared off ${position.tradingsymbol}: ${closeType} ${closeQty} @ ₹${closePrice.toFixed(2)}, P&L: ₹${pnl.toFixed(2)}`);
       }
+
+      // Every position is now closed — block further trading until the
+      // master/admin explicitly credits this account again (creditUser /
+      // creditUserByAdmin clear this). Set inside the same transaction as
+      // the closes so a crash between them can't leave positions closed but
+      // trading still open.
+      freshUser.margin_call_blocked = true;
 
       await lease.assertActive({ session });
       await freshUser.save({ session });
